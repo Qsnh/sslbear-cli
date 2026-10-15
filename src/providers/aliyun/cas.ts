@@ -23,6 +23,9 @@ interface CertOrder {
 
 const PAGE = 50;
 
+/** 只有日期的 EndDate 表示当天仍有效，按北京时间当天 23:59:59 计算，避免到期当天被判为已过期 */
+const endOfDay = (date?: string) => (date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? `${date} 23:59:59` : date);
+
 function listOrders(ctx: QueryContext, creds: AliyunCredentials, status?: string): Promise<CertOrder[]> {
   return paginate(PAGE, async (page) => {
     const res = await callRpc<{ CertificateOrderList?: CertOrder[]; TotalCount?: number }>(ctx, creds, {
@@ -56,7 +59,7 @@ export async function listCasCertificates(ctx: QueryContext, creds: AliyunCreden
         sans: c.Sans?.split(",").map((s) => s.trim()).filter(Boolean),
         issuer: c.Issuer,
         notBefore: toIso(c.StartDate),
-        notAfter: toIso(c.EndDate),
+        notAfter: toIso(endOfDay(c.EndDate)),
         status: c.Status ?? (c.Expired ? "EXPIRED" : "ISSUED"),
         source: c.Upload === undefined ? undefined : c.Upload ? "upload" : "issued",
       }),

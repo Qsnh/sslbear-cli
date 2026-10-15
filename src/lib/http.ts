@@ -47,9 +47,10 @@ export async function withRetry<T>(ctx: QueryContext, fn: () => Promise<T>): Pro
 }
 
 export async function send(ctx: QueryContext, provider: Provider, url: string, init: RequestInit): Promise<RawResponse> {
-  let res: Response;
+  // 读响应体也在超时与网络错误处理范围内：响应头到了但响应体卡住 / 连接中断同样要重试
   try {
-    res = await ctx.fetch(url, { ...init, signal: AbortSignal.timeout(ctx.timeoutMs) });
+    const res = await ctx.fetch(url, { ...init, signal: AbortSignal.timeout(ctx.timeoutMs) });
+    return { status: res.status, text: await res.text() };
   } catch (e) {
     const err = e as Error;
     if (err.name === "TimeoutError" || err.name === "AbortError") {
@@ -58,7 +59,6 @@ export async function send(ctx: QueryContext, provider: Provider, url: string, i
     const cause = (err as { cause?: { code?: string } }).cause?.code;
     throw new CloudApiError(provider, "NetworkError", `网络错误：${new URL(url).host} ${cause ?? err.message}`);
   }
-  return { status: res.status, text: await res.text() };
 }
 
 export function parseJson(provider: Provider, raw: RawResponse): unknown {

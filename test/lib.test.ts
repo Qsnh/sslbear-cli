@@ -46,6 +46,20 @@ describe(".env", () => {
       parseDotenv(`# comment\nexport A=1\nB="two words"\nC='x#y'\nD=bare # trailing\n\nbad line`),
     ).toEqual({ A: "1", B: "two words", C: "x#y", D: "bare" });
   });
+  it("引号后跟注释、值里含 = 与 #、双引号转义", () => {
+    expect(
+      parseDotenv(
+        [
+          `S1="abc"  # prod`,
+          `S2='sec#ret' # c`,
+          `S3=a=b=c`,
+          `S4=p#ss`,
+          String.raw`S5="say \"hi\" \\ done\n"`,
+          `S6=''`,
+        ].join("\n"),
+      ),
+    ).toEqual({ S1: "abc", S2: "sec#ret", S3: "a=b=c", S4: "p#ss", S5: 'say "hi" \\ done\n', S6: "" });
+  });
   it("不覆盖已存在的环境变量", () => {
     const dir = mkdtempSync(join(tmpdir(), "sslbear-"));
     const file = join(dir, ".env");
@@ -54,6 +68,14 @@ describe(".env", () => {
     expect(loadEnvFile(file, env)).toBe(true);
     expect(env).toEqual({ A: "from-shell", B: "from-file" });
     expect(loadEnvFile(join(dir, "missing"), env)).toBe(false);
+  });
+  it("shell 里设置了某组的任一变量时，整组都不从文件读取", () => {
+    const dir = mkdtempSync(join(tmpdir(), "sslbear-"));
+    const file = join(dir, ".env");
+    writeFileSync(file, "ID_B=b\nSECRET_B=b\nTOKEN=stale\nOTHER=x\n");
+    const env: Record<string, string | undefined> = { ID_A: "a" };
+    loadEnvFile(file, env, [["ID_A", "ID_B", "SECRET_B", "TOKEN"]]);
+    expect(env).toEqual({ ID_A: "a", OTHER: "x" });
   });
 });
 
@@ -72,14 +94,26 @@ describe("凭证读取", () => {
         ALIBABA_CLOUD_SECURITY_TOKEN: "tok",
       }),
     ).toEqual({ state: "ok", credentials: { accessKeyId: "id1", accessKeySecret: "sk", securityToken: "tok" } });
-    expect(readAliyun({ ALIBABA_CLOUD_ACCESS_KEY_ID: "id" })).toEqual({
+    expect(readAliyun({ ALIBABA_CLOUD_ACCESS_KEY_ID: "id" })).toMatchObject({
       state: "incomplete",
       missing: ["ALIBABA_CLOUD_ACCESS_KEY_SECRET"],
     });
   });
+  it("阿里云：ID / Secret / Token 只从同一个名族取，不跨名族拼凑", () => {
+    expect(
+      readAliyun({
+        ALIBABA_CLOUD_ACCESS_KEY_ID: "id-b",
+        ALIYUN_ACCESS_KEY_ID: "id-a",
+        ALIYUN_ACCESS_KEY_SECRET: "sk-a",
+      }),
+    ).toMatchObject({ state: "incomplete", missing: ["ALIBABA_CLOUD_ACCESS_KEY_SECRET"] });
+    expect(
+      readAliyun({ ALIYUN_ACCESS_KEY_ID: "id-a", ALIYUN_ACCESS_KEY_SECRET: "sk-a", ALIBABA_CLOUD_SECURITY_TOKEN: "stale" }),
+    ).toEqual({ state: "ok", credentials: { accessKeyId: "id-a", accessKeySecret: "sk-a" } });
+  });
   it("腾讯云：空白值视为未设置", () => {
     expect(readTencent({ TENCENTCLOUD_SECRET_ID: "  ", TENCENTCLOUD_SECRET_KEY: "" })).toEqual({ state: "missing" });
-    expect(readTencent({ TENCENTCLOUD_SECRET_KEY: "k" })).toEqual({ state: "incomplete", missing: ["TENCENTCLOUD_SECRET_ID"] });
+    expect(readTencent({ TENCENTCLOUD_SECRET_KEY: "k" })).toMatchObject({ state: "incomplete", missing: ["TENCENTCLOUD_SECRET_ID"] });
   });
   it("脱敏保留首尾", () => {
     expect(mask("LTAI5tAbCdEfGhIjKlMn")).toBe("LTAI********KlMn");

@@ -78,9 +78,8 @@ export function renderEnv(env: Env, envFile?: string): string {
   for (const s of envStatus(env)) {
     lines.push(`${PROVIDER_LABEL[s.provider]}（${s.provider}）：${STATE_LABEL[s.state]}`);
     for (const k of s.keys) {
-      const value = k.source ? (k.masked ? `= ${k.masked}` : "已设置") : k.required ? "未设置（必填）" : "未设置（可选）";
-      const alias = k.source && k.source !== k.name ? `（通过 ${k.source}）` : "";
-      lines.push(`  ${k.name} ${value}${alias}`);
+      const value = k.set ? (k.masked ? `= ${k.masked}` : "已设置") : k.required ? "未设置（必填）" : "未设置（可选）";
+      lines.push(`  ${k.name} ${value}`);
     }
     lines.push(`  可查询服务：${s.services.join(", ")}`, "");
   }

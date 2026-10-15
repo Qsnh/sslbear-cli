@@ -16,10 +16,16 @@ export function outJson(data: unknown): void {
   console.log(JSON.stringify({ ok: true, data }));
 }
 
-/** exitCode：1 = 接口/网络错误，2 = 参数或配置错误 */
-export function fail(opts: OutputOptions, status: number | string, message: string, exitCode = 1): never {
+/** exitCode：1 = 接口/网络错误，2 = 参数或配置错误；extra 只附加在 JSON 输出里 */
+export function fail(
+  opts: OutputOptions,
+  status: number | string,
+  message: string,
+  exitCode = 1,
+  extra?: Record<string, unknown>,
+): never {
   if (opts.json) {
-    console.error(JSON.stringify({ ok: false, status, message }));
+    console.error(JSON.stringify({ ok: false, status, message, ...extra }));
   } else {
     console.error(`错误：${message}`);
   }

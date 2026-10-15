@@ -44,12 +44,12 @@ export const live: DomainService<TencentCredentials> = {
         });
         return { items: res.DomainList ?? [], total: res.AllCount };
       }),
-      paginate(BINDING_PAGE, async (page) => {
+      paginate(BINDING_PAGE, async (_page, offset) => {
         const res = await call<{ LiveDomainCertBindings?: CertBinding[] | null; TotalNum?: number }>(
           ctx,
           creds,
           "DescribeLiveDomainCertBindings",
-          { Offset: (page - 1) * BINDING_PAGE, Length: BINDING_PAGE },
+          { Offset: offset, Length: BINDING_PAGE },
         );
         return { items: res.LiveDomainCertBindings ?? [], total: res.TotalNum };
       }),
@@ -64,7 +64,8 @@ export const live: DomainService<TencentCredentials> = {
         domain: d.Name,
         status: d.Status === undefined ? undefined : d.Status === 1 ? "online" : "offline",
         https,
-        cert: b ? compact({ id: b.CloudCertId, name: b.CertificateAlias, notAfter: toIso(b.CertExpireTime) }) : undefined,
+        // 绑了证书但未开启 HTTPS 的域名不对外提供证书，不计入到期统计
+        cert: https && b ? compact({ id: b.CloudCertId, name: b.CertificateAlias, notAfter: toIso(b.CertExpireTime) }) : undefined,
         extra: d.Type === undefined ? undefined : { type: d.Type === 1 ? "play" : "push" },
       });
     });

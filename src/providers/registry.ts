@@ -1,4 +1,4 @@
-import { pick, type CredentialState, type Env } from "../lib/env.js";
+import { resolveFamily, type Credentials, type Env, type EnvFamily } from "../lib/env.js";
 import type { QueryContext } from "../lib/http.js";
 import type { CertificateRecord, DomainRecord, Provider } from "../types.js";
 
@@ -14,18 +14,11 @@ export interface DomainService<C> {
   list(ctx: QueryContext, creds: C, warn: Warn): Promise<DomainRecord[]>;
 }
 
-export interface EnvKeySpec {
-  /** 按优先级排列的候选变量名，第一个为推荐名 */
-  names: readonly string[];
-  required: boolean;
-  /** 密钥类变量只显示是否已设置，不显示任何字符 */
-  secret: boolean;
-}
-
 export interface ProviderDef<C> {
   provider: Provider;
-  envKeys: EnvKeySpec[];
-  readCredentials(env: Env): CredentialState<C>;
+  /** 支持的环境变量名族，第一个为推荐名 */
+  envFamilies: readonly EnvFamily[];
+  readCredentials(env: Env): Credentials<C>;
   services: DomainService<C>[];
   listCertificates(ctx: QueryContext, creds: C): Promise<CertificateRecord[]>;
   /** 判断错误是否表示「该服务未开通」，这类情况记为提示而非失败 */
@@ -37,25 +30,27 @@ export function defineProvider<C>(def: ProviderDef<C>): ProviderDef<C> {
 }
 
 export function requiredEnvNames(def: ProviderDef<unknown>): string[] {
-  return def.envKeys.filter((k) => k.required).map((k) => k.names[0] as string);
+  const f = def.envFamilies[0]!;
+  return [f.id, f.secret];
 }
 
 export interface EnvKeyStatus {
   name: string;
   required: boolean;
-  /** 实际生效的变量名（可能是别名），未设置时缺省 */
-  source?: string;
-  /** 非密钥类变量的脱敏值 */
+  set: boolean;
+  /** 仅 ID 类变量给出脱敏值，Secret / Token 只标明是否已设置 */
   masked?: string;
 }
 
+/** 按实际生效的名族展示（都没设置时展示推荐名族） */
 export function envKeyStatus(def: ProviderDef<unknown>, env: Env, mask: (v: string) => string): EnvKeyStatus[] {
-  return def.envKeys.map((k) => {
-    const hit = pick(env, k.names);
-    return {
-      name: k.names[0] as string,
-      required: k.required,
-      ...(hit && { source: hit.name, ...(!k.secret && { masked: mask(hit.value) }) }),
-    };
-  });
+  const r = resolveFamily(env, def.envFamilies);
+  const f = r.state === "missing" ? def.envFamilies[0]! : r.family;
+  const get = (name: string) => env[name]?.trim() || undefined;
+  const id = get(f.id);
+  return [
+    { name: f.id, required: true, set: !!id, ...(id && { masked: mask(id) }) },
+    { name: f.secret, required: true, set: !!get(f.secret) },
+    { name: f.token, required: false, set: !!get(f.token) },
+  ];
 }

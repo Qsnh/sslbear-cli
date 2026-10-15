@@ -360,10 +360,10 @@ describe("aliyun certs", () => {
         id: "2",
         name: "old",
         commonName: "old.example.com",
-        notAfter: "2026-08-31T16:00:00.000Z",
+        notAfter: "2026-09-01T15:59:59.000Z",
         status: "EXPIRED",
         source: "upload",
-        daysLeft: -45,
+        daysLeft: -44,
       },
       {
         provider: "aliyun",
@@ -373,10 +373,10 @@ describe("aliyun certs", () => {
         sans: ["*.example.com", "example.com"],
         issuer: "DigiCert",
         notBefore: "2025-12-31T16:00:00.000Z",
-        notAfter: "2026-12-31T16:00:00.000Z",
+        notAfter: "2027-01-01T15:59:59.000Z",
         status: "ISSUED",
         source: "issued",
-        daysLeft: 77,
+        daysLeft: 78,
       },
     ]);
   });

@@ -24,12 +24,12 @@ export const cdn: DomainService<TencentCredentials> = {
   key: "cdn",
   label: "CDN",
   async list(ctx: QueryContext, creds: TencentCredentials): Promise<DomainRecord[]> {
-    const domains = await paginate(PAGE, async (page) => {
+    const domains = await paginate(PAGE, async (_page, offset) => {
       const res = await callTencent<{ Domains?: CdnDomain[] | null; TotalNumber?: number }>(ctx, creds, {
         service: "cdn",
         version: "2018-06-06",
         action: "DescribeDomainsConfig",
-        payload: { Offset: (page - 1) * PAGE, Limit: PAGE },
+        payload: { Offset: offset, Limit: PAGE },
       });
       return { items: res.Domains ?? [], total: res.TotalNumber };
     });

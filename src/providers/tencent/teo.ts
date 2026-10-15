@@ -32,20 +32,20 @@ export const teo: DomainService<TencentCredentials> = {
   key: "teo",
   label: "EdgeOne",
   async list(ctx: QueryContext, creds: TencentCredentials, warn: Warn): Promise<DomainRecord[]> {
-    const zones = await paginate(ZONE_PAGE, async (page) => {
+    const zones = await paginate(ZONE_PAGE, async (_page, offset) => {
       const res = await call<{ Zones?: Zone[] | null; TotalCount?: number }>(ctx, creds, "DescribeZones", {
-        Offset: (page - 1) * ZONE_PAGE,
+        Offset: offset,
         Limit: ZONE_PAGE,
       });
       return { items: res.Zones ?? [], total: res.TotalCount };
     });
     const perZone = await mapLimit(zones, 5, async (zone) => {
-      const domains = await paginate(DOMAIN_PAGE, async (page) => {
+      const domains = await paginate(DOMAIN_PAGE, async (_page, offset) => {
         const res = await call<{ AccelerationDomains?: AccelerationDomain[] | null; TotalCount?: number }>(
           ctx,
           creds,
           "DescribeAccelerationDomains",
-          { ZoneId: zone.ZoneId, Offset: (page - 1) * DOMAIN_PAGE, Limit: DOMAIN_PAGE },
+          { ZoneId: zone.ZoneId, Offset: offset, Limit: DOMAIN_PAGE },
         );
         return { items: res.AccelerationDomains ?? [], total: res.TotalCount };
       }).catch((e: unknown) => {

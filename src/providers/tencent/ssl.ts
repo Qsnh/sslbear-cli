@@ -24,12 +24,12 @@ interface SslCertificate {
 const PAGE = 1000;
 
 async function fetchAll(ctx: QueryContext, creds: TencentCredentials): Promise<CertificateRecord[]> {
-  const list = await paginate(PAGE, async (page) => {
+  const list = await paginate(PAGE, async (_page, offset) => {
     const res = await callTencent<{ Certificates?: SslCertificate[] | null; TotalCount?: number }>(ctx, creds, {
       service: "ssl",
       version: "2019-12-05",
       action: "DescribeCertificates",
-      payload: { Offset: (page - 1) * PAGE, Limit: PAGE, CertificateType: "SVR" },
+      payload: { Offset: offset, Limit: PAGE, CertificateType: "SVR" },
     });
     return { items: res.Certificates ?? [], total: res.TotalCount };
   });

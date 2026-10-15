@@ -75,9 +75,8 @@ function toIssue(def: ProviderDef<unknown>, service: string, e: unknown, target?
 export interface DomainQueryResult {
   items: DomainRecord[];
   issues: QueryIssue[];
-  /** 发起的查询数（云厂商 × 服务）与整体失败数，二者相等即全部失败 */
-  attempted: number;
-  failed: number;
+  /** 整体成功的查询数（云厂商 × 服务），为 0 且有错误即视为全部失败 */
+  succeeded: number;
 }
 
 export async function queryDomains(ctx: QueryContext, sel: Selection): Promise<DomainQueryResult> {
@@ -103,14 +102,13 @@ export async function queryDomains(ctx: QueryContext, sel: Selection): Promise<D
     const days = daysUntil(item.cert?.notAfter, ctx.now);
     if (days !== undefined) item.daysLeft = days;
   }
-  return { items, issues, attempted: jobs.length, failed: settled.filter((r) => r.status === "rejected").length };
+  return { items, issues, succeeded: settled.filter((r) => r.status === "fulfilled").length };
 }
 
 export interface CertQueryResult {
   items: CertificateRecord[];
   issues: QueryIssue[];
-  attempted: number;
-  failed: number;
+  succeeded: number;
 }
 
 export async function queryCertificates(ctx: QueryContext, sel: Selection): Promise<CertQueryResult> {
@@ -127,7 +125,7 @@ export async function queryCertificates(ctx: QueryContext, sel: Selection): Prom
     const days = daysUntil(item.notAfter, ctx.now);
     if (days !== undefined) item.daysLeft = days;
   }
-  return { items, issues, attempted: targets.length, failed: settled.filter((r) => r.status === "rejected").length };
+  return { items, issues, succeeded: settled.filter((r) => r.status === "fulfilled").length };
 }
 
 export interface Filter {

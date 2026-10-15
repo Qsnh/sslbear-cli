@@ -163,25 +163,170 @@ describe("env 与 .env", () => {
     expect(r.stdout).not.toContain("LTAI5tAbCdEfGhIjKlMn");
     const [aliyun, tencent] = r.json.data.providers;
     expect(aliyun).toMatchObject({ provider: "aliyun", state: "ok" });
-    expect(aliyun.keys[0]).toEqual({ name: "ALIBABA_CLOUD_ACCESS_KEY_ID", required: true, source: "ALIYUN_ACCESS_KEY_ID", masked: "LTAI********KlMn" });
-    expect(aliyun.keys[1]).toEqual({ name: "ALIBABA_CLOUD_ACCESS_KEY_SECRET", required: true, source: "ALIYUN_ACCESS_KEY_SECRET" });
+    expect(aliyun.keys).toEqual([
+      { name: "ALIYUN_ACCESS_KEY_ID", required: true, set: true, masked: "LTAI********KlMn" },
+      { name: "ALIYUN_ACCESS_KEY_SECRET", required: true, set: true },
+      { name: "ALIYUN_SECURITY_TOKEN", required: false, set: false },
+    ]);
     expect(tencent).toMatchObject({ provider: "tencent", state: "missing" });
+    expect(tencent.keys.map((k: any) => k.name)).toEqual(["TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY", "TENCENTCLOUD_SESSION_TOKEN"]);
   });
 
-  it("自动加载当前目录 .env，shell 变量优先", async () => {
+  it("自动加载当前目录 .env", async () => {
     const dir = mkdtempSync(join(tmpdir(), "sslbear-cli-"));
     writeFileSync(join(dir, ".env"), "TENCENTCLOUD_SECRET_ID=from-file-id\nTENCENTCLOUD_SECRET_KEY=from-file-key\n");
     const fetch = fakeFetch((req) => (req.action === "DescribeCertificates" ? { body: { Response: { TotalCount: 0, Certificates: [] } } } : undefined));
-    const r = await runCli(["certs", "--json"], { env: { TENCENTCLOUD_SECRET_ID: "from-shell" }, fetch, cwd: dir });
+    const r = await runCli(["certs", "--json"], { fetch, cwd: dir });
     expect(r.code).toBe(0);
-    expect(fetch.calls[0]!.headers.authorization).toContain("Credential=from-shell/");
+    expect(fetch.calls[0]!.headers.authorization).toContain("Credential=from-file-id/");
     const e = await runCli(["env"], { cwd: dir });
     expect(e.stdout).toContain(`.env 文件：${join(dir, ".env")}`);
+  });
+
+  it("shell 里配置了某家云的凭证时，.env 里这家的凭证整组忽略，不拼凑", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sslbear-cli-"));
+    writeFileSync(
+      join(dir, ".env"),
+      "ALIBABA_CLOUD_ACCESS_KEY_ID=file-id\nALIBABA_CLOUD_SECURITY_TOKEN=stale\nTENCENTCLOUD_SECRET_ID=t-id\nTENCENTCLOUD_SECRET_KEY=t-key\n",
+    );
+    const fetch = fakeFetch((req) => {
+      if (req.url.host === "cas.aliyuncs.com") return { body: { TotalCount: 0, CertificateOrderList: [] } };
+      if (req.url.host === "ssl.tencentcloudapi.com") return { body: { Response: { TotalCount: 0, Certificates: [] } } };
+      return undefined;
+    });
+    const r = await runCli(["certs", "--json"], {
+      env: { ALIYUN_ACCESS_KEY_ID: "shell-id", ALIYUN_ACCESS_KEY_SECRET: "shell-secret" },
+      fetch,
+      cwd: dir,
+    });
+    expect(r.code).toBe(0);
+    const cas = fetch.calls.find((c) => c.url.host === "cas.aliyuncs.com")!;
+    expect(cas.url.searchParams.get("AccessKeyId")).toBe("shell-id");
+    expect(cas.url.searchParams.get("SecurityToken")).toBeNull();
+    // 腾讯云在 shell 里没有任何变量，照常从 .env 读取
+    expect(fetch.calls.some((c) => c.headers.authorization?.includes("Credential=t-id/"))).toBe(true);
   });
 
   it("--env-file 指定的文件不存在时 exit 2", async () => {
     const r = await runCli(["env", "--env-file", "nope.env"]);
     expect(r.code).toBe(2);
     expect(r.stderr).toContain("nope.env");
+  });
+});
+
+describe("审查发现问题的回归测试", () => {
+  it("--json 下参数错误也输出 JSON；无参数运行按参数错误退出", async () => {
+    const r = await runCli(["domains", "--json", "--bogus"], { env: BOTH });
+    expect(r.code).toBe(2);
+    expect(r.stdout).toBe("");
+    expect(JSON.parse(r.stderr)).toEqual({ ok: false, status: "UsageError", message: "unknown option '--bogus'" });
+    const missing = await runCli(["domains", "-e", "--json"], { env: BOTH });
+    expect(missing.code).toBe(2);
+    expect(JSON.parse(missing.stderr)).toMatchObject({ ok: false, status: "UsageError" });
+    expect((await runCli([])).code).toBe(2);
+  });
+
+  it("--timeout 必须在 1~600000 之间", async () => {
+    for (const t of ["0", "3000000000", "1.5"]) {
+      expect((await runCli(["domains", "--timeout", t], { env: BOTH })).code, t).toBe(2);
+    }
+  });
+
+  it("重复指定云厂商 / 服务不会重复查询", async () => {
+    const fetch = fakeFetch(mixedRoutes);
+    const r = await runCli(["domains", "-p", "aliyun,aliyun", "-p", "aliyun", "-s", "cdn,cdn", "--json"], { env: BOTH, fetch });
+    expect(r.json.data.items).toHaveLength(3);
+    expect(fetch.calls.filter((c) => c.action === "DescribeUserDomains")).toHaveLength(1);
+  });
+
+  it("没有任何查询成功时 exit 1；未开通的服务不计入失败数，JSON 里带上全部 issues", async () => {
+    const fetch = fakeFetch((req) => {
+      const inactive: Record<string, string> = {
+        "cdn.aliyuncs.com": "CdnServiceNotFound",
+        "dcdn.aliyuncs.com": "DcdnServiceNotFound",
+        "live.aliyuncs.com": "LiveServiceNotFound",
+        "vod.cn-shanghai.aliyuncs.com": "VodServiceNotFound",
+      };
+      const code = inactive[req.url.host];
+      if (code) return { status: 403, body: { Code: code, Message: "not activated" } };
+      return { status: 403, body: "<Error><Code>AccessDenied</Code><Message>denied</Message></Error>" };
+    });
+    const r = await runCli(["domains", "-p", "aliyun"], { env: BOTH, fetch });
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("没有任何查询成功（1 项失败）");
+    const j = await runCli(["domains", "-p", "aliyun", "--json"], { env: BOTH, fetch });
+    expect(j.code).toBe(1);
+    const err = JSON.parse(j.stderr);
+    expect(err).toMatchObject({ ok: false, status: "AccessDenied" });
+    expect(err.issues.map((i: any) => `${i.service}:${i.kind}`).sort()).toEqual([
+      "cdn:inactive",
+      "dcdn:inactive",
+      "live:inactive",
+      "oss:error",
+      "vod:inactive",
+    ]);
+  });
+
+  it("接口悄悄把 pageSize 截小时，按 total 继续翻页不漏数据", async () => {
+    const all = Array.from({ length: 120 }, (_, i) => ({ Domain: `d${i}.example.cn`, Status: "online" }));
+    const fetch = fakeFetch((req) => {
+      if (req.action !== "DescribeDomainsConfig") return undefined;
+      const offset = req.json!.Offset as number;
+      return { body: { Response: { TotalNumber: all.length, Domains: all.slice(offset, offset + 50) } } };
+    });
+    const r = await runCli(["domains", "-p", "tencent", "-s", "cdn", "--json"], { env: BOTH, fetch });
+    expect(r.json.data.items).toHaveLength(120);
+  });
+
+  it("读取响应体超时按 Timeout 重试", async () => {
+    let n = 0;
+    const base = fakeFetch(mixedRoutes);
+    const fetch = (async (input: any, init?: any) => {
+      if (n++ === 0) {
+        return {
+          status: 200,
+          text: async () => {
+            throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+          },
+        } as unknown as Response;
+      }
+      return base(input, init);
+    }) as typeof globalThis.fetch;
+    const r = await runCli(["domains", "-p", "tencent", "-s", "cdn", "--json"], { env: BOTH, fetch });
+    expect(r.code).toBe(0);
+    expect(r.json.data.items).toHaveLength(1);
+    expect(n).toBe(2);
+  });
+
+  it("未开启 HTTPS 的域名不挂证书、不计入到期统计", async () => {
+    const fetch = fakeFetch((req) => {
+      if (req.action === "DescribeUserDomains") {
+        return { body: { TotalCount: 1, Domains: { PageData: [{ DomainName: "off.example.com", SslProtocol: "off" }] } } };
+      }
+      if (req.action === "DescribeCdnHttpsDomainList") {
+        return { body: { TotalCount: 1, CertInfos: { CertInfo: [{ DomainName: "off.example.com", CertName: "old", CertExpireTime: "2026-01-01 00:00:00" }] } } };
+      }
+      if (req.url.host.startsWith("oss-")) {
+        return { body: "<ListAllMyBucketsResult><Buckets><Bucket><Name>b</Name><Region>cn-hangzhou</Region><ExtranetEndpoint>oss-cn-hangzhou.aliyuncs.com</ExtranetEndpoint></Bucket></Buckets></ListAllMyBucketsResult>" };
+      }
+      if (req.url.host === "b.oss-cn-hangzhou.aliyuncs.com") {
+        return { body: "<ListCnameResult><Cname><Domain>oss-off.example.com</Domain><Certificate><CertId>1</CertId><Status>Disabled</Status><ValidEndDate>Mon, 4 May 2020 10:14:51 GMT</ValidEndDate></Certificate></Cname></ListCnameResult>" };
+      }
+      if (req.action === "DescribeLiveDomains") return { body: { Response: { AllCount: 1, DomainList: [{ Name: "live-off.example.com", Type: 1, Status: 1 }] } } };
+      if (req.action === "DescribeLiveDomainCertBindings") {
+        return { body: { Response: { TotalNum: 1, LiveDomainCertBindings: [{ DomainName: "live-off.example.com", Status: 0, CertExpireTime: "2020-01-01 00:00:00" }] } } };
+      }
+      return undefined;
+    });
+    const a = await runCli(["domains", "-p", "aliyun", "-s", "cdn,oss", "--json"], { env: BOTH, fetch });
+    const t = await runCli(["domains", "-p", "tencent", "-s", "live", "--json"], { env: BOTH, fetch });
+    const items = [...a.json.data.items, ...t.json.data.items];
+    expect(items.map((d: any) => [d.domain, d.https, d.cert, d.daysLeft])).toEqual([
+      ["off.example.com", false, undefined, undefined],
+      ["oss-off.example.com", false, undefined, undefined],
+      ["live-off.example.com", false, undefined, undefined],
+    ]);
+    const expiring = await runCli(["domains", "-p", "aliyun", "-s", "cdn,oss", "-e", "30", "--json"], { env: BOTH, fetch });
+    expect(expiring.json.data.items).toEqual([]);
   });
 });

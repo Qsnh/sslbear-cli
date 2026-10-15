@@ -95,11 +95,11 @@ function parseCnames(xml: string, bucket: Bucket): DomainRecord[] {
         domain,
         status: xmlText(block, "Status"),
         https,
-        cert: certXml
+        cert: https
           ? compact({
-              id: xmlText(certXml, "CertId"),
-              notBefore: toIso(xmlText(certXml, "ValidStartDate")),
-              notAfter: toIso(xmlText(certXml, "ValidEndDate")),
+              id: xmlText(certXml!, "CertId"),
+              notBefore: toIso(xmlText(certXml!, "ValidStartDate")),
+              notAfter: toIso(xmlText(certXml!, "ValidEndDate")),
               status: certStatus,
             })
           : undefined,

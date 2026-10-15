@@ -71,13 +71,16 @@ function cdnLike(p: Product): DomainService<AliyunCredentials> {
       ]);
       const certByDomain = new Map(certs.map((c) => [c.DomainName, c]));
       return domains.map((d) => {
-        const c = certByDomain.get(d.DomainName);
+        // 域名列表里有 HTTPS 开关就以开关为准；没有该字段时以是否出现在 HTTPS 列表判断
+        const ssl = d.SslProtocol ?? d.SSLProtocol;
+        const https = ssl === undefined ? certByDomain.has(d.DomainName) : ssl === "on";
+        const c = https ? certByDomain.get(d.DomainName) : undefined;
         return compact({
           provider: "aliyun" as const,
           service: p.service,
           domain: d.DomainName,
           status: d.DomainStatus ?? d.LiveDomainStatus,
-          https: (d.SslProtocol ?? d.SSLProtocol) === "on" || !!c,
+          https,
           cert: c
             ? compact({
                 name: c.CertName,
@@ -94,7 +97,7 @@ function cdnLike(p: Product): DomainService<AliyunCredentials> {
   };
 }
 
-// HTTPS 列表接口的 PageSize 上限：DCDN 文档为 500，CDN / 直播未注明，取保守值 100
+// HTTPS 列表接口的 PageSize 上限：DCDN 文档为 500，CDN / 直播未注明上限，用文档默认值 20 以免超限报错
 export const cdn = cdnLike({
   service: "cdn",
   label: "CDN",
@@ -103,7 +106,7 @@ export const cdn = cdnLike({
   listAction: "DescribeUserDomains",
   listPageSize: 500,
   httpsAction: "DescribeCdnHttpsDomainList",
-  httpsPageSize: 100,
+  httpsPageSize: 20,
 });
 
 export const dcdn = cdnLike({
@@ -125,5 +128,5 @@ export const live = cdnLike({
   listAction: "DescribeLiveUserDomains",
   listPageSize: 50,
   httpsAction: "DescribeLiveHttpsDomainList",
-  httpsPageSize: 100,
+  httpsPageSize: 20,
 });

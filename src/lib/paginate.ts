@@ -1,5 +1,5 @@
-/** 防止接口异常时死循环：单个服务最多翻 200 页 */
-const MAX_PAGES = 200;
+/** 防止接口异常（如忽略页码一直返回同一页）时死循环 */
+const MAX_PAGES = 1000;
 
 export interface Page<T> {
   items: T[];
@@ -7,17 +7,20 @@ export interface Page<T> {
 }
 
 /**
- * 逐页拉取直到取完：返回条数不足一页，或累计条数达到 total 即停止。
- * page 从 1 开始；偏移量分页的接口自行换算 offset = (page - 1) * pageSize。
+ * 逐页拉取直到取完。接口返回 total 时以 total 为准（遇到空页也停），
+ * 这样即使接口悄悄把 pageSize 截小也不会漏数据；没有 total 时以不足一页为结束。
+ * 页码分页的接口用 page（从 1 开始）；偏移量分页的接口用 offset（已取到的条数），
+ * 不要用 (page - 1) * pageSize 换算，否则接口截小 pageSize 时会跳过中间的数据。
  */
-export async function paginate<T>(pageSize: number, fetchPage: (page: number) => Promise<Page<T>>): Promise<T[]> {
+export async function paginate<T>(pageSize: number, fetchPage: (page: number, offset: number) => Promise<Page<T>>): Promise<T[]> {
   const all: T[] = [];
   for (let page = 1; page <= MAX_PAGES; page++) {
-    const { items, total } = await fetchPage(page);
+    const { items, total } = await fetchPage(page, all.length);
     all.push(...items);
-    if (items.length < pageSize || (total !== undefined && all.length >= total)) break;
+    const done = total !== undefined ? all.length >= total || items.length === 0 : items.length < pageSize;
+    if (done) return all;
   }
-  return all;
+  throw new Error(`分页超过 ${MAX_PAGES} 页仍未取完，已中止（接口返回可能异常）`);
 }
 
 /** 同一次命令里多个服务共享的查询结果（如证书列表），按 key 缓存 Promise */

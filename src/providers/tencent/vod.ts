@@ -37,9 +37,9 @@ export const vod: DomainService<TencentCredentials> = {
   label: "云点播",
   async list(ctx: QueryContext, creds: TencentCredentials, warn: Warn): Promise<DomainRecord[]> {
     // 应用列表查不到（老账号、接口异常）时退回不带 SubAppId 查询，真正的问题会在域名查询里暴露
-    const apps = await paginate(SUBAPP_PAGE, async (page) => {
+    const apps = await paginate(SUBAPP_PAGE, async (_page, offset) => {
       const res = await call<{ SubAppIdInfoSet?: SubApp[] | null; TotalCount?: number }>(ctx, creds, "DescribeSubAppIds", {
-        Offset: (page - 1) * SUBAPP_PAGE,
+        Offset: offset,
         Limit: SUBAPP_PAGE,
       });
       return { items: res.SubAppIdInfoSet ?? [], total: res.TotalCount };
@@ -48,9 +48,9 @@ export const vod: DomainService<TencentCredentials> = {
     const targets: (SubApp | undefined)[] = active.length ? active : [undefined];
     const perApp = await mapLimit(targets, 5, async (app) => {
       try {
-        const domains = await paginate(DOMAIN_PAGE, async (page) => {
+        const domains = await paginate(DOMAIN_PAGE, async (_page, offset) => {
           const res = await call<{ DomainSet?: VodDomain[] | null; TotalCount?: number }>(ctx, creds, "DescribeVodDomains", {
-            Offset: (page - 1) * DOMAIN_PAGE,
+            Offset: offset,
             Limit: DOMAIN_PAGE,
             ...(app && { SubAppId: app.SubAppId }),
           });
