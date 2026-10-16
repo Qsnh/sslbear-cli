@@ -29,6 +29,14 @@
     "sslbear"
   ],
   "license": "MIT",
+  "homepage": "https://github.com/Qsnh/sslbear-cli#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Qsnh/sslbear-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Qsnh/sslbear-cli/issues"
+  },
   "devDependencies": {
     "@types/node": "^22.20.5",
     "commander": "^12.1.0",
