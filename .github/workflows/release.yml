@@ -1,0 +1,44 @@
+# 推送 v* tag 时暂存发布到 npm，并创建 GitHub Release
+# npm 侧走 Trusted Publishing（OIDC）：无需在仓库里存 NPM_TOKEN，需在 npmjs.com 包设置里登记本工作流文件名
+# 暂存的版本需维护者在 npmjs.com 的 Staged Packages 或 `npm stage approve` 用 2FA 批准后才可安装
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # 创建 GitHub Release
+  id-token: write # npm Trusted Publishing 需要 OIDC token
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Node 24 自带 npm 11.19+，满足 npm stage 要求的 npm >= 11.15.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false # 发布构建不使用缓存
+
+      - name: 校验 tag 与 package.json 版本一致
+        run: |
+          PKG_VERSION="v$(node -p "require('./package.json').version")"
+          if [ "$PKG_VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME 与 package.json 版本 $PKG_VERSION 不一致"
+            exit 1
+          fi
+
+      - run: npm ci
+
+      # prepublishOnly 会执行 typecheck、test、build
+      - run: npm stage publish
+
+      - name: 创建 GitHub Release
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
