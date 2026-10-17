@@ -10,8 +10,10 @@ import { enrichFromSsl } from "./ssl.js";
 interface CdnDomain {
   /** 泛域名以点开头，如 .example.com */
   name: string;
-  /** normal / wildcard / pan（泛子域名）/ test */
+  /** normal / wildcard / pan（泛子域名）/ test（七牛分配的测试域名，如 xxx.hd-bkt.clouddn.com） */
   type?: string;
+  /** cdn（静态加速）/ dcdn（全站加速），列表与详情都有 */
+  product?: string;
   /** http / https，即 HTTPS 开关 */
   protocol?: string;
   geoCover?: string;
@@ -20,8 +22,6 @@ interface CdnDomain {
 }
 
 interface CdnDomainDetail extends CdnDomain {
-  /** cdn（静态加速）/ dcdn（全站加速） */
-  product?: string;
   https?: { certId?: string; forceHttps?: boolean; http2Enable?: boolean } | null;
 }
 
@@ -45,7 +45,8 @@ function toRecord(d: CdnDomainDetail): DomainRecord {
 /**
  * CDN 域名（含全站加速 dcdn 域名，二者共用域名管理接口）：列表只有 HTTPS 开关没有证书 ID，
  * 对开启了 HTTPS 的域名逐个查详情（并发 5）取 certId，再从证书列表补全有效期。
- * 已下线 / 冻结的域名照常列出，状态见 status。
+ * 已下线 / 冻结的域名照常列出，状态见 status。七牛给每个新建 bucket 自动分配的测试域名（type test，
+ * 七牛自有的 *.clouddn.com 域名，不能配置 HTTPS、30 天后回收）不是用户的域名，不列出。
  */
 export const cdn: DomainService<AccessKeyCredentials> = {
   key: "cdn",
@@ -54,7 +55,7 @@ export const cdn: DomainService<AccessKeyCredentials> = {
     const domains = await listByMarker(DOMAIN_PAGE, async (query) => {
       const res = await qiniuGet<{ domains?: CdnDomain[] | null; marker?: string }>(ctx, creds, API_HOST, `/domain?${query}`);
       return { items: res.domains ?? [], marker: res.marker };
-    });
+    }).then((list) => list.filter((d) => d.type !== "test"));
     const records = await mapLimit(domains, 5, async (d) => {
       if (d.protocol === "http") return toRecord(d);
       try {

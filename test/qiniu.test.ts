@@ -7,33 +7,53 @@ const QINIU_ENV = { QINIU_ACCESS_KEY: "qiniu-test-ak", QINIU_SECRET_KEY: "qiniu-
 const T = (iso: string) => Math.floor(Date.parse(iso) / 1000);
 const pathOf = (req: FakeRequest) => req.url.pathname + req.url.search;
 
+/** 证书列表条目，按真实响应形态脱敏（uid 为假值） */
+const cert = (o: { certid: string; name: string; common_name: string; dnsnames: string[]; not_before: number; not_after: number }) => ({
+  ...o,
+  uid: 1000000001,
+  create_time: o.not_before + 3600,
+  orderid: "",
+  product_short_name: "",
+  product_type: o.dnsnames.length > 1 ? "multiple" : "single",
+  cert_type: "DV",
+  encrypt: "RSA",
+  encryptParameter: "",
+  enable: false,
+  child_order_id: "",
+  state: "",
+  auto_renew: false,
+  renewable: false,
+});
+
 const CERTS = [
-  {
+  cert({
     certid: "cert-www",
     name: "www-2026",
     common_name: "www.example.com",
     dnsnames: ["www.example.com", "example.com"],
     not_before: T("2026-08-01T00:00:00Z"),
     not_after: T("2026-11-01T00:00:00Z"),
-    create_time: T("2026-08-01T01:00:00Z"),
-  },
-  {
+  }),
+  cert({
     certid: "cert-wild",
     name: "wild",
     common_name: "*.example.com",
     dnsnames: ["*.example.com"],
     not_before: T("2026-07-01T00:00:00Z"),
     not_after: T("2026-10-20T00:00:00Z"),
-  },
+  }),
 ];
 
-/** 证书列表分两页：第一页 marker 为 "2"，第二页 marker 为空 */
-function sslRoute(req: FakeRequest) {
+/**
+ * 证书列表（按真实账号实测的行为）：成功时 code 为 0；marker 是偏移量，非空页返回 offset + limit，
+ * 取完也不会返回空 marker，而是下一页返回空列表与原 marker（如 2 张证书、limit=100：先 "100"，再 [] + "100"）
+ */
+function sslRoute(req: FakeRequest, certs: unknown[] = CERTS) {
   if (req.url.host !== "fusion.qiniuapi.com" || req.url.pathname !== "/sslcert") return undefined;
-  const marker = req.url.searchParams.get("marker");
-  if (marker === "") return { body: { code: 200, error: "", certs: [CERTS[0]], marker: "2" } };
-  if (marker === "2") return { body: { code: 200, error: "", certs: [CERTS[1]], marker: "" } };
-  return undefined;
+  const offset = Number(req.url.searchParams.get("marker") || 0);
+  const limit = Number(req.url.searchParams.get("limit") || 100);
+  const page = certs.slice(offset, offset + limit);
+  return { body: { code: 0, error: "", certs: page, marker: String(page.length ? offset + limit : offset) } };
 }
 
 const DOMAIN_MARKER = "MTc2NTM3MTY5NDE1MzAwMDAwMA==";
@@ -45,8 +65,10 @@ function cdnRoute(req: FakeRequest) {
       return {
         body: {
           domains: [
-            { name: "www.example.com", type: "normal", protocol: "https", geoCover: "china", operatingState: "success" },
-            { name: "img.example.com", type: "normal", protocol: "http", geoCover: "global", operatingState: "success" },
+            { name: "www.example.com", type: "normal", protocol: "https", product: "cdn", geoCover: "china", operatingState: "success" },
+            { name: "img.example.com", type: "normal", protocol: "http", product: "cdn", geoCover: "global", operatingState: "success" },
+            // 新建 bucket 时七牛自动分配的测试域名（真实账号里见到的形态）
+            { name: "abc123xyz.hd-bkt.clouddn.com", type: "test", protocol: "http", product: "cdn", platform: "web", geoCover: "china", operatingState: "success" },
           ],
           marker: DOMAIN_MARKER,
         },
@@ -112,7 +134,8 @@ describe("qiniu 请求格式", () => {
       qboxAuthorization({ accessKey: "qiniu-test-ak", secretKey: "qiniu-test-sk", pathWithQuery: "/sslcert?marker=&limit=100" }),
     );
     expect(call.headers["x-qiniu-date"]).toBeUndefined();
-    expect(fetch.calls[1]!.url.search).toBe("?marker=2&limit=100");
+    expect(fetch.calls[1]!.url.search).toBe("?marker=100&limit=100");
+    expect(fetch.calls).toHaveLength(2);
   });
 });
 
@@ -144,6 +167,17 @@ describe("qiniu certs", () => {
     ]);
   });
 
+  it("超过一页（limit 100）时按偏移量 marker 继续取，取到空页为止", async () => {
+    const many = Array.from({ length: 150 }, (_, i) =>
+      cert({ certid: `c${i}`, name: `c${i}`, common_name: `c${i}.example.com`, dnsnames: [`c${i}.example.com`], not_before: T("2026-08-01T00:00:00Z"), not_after: T("2026-11-01T00:00:00Z") }),
+    );
+    const fetch = fakeFetch((req) => sslRoute(req, many));
+    const r = await runCli(["certs", "--json"], { env: QINIU_ENV, fetch });
+    expect(r.code).toBe(0);
+    expect(fetch.calls.map((c) => c.url.search)).toEqual(["?marker=&limit=100", "?marker=100&limit=100", "?marker=200&limit=100"]);
+    expect(new Set(r.json.data.items.map((c: any) => c.id)).size).toBe(150);
+  });
+
   it("鉴权失败：HTTP 401 + {error, error_code}", async () => {
     const fetch = fakeFetch(() => ({ status: 401, body: { error: "bad token", error_code: "BadToken" } }));
     const r = await runCli(["certs", "--json"], { env: QINIU_ENV, fetch });
@@ -158,10 +192,22 @@ describe("qiniu certs", () => {
     expect(JSON.parse(r.stderr)).toMatchObject({ ok: false, status: "403022" });
   });
 
-  it("HTTP 200 但 code 非 200 也视为失败", async () => {
+  it("成功响应的业务码：0（证书列表）、200（写接口）或缺省都算成功", async () => {
+    for (const code of [0, 200, undefined]) {
+      const fetch = fakeFetch((req) =>
+        req.url.pathname === "/sslcert" ? { body: { code, error: "", certs: req.url.searchParams.get("marker") ? [] : CERTS, marker: "100" } } : undefined,
+      );
+      const r = await runCli(["certs", "--json"], { env: QINIU_ENV, fetch });
+      expect(r.code).toBe(0);
+      expect(r.json.data.items).toHaveLength(2);
+      expect(r.json.data.issues).toEqual([]);
+    }
+  });
+
+  it("HTTP 200 但带其他业务码视为失败", async () => {
     const fetch = fakeFetch(() => ({ body: { code: 400401, error: "无此证书" } }));
     const r = await runCli(["certs", "--json"], { env: QINIU_ENV, fetch });
-    expect(JSON.parse(r.stderr)).toMatchObject({ ok: false, status: "400401" });
+    expect(JSON.parse(r.stderr)).toMatchObject({ ok: false, status: "400401", message: "没有任何查询成功：qiniu/cert 400401 无此证书" });
   });
 
   it("限流（403024 / HTTP 573 / 429）记为 Throttling 并重试", async () => {
@@ -190,7 +236,7 @@ describe("qiniu certs", () => {
 });
 
 describe("qiniu domains", () => {
-  it("CDN：按 marker 翻页，仅对开启 HTTPS 的域名查详情，证书从证书列表补全", async () => {
+  it("CDN：按 marker 翻页，仅对开启 HTTPS 的域名查详情，证书从证书列表补全，不列七牛测试域名", async () => {
     const fetch = fakeFetch((req) => cdnRoute(req) ?? sslRoute(req));
     const r = await runCli(["domains", "-p", "qiniu", "-s", "cdn", "--json"], { env: QINIU_ENV, fetch });
     expect(r.code).toBe(0);
@@ -224,8 +270,11 @@ describe("qiniu domains", () => {
       domain: "img.example.com",
       status: "success",
       https: false,
-      extra: { type: "normal", geoCover: "global" },
+      extra: { type: "normal", product: "cdn", geoCover: "global" },
     });
+    // 七牛分配的测试域名不列出
+    expect(byDomain["abc123xyz.hd-bkt.clouddn.com"]).toBeUndefined();
+    expect(r.json.data.items).toHaveLength(5);
     // 已下线的泛域名照常列出
     expect(byDomain[".example.com"]).toMatchObject({
       status: "offlined",

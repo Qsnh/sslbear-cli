@@ -16,17 +16,17 @@ interface ScmCertificate {
   id: string;
   name?: string;
   domain?: string;
-  /** 附加域名，分号分隔，如 "a.example.com;b.example.com" */
+  /** 附加域名（不含 domain），分号分隔，如 "a.example.com;b.example.com"；没有时为 null */
   sans?: string;
   type?: string;
   brand?: string;
-  /** "2021-05-27 16:46:25.0"，不带时区 */
+  /** "2021-05-27 16:46:25.0"，不带时区，实测为北京时间（证书 notAfter 13:09:53Z 返回 "21:09:53.0"） */
   expire_time?: string;
   /** ISSUED / EXPIRED / UPLOAD（上传托管的证书）等 */
   status?: string;
 }
 
-// 文档未注明时区，与控制台展示一致按北京时间处理；toIso 不认小数秒，先去掉
+// 文档未注明时区，实测为北京时间；toIso 不认小数秒，先去掉
 const scmTime = (s: string | undefined) => toIso(s?.replace(/\.\d+$/, ""));
 
 async function fetchAll(ctx: QueryContext, creds: AccessKeyCredentials): Promise<CertificateRecord[]> {
@@ -46,7 +46,8 @@ async function fetchAll(ctx: QueryContext, creds: AccessKeyCredentials): Promise
       id: c.id,
       name: c.name,
       commonName: c.domain,
-      sans: (c.sans ?? "").split(/[;,]/).map((s) => s.trim()).filter(Boolean),
+      // sans 只是「附加域名」，不含主域名；与证书本身的 SAN 扩展（及其它厂商的输出）保持一致，把主域名放在最前面
+      sans: [...new Set([c.domain ?? "", ...(c.sans ?? "").split(/[;,]/)].map((s) => s.trim()).filter(Boolean))],
       issuer: c.brand,
       notAfter: scmTime(c.expire_time),
       status: c.status,
@@ -62,9 +63,13 @@ export function listScmCertificates(ctx: QueryContext, creds: AccessKeyCredentia
   return cached(ctx, `scm:${creds.accessKeyId}`, () => fetchAll(ctx, creds));
 }
 
+const needsExpiry = (r: DomainRecord) => !!r.cert?.id && !r.cert.notAfter;
+/** 绑定的是 CCM 证书（ID 形如 scs1765868588104；OBS 自有证书自动生成的是 32 位十六进制 ID）但缺通用名，如 OBS 自定义域名 */
+const needsNames = (r: DomainRecord) => !!r.cert?.id && /^scs\d+$/.test(r.cert.id) && !r.cert.commonName;
+
 /**
- * 域名接口只给了证书 ID、缺到期时间时，用 SSL 证书列表按 ID 补全。
- * 补全失败（如没有 SCM 只读权限）只记一条 issue，域名本身照常返回。
+ * 域名接口只给了证书 ID、缺到期时间（或缺 CN / SAN）时，用 SSL 证书列表按 ID 补全；已有的到期时间不覆盖。
+ * 补全失败（如没有 SCM 只读权限）时，有域名缺到期时间才记一条 issue，域名本身照常返回。
  */
 export async function enrichFromScm(
   ctx: QueryContext,
@@ -72,13 +77,13 @@ export async function enrichFromScm(
   warn: Warn,
   records: DomainRecord[],
 ): Promise<DomainRecord[]> {
-  const pending = records.filter((r) => r.cert?.id && !r.cert.notAfter);
+  const pending = records.filter((r) => needsExpiry(r) || needsNames(r));
   if (pending.length === 0) return records;
   let certs: CertificateRecord[];
   try {
     certs = await listScmCertificates(ctx, creds);
   } catch (e) {
-    warn(e, "SSL 证书列表（用于补全到期时间）");
+    if (pending.some(needsExpiry)) warn(e, "SSL 证书列表（用于补全到期时间）");
     return records;
   }
   const byId = new Map(certs.map((c) => [c.id, c]));
@@ -91,7 +96,7 @@ export async function enrichFromScm(
       commonName: r.cert!.commonName ?? c.commonName,
       sans: r.cert!.sans ?? c.sans,
       issuer: r.cert!.issuer ?? c.issuer,
-      notAfter: c.notAfter,
+      notAfter: r.cert!.notAfter ?? c.notAfter,
       status: r.cert!.status ?? c.status,
     });
   }

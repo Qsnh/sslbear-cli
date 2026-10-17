@@ -19,12 +19,19 @@ async function pace(ctx: QueryContext): Promise<void> {
 }
 
 interface QiniuError {
-  /** 业务错误码，如 400401；成功时 fusion 接口也带 code: 200 */
+  /**
+   * 业务码。失败时为 6 位错误码（如 400401），HTTP 状态码同时为 4xx / 5xx；
+   * 成功时各接口不统一：证书列表 GET /sslcert（api 与 fusion 两个 host 都一样）为 0，
+   * 上传证书 POST /sslcert、刷新预取等写接口为 200，域名接口不带 code。
+   */
   code?: number;
   error?: string;
   /** 网关鉴权失败时返回，如 BadToken */
   error_code?: string;
 }
+
+/** 成功响应的业务码：0、200 或缺省；HTTP 2xx 但带其他业务码也按失败处理 */
+const isSuccessCode = (code: unknown) => typeof code !== "number" || code === 0 || code === 200;
 
 /**
  * 把七牛的错误响应转成 CloudApiError。限流（HTTP 429 / 573、业务码 403024）统一记为 Throttling、
@@ -66,7 +73,7 @@ export async function qiniuGet<T>(ctx: QueryContext, creds: AccessKeyCredentials
       if (raw.status >= 400) throw toError(raw.status, undefined, raw.text);
       throw new CloudApiError("qiniu", "InvalidResponse", `响应不是合法 JSON（HTTP ${raw.status}）：${raw.text.slice(0, 200)}`, undefined, raw.status);
     }
-    if (raw.status >= 400 || (typeof body?.code === "number" && body.code !== 200)) throw toError(raw.status, body, raw.text);
+    if (raw.status >= 400 || !isSuccessCode(body?.code)) throw toError(raw.status, body, raw.text);
     return body as T;
   });
 }
@@ -75,7 +82,9 @@ const MAX_PAGES = 1000;
 
 /**
  * marker 分页：返回的 marker 为空（或与上次相同、或本页为空）即取完。
- * 七牛的列表接口都不返回总数，接口悄悄截小 limit 时也会按 marker 继续取。
+ * 七牛的列表接口都不返回总数，接口悄悄截小 limit 时也会按 marker 继续取。实测两种 marker：
+ * 域名列表是游标，最后一页仍带 marker，再取一页才返回空列表与空 marker；
+ * 证书列表是偏移量（非空页返回 offset + limit），从不为空，取完后下一页返回空列表与原 marker。
  */
 export async function listByMarker<T>(
   limit: number,

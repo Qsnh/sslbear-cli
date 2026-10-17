@@ -7,17 +7,18 @@ import type { CertificateRecord, DomainRecord } from "../../types.js";
 import type { Warn } from "../registry.js";
 import { FUSION_HOST, listByMarker, qiniuGet } from "./client.js";
 
+/** 列表还有 uid、create_time、product_type（single / multiple_wildcard 等）、encrypt（RSA / ECDSA）、enable、state 等字段，未使用 */
 interface SslCert {
   certid: string;
   name?: string;
   common_name?: string;
   dnsnames?: string[] | null;
-  /** Unix 秒 */
+  /** Unix 秒（UTC） */
   not_before?: number;
   not_after?: number;
 }
 
-// 文档未写 limit 上限（默认 10）；取完以 marker 为准，不依赖 limit
+// 文档未写 limit 上限（默认 10）；marker 是偏移量，取完以空页为准，不依赖 limit
 const PAGE = 100;
 
 const unixToIso = (v: number | undefined) => (v ? toIso(v) : undefined);

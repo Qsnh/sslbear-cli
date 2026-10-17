@@ -22,8 +22,21 @@ interface CdnDomain {
   domain_status?: string;
   business_type?: string;
   service_area?: string;
-  /** 0 未开启 HTTPS，1 开启 */
+  /** 0 未开启 HTTPS，其余为开启（文档只写了 1，实测还有 2 / 3） */
   https_status?: number;
+}
+
+/** 「certificates」里的单张证书，双证书（国际 + 国密）时各一条 */
+interface HttpsCertItem {
+  /** server 国际证书，server_sm 国密证书 */
+  certificate_type?: string;
+  /** 0 自有证书，2 SCM 证书 */
+  certificate_source?: number;
+  certificate_name?: string;
+  /** PEM 证书内容 */
+  certificate_value?: string | null;
+  /** 证书过期时间，毫秒时间戳 */
+  expire_time?: number;
 }
 
 interface HttpsDetail {
@@ -35,20 +48,27 @@ interface HttpsDetail {
   certificate_type?: number;
   /** 证书过期时间，毫秒时间戳 */
   expiration_time?: number;
-  /** 0 未启用，1 / 2 已启用 */
+  /** 0 未启用，其余为已启用（文档写 1 / 2，实测还有 3） */
   https_status?: number;
+  /** 实测接口还会返回证书数组；外层字段只描述其中一张，配了双证书时要看这里 */
+  certificates?: HttpsCertItem[] | null;
 }
 
 const CERT_SOURCE: Record<number, string> = { 0: "user", 1: "managed", 2: "scm" };
 
-function toCert(h: HttpsDetail): CertInfo & { source?: string } {
-  const pem = parsePem(h.certificate);
-  return compact({
-    name: h.cert_name,
-    ...pem,
-    notAfter: pem?.notAfter ?? toIso(h.expiration_time),
-    source: h.certificate_type === undefined ? undefined : (CERT_SOURCE[h.certificate_type] ?? String(h.certificate_type)),
-  });
+const sourceOf = (n: number | undefined) => (n === undefined ? undefined : (CERT_SOURCE[n] ?? String(n)));
+
+function toCert(name: string | undefined, pemText: string | null | undefined, expire: number | undefined, source: number | undefined): CertInfo & { source?: string } {
+  const pem = parsePem(pemText);
+  return compact({ name, ...pem, notAfter: pem?.notAfter ?? toIso(expire), source: sourceOf(source) });
+}
+
+/** 一条 HTTPS 记录里的所有证书：有 certificates 数组时以它为准（双证书时国际、国密各一条），否则用外层字段 */
+function certsOf(h: HttpsDetail): (CertInfo & { source?: string })[] {
+  if (h.certificates?.length) {
+    return h.certificates.map((c) => toCert(c.certificate_name, c.certificate_value, c.expire_time, c.certificate_source));
+  }
+  return [toCert(h.cert_name, h.certificate, h.expiration_time, h.certificate_type)];
 }
 
 /** 加速域名列表 + 「查询所有绑定HTTPS证书的域名信息」两次分页查询后按域名合并，避免逐个域名查配置 */
@@ -81,7 +101,7 @@ export const cdn: DomainService<AccessKeyCredentials> = {
       // 域名列表里的 HTTPS 开关为准；缺该字段时看 HTTPS 列表里是否启用
       const enabled = entries.filter((h) => h.https_status !== 0);
       const https = d.https_status === undefined ? enabled.length > 0 : d.https_status !== 0;
-      const best = https ? earliest(entries.map(toCert)) : undefined;
+      const best = https ? earliest(entries.flatMap(certsOf)) : undefined;
       const { source, ...cert } = best ?? {};
       return compact({
         provider: "huawei" as const,

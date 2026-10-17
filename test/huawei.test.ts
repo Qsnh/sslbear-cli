@@ -80,7 +80,7 @@ describe("huawei 请求格式", () => {
 });
 
 describe("huawei certs", () => {
-  it("SCM 证书：北京时间（带小数秒）换算成 UTC，附加域名按分号拆分，上传的证书来源记为 upload", async () => {
+  it("SCM 证书：北京时间（带小数秒）换算成 UTC，附加域名按分号拆分并补上主域名，上传的证书来源记为 upload", async () => {
     const r = await runCli(["certs", "--json"], { env: HUAWEI_ENV, fetch: fakeFetch(scmRoute) });
     expect(r.code).toBe(0);
     expect(r.json.data.items).toEqual([
@@ -89,7 +89,7 @@ describe("huawei certs", () => {
         id: "scs1554192131150",
         name: "wild",
         commonName: "*.example.cn",
-        sans: ["example.cn", "static.example.cn"],
+        sans: ["*.example.cn", "example.cn", "static.example.cn"],
         issuer: "GEOTRUST",
         notAfter: "2026-10-30T04:00:00.000Z",
         status: "ISSUED",
@@ -101,6 +101,7 @@ describe("huawei certs", () => {
         id: "scs1554192131151",
         name: "uploaded",
         commonName: "up.example.cn",
+        sans: ["up.example.cn"],
         notAfter: "2026-12-01T00:00:00.000Z",
         status: "UPLOAD",
         source: "upload",
@@ -148,9 +149,11 @@ describe("huawei cdn", () => {
       if (req.url.pathname === "/v1.0/cdn/domains") {
         return {
           body: {
-            total: 3,
+            total: 4,
             domains: [
               { domain_name: "static.example.cn", domain_status: "online", business_type: "web", service_area: "mainland_china", https_status: 1 },
+              // 实测开启 HTTPS 的域名 https_status 为 2 / 3，不只是文档写的 1
+              { domain_name: "dual.example.cn", domain_status: "online", business_type: "web", service_area: "mainland_china", https_status: 3 },
               { domain_name: "dl.example.cn", domain_status: "offline", business_type: "download", service_area: "global", https_status: 0 },
               { domain_name: "img.example.cn", domain_status: "online", business_type: "web", service_area: "mainland_china", https_status: 1 },
             ],
@@ -160,8 +163,22 @@ describe("huawei cdn", () => {
       if (req.url.pathname === "/v1.0/cdn/domains/https-certificate-info") {
         return {
           body: {
-            total: 4,
+            total: 5,
             https: [
+              {
+                // 真实响应在外层字段之外还带 certificates 数组；双证书时外层只描述其中一张
+                domain_name: "dual.example.cn",
+                cert_name: "dual-rsa",
+                certificate: LEAF_PEM,
+                private_key: "",
+                certificate_type: 0,
+                expiration_time: Date.parse("2026-10-30T12:00:00Z"),
+                https_status: 3,
+                certificates: [
+                  { certificate_type: "server", certificate_source: 0, certificate_name: "dual-rsa", certificate_value: LEAF_PEM, private_key: "", expire_time: Date.parse("2026-10-30T12:00:00Z") },
+                  { certificate_type: "server_sm", certificate_source: 2, certificate_name: "dual-sm2", certificate_value: "", expire_time: Date.parse("2026-10-25T00:00:00Z") },
+                ],
+              },
               {
                 domain_name: "static.example.cn",
                 cert_name: "static-sm2",
@@ -227,6 +244,13 @@ describe("huawei cdn", () => {
       status: "offline",
       https: false,
       extra: { businessType: "download", serviceArea: "global" },
+    });
+    // certificates 数组里的国密证书先到期
+    expect(items["dual.example.cn"]).toMatchObject({
+      https: true,
+      cert: { name: "dual-sm2", notAfter: "2026-10-25T00:00:00.000Z" },
+      extra: { certSource: "scm" },
+      daysLeft: 10,
     });
     // PEM 解析失败时退回接口给的毫秒时间戳
     expect(items["img.example.cn"]).toMatchObject({
@@ -300,14 +324,22 @@ describe("huawei live", () => {
             body: {
               total: 3,
               certificates_info: [
-                // 国密证书与国际证书各一条，取先到期的国际证书
-                { play_domain: "play.example.cn", cert_type: 1, gm_cert_type: 1, source: "scm", cert_id: "scs-gm", cert_name: "gm", start_time: "2026-03-01T00:00:00Z", expire_time: "2027-03-01T00:00:00Z" },
-                { play_domain: "play.example.cn", cert_type: 0, source: "user", start_time: "2026-09-01T00:00:00Z", expire_time: "2026-12-01T00:00:00Z" },
-                // 缺到期时间，按证书 ID 从 SCM 补全
+                // 国密证书与国际证书各一条，取先到期的国际证书；列表时间按真实响应比证书有效期早 8 小时
+                { play_domain: "play.example.cn", cert_type: 1, gm_cert_type: 1, source: "scm", cert_id: "scs-gm", cert_name: "gm", start_time: "2026-02-28T16:00:00Z", expire_time: "2027-02-28T16:00:00Z" },
+                { play_domain: "play.example.cn", cert_type: 0, gm_cert_type: 0, source: "user", cert_name: "", cert_id: "", start_time: "2026-07-31T16:00:00Z", expire_time: "2026-10-30T04:00:00Z" },
+                // 缺到期时间且取不到 PEM，按证书 ID 从 SCM 补全
                 { play_domain: "play2.example.cn", cert_type: 0, source: "scm", cert_id: "scs1554192131150", cert_name: "wild" },
               ],
             },
           };
+        }
+        if (path === "/v1/p-bj4/guard/https-cert") {
+          const domain = req.url.searchParams.get("domain");
+          // 真实响应：国际证书在 certificate 与 tls_certificate.certificate 各一份，私钥为空串
+          if (domain === "play.example.cn") {
+            return { body: { certificate_format: "PEM", certificate: LEAF_PEM, certificate_key: "", force_redirect: false, gm_certificate: {}, tls_certificate: { certificate: LEAF_PEM } } };
+          }
+          if (domain === "play2.example.cn") return { body: { certificate_format: "", certificate: "", certificate_key: "", gm_certificate: {}, tls_certificate: {} } };
         }
       }
       if (req.url.host === "live.cn-north-1.myhuaweicloud.com") return apigError(400, "LIVE.100011009", "The requested user does not exist.");
@@ -346,6 +378,13 @@ describe("huawei live", () => {
     expect(liveCall.headers["x-project-id"]).toBe("p-bj4");
     expect(liveCall.headers.authorization).toMatch(/SignedHeaders=host;x-project-id;x-sdk-date,/);
     expect(Object.fromEntries(liveCall.url.searchParams)).toEqual({ offset: "0", limit: "100" });
+    // 只对证书列表里出现的播放域名取证书内容，每个域名一次
+    expect(
+      fetch.calls
+        .filter((c) => c.url.pathname.endsWith("/guard/https-cert"))
+        .map((c) => `${c.url.host} ${c.url.searchParams.get("domain")}`)
+        .sort(),
+    ).toEqual(["live.cn-north-4.myhuaweicloud.com play.example.cn", "live.cn-north-4.myhuaweicloud.com play2.example.cn"]);
 
     const items = r.json.data.items;
     expect(items.filter((d: any) => d.domain === "play.example.cn")).toHaveLength(1);
@@ -356,9 +395,16 @@ describe("huawei live", () => {
       domain: "play.example.cn",
       status: "on",
       https: true,
-      cert: { notBefore: "2026-09-01T00:00:00.000Z", notAfter: "2026-12-01T00:00:00.000Z" },
+      // 时间、CN、SAN、签发者都取自 PEM（证书真实有效期 2026-08-01 ~ 2026-10-30T12:00Z）
+      cert: {
+        commonName: "static.example.cn",
+        sans: ["static.example.cn", "*.example.cn"],
+        issuer: "SSLBear Test CA",
+        notBefore: "2026-08-01T00:00:00.000Z",
+        notAfter: "2026-10-30T12:00:00.000Z",
+      },
       extra: { region: "cn-north-4", type: "pull", serviceArea: "mainland_china", certSource: "user" },
-      daysLeft: 47,
+      daysLeft: 15,
     });
     expect(map["push.example.cn"]).toEqual({
       provider: "huawei",
@@ -375,7 +421,7 @@ describe("huawei live", () => {
         id: "scs1554192131150",
         name: "wild",
         commonName: "*.example.cn",
-        sans: ["example.cn", "static.example.cn"],
+        sans: ["*.example.cn", "example.cn", "static.example.cn"],
         notAfter: "2026-10-30T04:00:00.000Z",
         status: "ISSUED",
       },
@@ -417,6 +463,49 @@ describe("huawei live", () => {
     expect(fetch.calls.filter((c) => c.url.pathname === "/v1/p-bj4/domain")).toHaveLength(2);
   });
 
+  it("证书列表的 offset 是页码（从 0 开始）；取证书内容失败时记 issue，到期时间用证书列表的并补回 8 小时", async () => {
+    const onlyBj4 = [{ id: "p-bj4", name: "cn-north-4" }];
+    const listed = [
+      ...Array.from({ length: 100 }, (_, i) => ({ play_domain: `gone${i}.example.cn`, cert_type: 0, source: "user", expire_time: "2026-12-01T00:00:00Z" })),
+      { play_domain: "a.example.cn", cert_type: 0, source: "scm", cert_id: "scs-a", cert_name: "a", start_time: "2026-09-30T16:00:00Z", expire_time: "2026-12-30T16:00:00Z" },
+    ];
+    const fetch = fakeFetch((req) => {
+      const iam = iamRoute(req, onlyBj4);
+      if (iam) return iam;
+      const path = req.url.pathname;
+      if (path === "/v1/p-bj4/domain") {
+        return { body: { total: 2, domain_info: [{ domain: "a.example.cn", domain_type: "pull", status: "on" }, { domain: "push.example.cn", domain_type: "push", status: "on" }] } };
+      }
+      if (path === "/v2/p-bj4/certificates") {
+        const page = Number(req.url.searchParams.get("offset"));
+        const limit = Number(req.url.searchParams.get("limit"));
+        // 真实接口：offset * limit 超出总数时报 page too large
+        if (page * limit >= listed.length) return apigError(400, "LIVE.100011001", "page too large");
+        return { body: { total: listed.length, certificates_info: listed.slice(page * limit, (page + 1) * limit) } };
+      }
+      if (path === "/v1/p-bj4/guard/https-cert") return apigError(403, "LIVE.100011003", "Permission denied");
+      return undefined;
+    });
+    const r = await runCli(["domains", "-p", "huawei", "-s", "live", "--json"], { env: HUAWEI_ENV, fetch });
+    expect(r.code).toBe(0);
+    expect(fetch.calls.filter((c) => c.url.pathname === "/v2/p-bj4/certificates").map((c) => c.url.searchParams.get("offset"))).toEqual(["0", "1"]);
+    // 不在域名列表里的播放域名不取证书内容
+    expect(fetch.calls.filter((c) => c.url.pathname === "/v1/p-bj4/guard/https-cert").map((c) => c.url.searchParams.get("domain"))).toEqual(["a.example.cn"]);
+    expect(byDomain(r.json.data.items)["a.example.cn"]).toEqual({
+      provider: "huawei",
+      service: "live",
+      domain: "a.example.cn",
+      status: "on",
+      https: true,
+      cert: { id: "scs-a", name: "a", notBefore: "2026-10-01T00:00:00.000Z", notAfter: "2026-12-31T00:00:00.000Z" },
+      extra: { region: "cn-north-4", type: "pull", certSource: "scm" },
+      daysLeft: 77,
+    });
+    expect(r.json.data.issues).toEqual([
+      expect.objectContaining({ service: "live", kind: "error", target: "domain a.example.cn HTTPS 证书内容（到期时间改用证书列表）", code: "LIVE.100011003" }),
+    ]);
+  });
+
   it("账号下没有直播地域的项目时报错", async () => {
     const r = await runCli(["domains", "-p", "huawei", "-s", "live", "--json"], {
       env: HUAWEI_ENV,
@@ -444,6 +533,8 @@ const CUSTOM_DOMAINS = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
   <Domains><DomainName>mtls.example.cn</DomainName><CreateTime>2019-03-13T10:22:05.912Z</CreateTime><CertName>ca</CertName><CertificateId>scs0000000000013</CertificateId><CertificateType>client</CertificateType></Domains>
   <Domains><DomainName>http.example.cn</DomainName><CreateTime>2019-03-13T10:22:05.912Z</CreateTime></Domains>
   <Domains><DomainName>old.example.cn</DomainName><CreateTime>2019-03-13T10:22:05.912Z</CreateTime><CertificateId>scs1554192131150</CertificateId></Domains>
+  <Domains><DomainName>ccm.example.cn</DomainName><CreateTime>2026-10-17T14:19:01.094Z</CreateTime><CertName>wild</CertName><CertificateId>scs1554192131150</CertificateId><CertificateType>server</CertificateType><ExpiredTime>2026-10-30T04:00:00.000Z</ExpiredTime></Domains>
+  <Domains><DomainName>own.example.cn</DomainName><CreateTime>2026-10-17T14:18:46.022Z</CreateTime><CertName>own</CertName><CertificateId>000001A14A3ABD8282E7B4974512770A</CertificateId><CertificateType>server</CertificateType><ExpiredTime>2027-01-15T13:09:53.000Z</ExpiredTime></Domains>
 </ListBucketCustomDomainsResult>`;
 
 describe("huawei obs", () => {
@@ -464,7 +555,7 @@ describe("huawei obs", () => {
     const r = await runCli(["domains", "-p", "huawei", "-s", "obs", "--json"], { env: { ...HUAWEI_ENV, HUAWEICLOUD_SDK_SECURITY_TOKEN: "tok" }, fetch });
     expect(r.code).toBe(0);
     const map = byDomain(r.json.data.items);
-    expect(Object.keys(map).sort()).toEqual(["cdn.example.cn", "http.example.cn", "mtls.example.cn", "old.example.cn"]);
+    expect(Object.keys(map).sort()).toEqual(["ccm.example.cn", "cdn.example.cn", "http.example.cn", "mtls.example.cn", "old.example.cn", "own.example.cn"]);
     expect(map["cdn.example.cn"]).toEqual({
       provider: "huawei",
       service: "obs",
@@ -488,6 +579,17 @@ describe("huawei obs", () => {
       cert: { id: "scs1554192131150", name: "wild", commonName: "*.example.cn", notAfter: "2026-10-30T04:00:00.000Z" },
       daysLeft: 15,
     });
+    // 绑定 CCM 证书（scs 开头的 ID）的域名从证书列表补 CN / SAN；自有证书自动生成的 ID 不在列表里，保持原样
+    expect(map["ccm.example.cn"].cert).toEqual({
+      id: "scs1554192131150",
+      name: "wild",
+      commonName: "*.example.cn",
+      sans: ["*.example.cn", "example.cn", "static.example.cn"],
+      issuer: "GEOTRUST",
+      notAfter: "2026-10-30T04:00:00.000Z",
+      status: "ISSUED",
+    });
+    expect(map["own.example.cn"].cert).toEqual({ id: "000001A14A3ABD8282E7B4974512770A", name: "own", notAfter: "2027-01-15T13:09:53.000Z" });
     expect(r.json.data.issues).toEqual([
       expect.objectContaining({ service: "obs", kind: "error", target: "bucket locked", code: "AccessDenied", requestId: "obs-req" }),
     ]);

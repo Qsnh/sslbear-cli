@@ -102,6 +102,46 @@ describe("aliyun domains", () => {
     expect(r.json.data.items).toHaveLength(501);
     expect(r.json.data.issues).toEqual([]);
     expect(fetch.calls.filter((c) => c.action === "DescribeUserDomains")).toHaveLength(2);
+    // 没有开启 HTTPS 的域名，不查证书列表
+    expect(fetch.calls.filter((c) => c.action === "DescribeCdnHttpsDomainList")).toHaveLength(0);
+  });
+
+  it("HTTPS 证书列表无权限时只记 issue，域名照常输出，HTTPS 以域名列表的开关为准", async () => {
+    const fetch = fakeFetch((req) => {
+      if (req.action === "DescribeCdnHttpsDomainList") {
+        return rpcError(403, "Forbidden.RAM", "User not authorized to operate on the specified resource, or this API doesn't support RAM.");
+      }
+      return cdnRoutes(req);
+    });
+    const r = await runCli(["domains", "-s", "cdn", "--json"], { env: ALIYUN_ENV, fetch });
+    expect(r.code).toBe(0);
+    expect(r.json.data.items).toEqual([
+      { provider: "aliyun", service: "cdn", domain: "api.example.com", status: "online", https: true },
+      { provider: "aliyun", service: "cdn", domain: "plain.example.com", status: "online", https: false },
+    ]);
+    expect(r.json.data.issues).toEqual([
+      {
+        provider: "aliyun",
+        service: "cdn",
+        target: "HTTPS 证书列表（用于补全证书信息）",
+        kind: "error",
+        code: "Forbidden.RAM",
+        message: "User not authorized to operate on the specified resource, or this API doesn't support RAM.",
+        requestId: "req-1",
+      },
+    ]);
+  });
+
+  it("没有域名时不查 HTTPS 证书列表", async () => {
+    const fetch = fakeFetch((req) => {
+      if (req.action === "DescribeUserDomains") return { body: { TotalCount: 0, Domains: { PageData: [] } } };
+      if (req.action === "DescribeLiveUserDomains") return { body: { TotalCount: 0, Domains: { PageData: [] } } };
+      return undefined;
+    });
+    const r = await runCli(["domains", "-s", "cdn,live", "--json"], { env: ALIYUN_ENV, fetch });
+    expect(r.code).toBe(0);
+    expect(r.json.data).toEqual({ items: [], issues: [] });
+    expect(fetch.calls.map((c) => c.action)).toEqual(["DescribeUserDomains", "DescribeLiveUserDomains"]);
   });
 
   it("DCDN 未开通记为 inactive，不影响其他服务与退出码", async () => {
@@ -182,7 +222,8 @@ describe("aliyun domains", () => {
         return {
           body: {
             CertInfos: {
-              CertInfo: [{ CertId: "123-cn-hangzhou", CertName: "vod", CertDomainName: "v1.example.com", CertExpireTime: "2027-01-01T00:00:00Z", Status: "success" }],
+              // 真实响应里 CertDomainName 是证书的全部 SAN（逗号分隔）
+              CertInfo: [{ CertId: "123", CertName: "vod", CertDomainName: "*.example.com,example.com", CertType: "cas", CertStartTime: "2026-10-01T00:00:00Z", CertExpireTime: "2027-01-01T00:00:00Z", Status: "", ServerCertificateStatus: "on" }],
             },
           },
         };
@@ -193,7 +234,14 @@ describe("aliyun domains", () => {
     expect(r.code).toBe(0);
     expect(fetch.calls.filter((c) => c.action === "DescribeVodDomainCertificateInfo")).toHaveLength(2);
     const byDomain = Object.fromEntries(r.json.data.items.map((d: any) => [d.domain, d]));
-    expect(byDomain["v1.example.com"].cert).toMatchObject({ id: "123-cn-hangzhou", notAfter: "2027-01-01T00:00:00.000Z" });
+    expect(byDomain["v1.example.com"].cert).toEqual({
+      id: "123",
+      name: "vod",
+      sans: ["*.example.com", "example.com"],
+      notBefore: "2026-10-01T00:00:00.000Z",
+      notAfter: "2027-01-01T00:00:00.000Z",
+    });
+    expect(byDomain["v1.example.com"].extra).toEqual({ certType: "cas" });
     expect(byDomain["v2.example.com"]).toMatchObject({ https: true });
     expect(byDomain["v2.example.com"].cert).toBeUndefined();
     expect(byDomain["v3.example.com"]).toMatchObject({ https: false });
@@ -658,5 +706,49 @@ describe("aliyun certs", () => {
         daysLeft: 78,
       },
     ]);
+  });
+
+  it("有毫秒时间戳 CertStartTime / CertEndTime 时优先使用，不按只有日期的 EndDate 推算", async () => {
+    // 真实响应（脱敏）：EndDate 是 UTC 日期，CertEndTime 才是精确到期时刻
+    const fetch = fakeFetch((req) => {
+      if (req.action !== "ListUserCertificateOrder") return undefined;
+      if (req.url.searchParams.get("Status") === "EXPIRED") {
+        return {
+          body: {
+            TotalCount: 1,
+            CertificateOrderList: [
+              { CertificateId: 11, Name: "utc-eod", CommonName: "a.example.com", Status: "EXPIRED", Expired: true, Upload: true, StartDate: "2024-07-16", EndDate: "2025-07-16", CertStartTime: 1721088000000, CertEndTime: 1752710399000 },
+            ],
+          },
+        };
+      }
+      return {
+        body: {
+          TotalCount: 1,
+          CertificateOrderList: [
+            {
+              CertificateId: 27905865,
+              Name: "sslbear-test-ec",
+              CommonName: "sslbear-test.example.com",
+              Sans: "*.sslbear-test.example.com,sslbear-test.example.com",
+              Issuer: "Let's Encrypt",
+              Status: "ISSUED",
+              Expired: false,
+              Upload: true,
+              StartDate: "2026-10-17",
+              EndDate: "2027-01-15",
+              CertStartTime: 1792242594000,
+              CertEndTime: 1800018593000,
+            },
+          ],
+        },
+      };
+    });
+    const r = await runCli(["certs", "--json"], { env: ALIYUN_ENV, fetch });
+    expect(r.code).toBe(0);
+    const byId = Object.fromEntries(r.json.data.items.map((c: any) => [c.id, c]));
+    expect(byId["27905865"]).toMatchObject({ notBefore: "2026-10-17T13:09:54.000Z", notAfter: "2027-01-15T13:09:53.000Z", daysLeft: 92, status: "ISSUED" });
+    // 按 EndDate 推算会得到 2025-07-16T15:59:59Z，比实际早 8 小时
+    expect(byId["11"]).toMatchObject({ notBefore: "2024-07-16T00:00:00.000Z", notAfter: "2025-07-16T23:59:59.000Z", status: "EXPIRED" });
   });
 });

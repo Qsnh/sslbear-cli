@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { loadEnvFile, mask, parseDotenv, readAliyun, readTencent } from "../src/lib/env.js";
 import { CloudApiError, withRetry } from "../src/lib/http.js";
+import { renderDomains } from "../src/render.js";
 import { displayWidth, renderTable } from "../src/lib/table.js";
 import { daysUntil, toIso } from "../src/lib/time.js";
 import { xmlBlocks, xmlText } from "../src/lib/xml.js";
@@ -158,5 +159,17 @@ describe("withRetry", () => {
       }),
     ).rejects.toThrow("bad request");
     expect(n).toBe(1);
+  });
+});
+
+describe("renderDomains", () => {
+  it("平台默认域名的证书列显示「平台托管」", () => {
+    const out = renderDomains([
+      { provider: "tencent", service: "vod", domain: "1250000000.vod2.myqcloud.com", https: true, extra: { managed: "platform" } },
+      { provider: "tencent", service: "vod", domain: "v.example.com", https: false },
+    ]);
+    const lines = out.split("\n");
+    expect(lines.find((l) => l.includes("vod2.myqcloud.com"))).toContain("平台托管");
+    expect(lines.find((l) => l.includes("v.example.com"))).not.toContain("平台托管");
   });
 });

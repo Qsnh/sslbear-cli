@@ -25,7 +25,7 @@ interface DcdnDomain {
       CertSource?: string;
       /** Deployed / Waiting / Deploying */
       DeployStatus?: string;
-      /** RFC 3339 UTC，如 2023-08-20T07:59:59Z */
+      /** RFC 3339 UTC，如 2023-08-20T07:59:59Z（实测与证书真实到期时刻一致，不是标成 Z 的北京时间） */
       Expire?: string;
     } | null;
   } | null;
@@ -57,7 +57,8 @@ export const dcdn: DomainService<AccessKeyCredentials> = {
     });
     const records = domains.map((d) => {
       const bind = d.Https?.CertBind;
-      // 没有开关字段时按文档的缺省行为：绑定了证书即开启
+      // 没有开关字段时按文档的缺省行为：绑定了证书即开启。
+      // 绑定证书但 EnableHttps=false 时按开关记为未开启（实测边缘节点仍用该证书完成 TLS 握手，HTTPS 请求照常回源）
       const https = d.Https?.EnableHttps ?? !!bind?.CertId;
       return compact({
         provider: "volcengine" as const,

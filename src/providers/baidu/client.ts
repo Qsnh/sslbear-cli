@@ -1,6 +1,6 @@
 import type { AccessKeyCredentials } from "../../lib/env.js";
 import { CloudApiError, send, withRetry, type QueryContext } from "../../lib/http.js";
-import { bceAuthorization, bceTimestamp, canonicalPath, canonicalQuery } from "./sign.js";
+import { bceAuthorization, bceTimestamp, canonicalPath, uriEncode } from "./sign.js";
 
 export interface BceRequest {
   host: string;
@@ -37,7 +37,10 @@ export async function callBce<T>(ctx: QueryContext, creds: AccessKeyCredentials,
       headers: { ...headers, host: req.host },
       timestamp,
     });
-    const qs = canonicalQuery(query);
+    // 值为空的参数在 URL 里只写参数名（如 config?https，与官方 SDK 一致），签名里仍按规范写成 https=
+    const qs = Object.entries(query)
+      .map(([k, v]) => (v === "" ? uriEncode(k) : `${uriEncode(k)}=${uriEncode(v)}`))
+      .join("&");
     const raw = await send(ctx, "baidu", `https://${req.host}${canonicalPath(req.path)}${qs ? `?${qs}` : ""}`, { method: "GET", headers });
     let body: unknown;
     try {
@@ -53,7 +56,7 @@ export async function callBce<T>(ctx: QueryContext, creds: AccessKeyCredentials,
     if (raw.status >= 400) {
       const err = (body ?? {}) as BceErrorBody;
       const code = err.code || `HTTP${raw.status}`;
-      const message = err.message || `HTTP ${raw.status}`;
+      const message = err.message || `HTTP ${raw.status}${raw.text.trim() ? "" : "（响应体为空）"}`;
       if (THROTTLE.test(code)) {
         throw new CloudApiError("baidu", "Throttling", `${code}: ${message}`, err.requestId, raw.status);
       }

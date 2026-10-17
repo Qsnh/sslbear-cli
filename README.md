@@ -129,6 +129,7 @@ sslbear-cli domains [选项]
 
 - 时间字段统一为 ISO 8601（UTC），`daysLeft` 为剩余天数，负数表示已过期。
 - 各云服务返回的字段不完全一致，`cert` 里只输出该服务实际提供的字段（如 OSS 只有证书 ID 和有效期，没有证书名）。
+- `extra.managed: "platform"` 表示云厂商分配的平台默认域名（如腾讯云 `*.myqcloud.com`、`*.vod-qcloud.com`），用云厂商自己的证书提供 HTTPS，用户无需续期：不带 `cert`、不计入到期统计，表格的证书列显示「平台托管」。
 - `issues` 记录各服务的查询问题：`kind: "inactive"` 表示该服务未开通或无资源，`kind: "error"` 表示调用失败（含错误码和 RequestId）；逐个 bucket / 站点 / 应用展开查询的服务，单个子项失败时用 `target` 标明是哪一个，其余子项照常返回。
 - 退出码：`0` 成功（部分服务失败时仍返回 0，详情见 `issues`）；`1` 所有查询都失败（如凭证无效、网络不通）；`2` 参数或凭证配置错误。失败时 stderr 输出 `{"ok":false,"status":...,"message":"..."}`。
 
@@ -143,20 +144,25 @@ sslbear-cli domains [选项]
 - 百度智能云：`CdnReadAccessPolicy`（CDN 只读）、`CASReadPolicy`（证书管理只读，需产品级权限）。
 - 七牛云：没有现成的只读系统策略，可用主账号 AK，或给 IAM 子账号自定义策略授权 `cdn/GetDomainList`、`cdn/GetDomainInfo`。
 
-部分服务的域名接口只返回证书 ID，会用该云的证书列表按 ID 补全到期时间（腾讯云直播、点播、EdgeOne、COS，火山引擎 DCDN、TOS、点播、veImageX，华为云直播、OBS，百度智能云 CDN，七牛云 CDN），因此建议同时授予证书服务的只读权限；补全失败只记一条 issue，域名照常输出。
+部分服务的域名接口只返回证书 ID，会用该云的证书列表按 ID 补全到期时间（腾讯云直播、点播、EdgeOne、COS，火山引擎 DCDN、TOS、点播、veImageX，华为云直播、OBS，百度智能云 CDN，七牛云 CDN），因此建议同时授予证书服务的只读权限；补全失败只记一条 issue，域名照常输出。阿里云 CDN、DCDN、直播的证书信息来自各自的 HTTPS 证书列表接口，查不到（如缺权限）时同样只记一条 issue、域名照常输出（CDN、DCDN 的 HTTPS 以域名列表里的开关为准；直播没有开关，此时显示为关闭）。
 
 缺少某个服务的权限时，只有该服务会出现在 `issues` 里，其余服务照常输出。
 
 ## 已知限制
 
-- 阿里云视频点播只查询上海地域（`vod.cn-shanghai.aliyuncs.com`）。
-- 阿里云 ESA 只查询中国站接入点（`esa.cn-hangzhou.aliyuncs.com`），国际站（`ap-southeast-1` 接入点）暂未适配。ESA 的证书配置在站点上，记录绑定的证书按证书通用名和 SAN 匹配得出；多张证书都匹配时按 ESA 的选择优先级取有效期内、配置时间较晚的那张，RSA 与 ECC 证书同时有效时取先到期的那张。HTTPS 列要求站点的 SSL/TLS 配置（全局配置与 SSL/TLS 规则）对该域名开启了 HTTPS，并且有已签发的匹配证书（只有申请中 / 申请失败的证书记为关闭）。JSON 里 `extra.httpsSwitch` 为开关状态 `on` / `off` / `partial`，`extra.httpsRule` 为决定结果的规则名；partial 表示有规则的条件无法按域名判断（如引用了自定义列表，或用了无法解析的写法），此时按开启处理并照常展示证书，宁可多报到期；SSL/TLS 配置查询失败时没有 `httpsSwitch`，HTTPS 只按证书判断。泛域名记录按记录名本身（如 `*.example.com`）匹配规则；SaaS 域名以其自身的 SSL 开关为准。只解析不加速的记录不列出，边缘函数、边缘容器和四层加速的记录暂不支持。
-- 腾讯云 COS 只列存储桶的自定义源站域名，HTTPS 以该域名的证书配置为「已启用」为准；经过 CDN 加速的 COS 域名出现在腾讯云 CDN 的结果里。每个域名要单独查一次证书配置，域名多时请求较多（并发 5）。
-- 火山引擎视频直播、TOS 的读接口不返回 HTTPS 开关，以「绑定了证书」视为开启 HTTPS。视频点播、veImageX 只查华北与亚太东南（柔佛）两个地域，HTTPS 配置要逐域名查询，域名多时较慢。`certs` 只列证书中心里已签发的 SSL 证书，不含 CDN 自托管证书和私有 CA 证书。
-- 华为云只适配中国站（CDN 走 `cdn.myhuaweicloud.com`，证书列表走 `scm.cn-north-4.myhuaweicloud.com`）。CDN 一次拉取所有企业项目下的域名。视频直播按 IAM 项目逐地域查询 cn-north-4、cn-north-1、cn-east-3、ap-southeast-3、ap-southeast-2，只查各地域的主项目，没用到直播的地域静默跳过；直播没有 HTTPS 开关，播放域名配置了证书即视为开启 HTTPS。OBS 只列对象桶（不含并行文件系统），自定义域名绑定了服务端证书（含国密）才算 HTTPS。证书列表的到期时间不带时区，按北京时间处理。
-- 百度智能云只覆盖境内 CDN（海外 CDN 未覆盖）；`certs` 只列证书管理里的证书，不单独查询 SSL 证书服务里购买的证书；使用平台通用证书（`cert-common`）的域名没有到期时间。
-- 七牛云只支持 CDN（含全站加速）域名，对象存储 Kodo 的自定义域名不在其中；泛域名按七牛的写法以点开头（如 `.example.com`）；已下线、冻结的域名也会列出，用 `status` 区分。开启了 HTTPS 的域名要逐个查详情，七牛接口限 10 QPS，域名多时约每秒 8 个。
-- 阿里云 CAS 证书列表接口只返回到期日期、不含具体时刻，按到期当天 23:59:59（北京时间）计算剩余天数。
+以下行为已在 2026-10 用各云真实账号验证（TLS 握手实测下发的证书与 CLI 报告一致）。
+
+- 阿里云视频点播只查询上海地域（`vod.cn-shanghai.aliyuncs.com`），点播证书只有 SAN、没有通用名。直播推流域名不能配 HTTPS，会显示为关闭；直播把 HTTPS 关掉时证书会被一并删除，不存在「绑了证书但关闭」的状态。
+- 阿里云 ESA 只查询中国站接入点（`esa.cn-hangzhou.aliyuncs.com`），国际站（`ap-southeast-1` 接入点）暂未适配。ESA 的证书配置在站点上，记录绑定的证书按证书通用名和 SAN 匹配得出；多张证书都匹配时按 ESA 的选择优先级取有效期内、配置时间较晚的那张，RSA 与 ECC 证书同时有效时取先到期的那张。HTTPS 列要求站点的 SSL/TLS 配置（全局配置与 SSL/TLS 规则）对该域名开启了 HTTPS，并且有已签发的匹配证书（只有申请中 / 申请失败的证书记为关闭）。JSON 里 `extra.httpsSwitch` 为开关状态 `on` / `off` / `partial`，`extra.httpsRule` 为决定结果的规则名；partial 表示有规则的条件无法按域名判断（如引用了自定义列表，或用了无法解析的写法），此时按开启处理并照常展示证书，宁可多报到期；SSL/TLS 配置查询失败时没有 `httpsSwitch`，HTTPS 只按证书判断。泛域名记录按记录名本身（如 `*.example.com`）匹配规则；SaaS 域名以其自身的 SSL 开关为准。只解析不加速的记录不列出，边缘函数、边缘容器和四层加速的记录暂不支持。在 ESA 上传的证书也会出现在 `certs`（数字证书管理服务）里，名称为 ESA 的证书 ID。
+- 阿里云 CAS 证书列表的有效期取接口返回的毫秒时间戳；个别证书缺该字段时退回只有日期的 EndDate，按到期当天 23:59:59（北京时间）计算。
+- 腾讯云平台默认域名按 `myqcloud.com`、`vod-qcloud.com`、`tlivecloud.com`、`tencentcos.cn` 后缀识别（接口里没有区分字段），标记为 `extra.managed: "platform"`：点播、直播的平台域名始终由平台提供 HTTPS，CDN 以 HTTPS 开关为准。CDN 的证书名取 SSL 证书的备注名。直播推流域名不能绑证书，会显示为关闭。
+- 腾讯云 COS 只列存储桶的自定义源站域名，HTTPS 以该域名的证书配置为「已启用」为准（COS 没有单独的 HTTPS 开关，自定义域名本身被停用但仍绑着证书时照常显示开启——此时边缘仍下发该证书）；经过 CDN 加速的 COS 域名出现在腾讯云 CDN 的结果里。每个域名要单独查一次证书配置，域名多时请求较多（并发 5）。
+- 火山引擎视频直播的读接口没有 HTTPS 开关，绑定证书并开启 HTTPS 时域名才带证书链 ID，CLI 以此判断；绑定证书时关闭了 HTTPS 的域名显示为关闭（边缘节点实际仍会用该证书完成 TLS 握手，读接口看不到）。推流域名的证书用于 RTMPS / HTTPS 推流，同样列出。
+- 火山引擎 TOS 没有 HTTPS 开关，绑定证书即可 HTTPS 访问；证书状态为 `CertNotExist`（证书已删除）或 `RoleNotExist`（TOS 无法访问证书中心）时实际下发的是 TOS 默认证书，记为关闭，原证书 ID 与状态放在 `extra.certId` / `extra.certStatus`。DCDN 绑了证书但关闭 HTTPS 的域名按开关记为关闭（实测边缘仍下发该证书）。CDN、点播的双证书（RSA + ECC）是平台白名单功能。
+- 火山引擎视频点播、veImageX 只查华北与亚太东南（柔佛）两个地域，HTTPS 配置要逐域名查询，域名多时较慢。`certs` 只列证书中心里已签发的 SSL 证书，不含视频直播证书管理里上传的证书、CDN 自托管证书和私有 CA 证书。
+- 华为云只适配中国站（CDN 走 `cdn.myhuaweicloud.com`，证书列表走 `scm.cn-north-4.myhuaweicloud.com`）。CDN 一次拉取所有企业项目下的域名；CDN 双证书只支持「国际 + 国密」，关闭 HTTPS 时证书会被一并删除。视频直播按 IAM 项目逐地域查询 cn-north-4、cn-north-1、cn-east-3、ap-southeast-3、ap-southeast-2，只查各地域的主项目，没用到直播的地域静默跳过；直播没有 HTTPS 开关，播放域名配置了证书即视为开启 HTTPS（未配证书时下发的是平台默认证书），有效期取自域名当前证书的 PEM（证书列表接口的时间比真实值早 8 小时，只在取不到 PEM 时补正后使用）。OBS 只列对象桶（不含并行文件系统），自定义域名绑定了服务端证书（含国密）才算 HTTPS。证书列表的到期时间不带时区，实测为北京时间。
+- 百度智能云只覆盖境内 CDN（海外 CDN 未覆盖），每个 CDN 域名只能绑一张证书。未开通 CDN 的账号只读接口照常返回空列表，因此显示 0 个域名、不提示未开通；「已开启 HTTPS 的域名列表」接口失败时退回逐个域名查询 HTTPS 配置（并发 5），域名多时较慢。`certs` 只列证书管理里的证书，不单独查询 SSL 证书服务里购买的证书；使用平台通用证书（`cert-common`）的域名没有到期时间。
+- 七牛云只支持 CDN（含全站加速）域名，对象存储 Kodo 的自定义域名不在其中，七牛给新建 bucket 自动分配的测试域名（`*.clouddn.com`）不列出；泛域名按七牛的写法以点开头（如 `.example.com`）；已下线、冻结的域名也会列出，用 `status` 区分。一个域名只能绑一张证书，降级为 HTTP 时证书会被解绑。开启了 HTTPS 的域名要逐个查详情，七牛接口限 10 QPS，域名多时约每秒 8 个。
 
 ## 开发
 

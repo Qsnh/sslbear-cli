@@ -23,7 +23,8 @@ export function renderDomains(items: DomainRecord[], expiringWithin?: number): s
       serviceLabel(d.provider, d.service),
       d.domain,
       d.https ? "开启" : "关闭",
-      d.cert?.name ?? d.cert?.commonName ?? d.cert?.id ?? "-",
+      // 平台默认域名（如腾讯云 *.myqcloud.com）用云厂商自己的证书，用户无需续期
+      d.extra?.managed === "platform" ? "平台托管" : (d.cert?.name ?? d.cert?.commonName ?? d.cert?.id ?? "-"),
       formatDate(d.cert?.notAfter),
       days(d.daysLeft),
     ]),

@@ -53,7 +53,7 @@ async function tosGet<T>(ctx: QueryContext, creds: AccessKeyCredentials, req: To
       const code = raw.status >= 400 ? `HTTP${raw.status}` : "InvalidResponse";
       throw new CloudApiError("volcengine", code, `响应不是合法 JSON（HTTP ${raw.status}）：${raw.text.slice(0, 200)}`, undefined, raw.status);
     }
-    // 桶未配置自定义域名：404 + EC 0016-00000008（Code 原文未查到，名称含 CustomDomain 的也认）；NoSuchBucket 等照常报错
+    // 桶未配置自定义域名：404 + EC 0016-00000008（实测 Code 为 NoSuchBucketCustomDomainConfiguration，名称含 CustomDomain 的也认）；NoSuchBucket 等照常报错
     if (raw.status === 404 && (body.EC === NO_CUSTOM_DOMAIN_EC || /CustomDomain/i.test(body.Code ?? ""))) return {};
     if (raw.status >= 400) {
       // 503 SlowDown 为限流，换成能被 withRetry 识别的错误码；其余限流码（ExceedAccountQPSLimit 等）为 HTTP 429
@@ -78,13 +78,23 @@ interface CustomDomainRule {
   Forbidden?: boolean;
   ForbiddenReason?: string;
   CertId?: string;
-  /** CertBound / CertUnbound / CertExpired / CertNotExist / RoleNotExist / CertUnknown */
+  /**
+   * CertBound 已绑定 / CertUnbound 未绑定 / CertExpired 已过期 / CertNotExist 证书已删除 /
+   * RoleNotExist 跨服务授权失败（TOS 无法访问证书中心）/ CertUnknown 状态未知
+   */
   CertStatus?: string;
 }
 
 /**
+ * TOS 拿不到所绑证书的状态：实测 CertNotExist 的域名 TLS 握手下发的是默认的 *.tos-<region>.volces.com 证书
+ * （即使证书中心里同 ID 的证书还在），自定义域名的 HTTPS 实际不可用；RoleNotExist 按文档同样无法使用。
+ * 这两种视为未开启 HTTPS，证书 ID 与状态放在 extra 里提示。CertExpired / CertUnknown 仍按开启处理，照常给出证书。
+ */
+const CERT_UNAVAILABLE = new Set(["CertNotExist", "RoleNotExist"]);
+
+/**
  * 对象存储 TOS 的自定义域名：ListBuckets（不分页，每账号最多 100 个桶）后逐个桶查 ?customdomain（并发 5）。
- * TOS 没有单独的 HTTPS 开关，绑定证书即可 HTTPS 访问、解绑后不能，所以以绑定了证书视为开启；
+ * TOS 没有单独的 HTTPS 开关，绑定证书即可 HTTPS 访问、解绑后不能，所以以绑定了证书视为开启（证书不可用的状态除外，见 CERT_UNAVAILABLE）；
  * 接口只给证书 ID 与绑定状态，名称、有效期从证书中心按 ID 补全。
  */
 export const tos: DomainService<AccessKeyCredentials> = {
@@ -109,7 +119,8 @@ export const tos: DomainService<AccessKeyCredentials> = {
       }
     });
     const records = perBucket.flat().map(({ rule, bucket }) => {
-      const https = !!rule.CertId && rule.CertStatus !== "CertUnbound";
+      const unavailable = !!rule.CertId && CERT_UNAVAILABLE.has(rule.CertStatus ?? "");
+      const https = !!rule.CertId && rule.CertStatus !== "CertUnbound" && !unavailable;
       return compact({
         provider: "volcengine" as const,
         service: "tos",
@@ -117,7 +128,13 @@ export const tos: DomainService<AccessKeyCredentials> = {
         status: rule.Forbidden ? "forbidden" : "normal",
         https,
         cert: https ? compact({ id: rule.CertId, status: rule.CertStatus }) : undefined,
-        extra: compact({ bucket: bucket.Name, region: bucket.Location, forbiddenReason: rule.Forbidden ? rule.ForbiddenReason : undefined }),
+        extra: compact({
+          bucket: bucket.Name,
+          region: bucket.Location,
+          forbiddenReason: rule.Forbidden ? rule.ForbiddenReason : undefined,
+          certId: unavailable ? rule.CertId : undefined,
+          certStatus: unavailable ? rule.CertStatus : undefined,
+        }),
       });
     });
     return enrichFromCertCenter(ctx, creds, warn, records);

@@ -6,6 +6,7 @@ import { toIso } from "../../lib/time.js";
 import type { DomainRecord } from "../../types.js";
 import type { DomainService } from "../registry.js";
 import { callTencent } from "./client.js";
+import { asPlatformDomain, isPlatformDomain } from "./platform.js";
 
 interface CdnDomain {
   Domain: string;
@@ -13,7 +14,8 @@ interface CdnDomain {
   Area?: string;
   Https?: {
     Switch?: string;
-    CertInfo?: { CertId?: string; CertName?: string; ExpireTime?: string; DeployTime?: string; From?: string } | null;
+    /** 实测 CertName 是证书的主域名（托管时自动生成），Message 才是证书备注（即 SSL 证书列表里的备注名） */
+    CertInfo?: { CertId?: string; CertName?: string; Message?: string; ExpireTime?: string; DeployTime?: string; From?: string } | null;
   } | null;
 }
 
@@ -36,15 +38,17 @@ export const cdn: DomainService<TencentCredentials> = {
     return domains.map((d) => {
       const cert = d.Https?.CertInfo;
       const https = d.Https?.Switch === "on";
-      return compact({
+      const record = compact({
         provider: "tencent" as const,
         service: "cdn",
         domain: d.Domain,
         status: d.Status,
         https,
-        cert: https && cert ? compact({ id: cert.CertId, name: cert.CertName, notAfter: toIso(cert.ExpireTime) }) : undefined,
+        cert: https && cert ? compact({ id: cert.CertId, name: cert.Message || cert.CertName, notAfter: toIso(cert.ExpireTime) }) : undefined,
         extra: d.Area ? { area: d.Area } : undefined,
       });
+      // 平台域名（如 *.video.myqcloud.com）有 HTTPS 开关但没有用户证书，HTTPS 以开关为准
+      return isPlatformDomain(d.Domain) ? asPlatformDomain(record, https) : record;
     });
   },
 };

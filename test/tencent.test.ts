@@ -78,15 +78,25 @@ describe("tencent domains", () => {
       if (req.url.host === "cdn.tencentcloudapi.com") {
         expect(req.json).toEqual({ Offset: 0, Limit: 100 });
         return ok({
-          TotalNumber: 2,
+          TotalNumber: 3,
           Domains: [
             {
               Domain: "static.example.cn",
               Status: "online",
               Area: "mainland",
-              Https: { Switch: "on", CertInfo: { CertId: "ssl-9", CertName: "static", ExpireTime: "2026-10-12 08:00:00" } },
+              // 实测 CertName 是证书主域名，Message 才是 SSL 证书的备注名
+              Https: { Switch: "on", CertInfo: { CertId: "ssl-9", CertName: "static.example.cn", Message: "static", ExpireTime: "2026-10-12 08:00:00" } },
             },
             { Domain: "dl.example.cn", Status: "offline", Area: "global", Https: null },
+            // 平台系统域名：HTTPS 开关开着但没有用户证书（真实响应脱敏）
+            {
+              Domain: "systemcover-10000001.video.myqcloud.com",
+              Status: "online",
+              Area: "mainland",
+              Cname: "",
+              ServiceType: "media",
+              Https: { Switch: "on", CertInfo: null, SslStatus: "deployed" },
+            },
           ],
         });
       }
@@ -107,6 +117,14 @@ describe("tencent domains", () => {
         daysLeft: -3,
       },
       { provider: "tencent", service: "cdn", domain: "dl.example.cn", status: "offline", https: false, extra: { area: "global" } },
+      {
+        provider: "tencent",
+        service: "cdn",
+        domain: "systemcover-10000001.video.myqcloud.com",
+        status: "online",
+        https: true,
+        extra: { area: "mainland", managed: "platform" },
+      },
     ]);
     expect(r.json.data.issues).toEqual([
       expect.objectContaining({ service: "live", kind: "inactive", code: "ResourceNotFound.UserNotExist" }),
@@ -222,9 +240,11 @@ describe("tencent domains", () => {
     const fetch = fakeFetch((req) => {
       if (req.action === "DescribeLiveDomains") {
         return ok({
-          AllCount: 3,
+          AllCount: 4,
           DomainList: [
             { Name: "push.example.com", Type: 0, Status: 1 },
+            // 平台默认推流域名
+            { Name: "12345.livepush.myqcloud.com", Type: 0, Status: 1, BCName: 1, TargetDomain: "12345.livepush.myqcloud.com" },
             { Name: "play.example.com", Type: 1, Status: 1 },
             { Name: "play2.example.com", Type: 1, Status: 0 },
           ],
@@ -250,6 +270,14 @@ describe("tencent domains", () => {
       status: "online",
       https: false,
       extra: { type: "push" },
+    });
+    expect(byDomain["12345.livepush.myqcloud.com"]).toEqual({
+      provider: "tencent",
+      service: "live",
+      domain: "12345.livepush.myqcloud.com",
+      status: "online",
+      https: true,
+      extra: { type: "push", managed: "platform" },
     });
     expect(byDomain["play.example.com"]).toMatchObject({ https: true, cert: { id: "x", notAfter: "2026-11-20T04:00:00.000Z" } });
     expect(byDomain["play2.example.com"]).toMatchObject({
@@ -308,6 +336,60 @@ describe("tencent domains", () => {
         extra: { type: "VOD", subAppId: "1500001", subApp: "主应用" },
       },
     ]);
+  });
+
+  it("点播：TotalCount 含不展示的域名时按页长翻页，同一域名不重复列出；默认分发域名标记为平台域名", async () => {
+    // 模拟真实行为：服务端先在完整列表上按 Offset/Limit 切片，再滤掉不展示的域名，TotalCount 仍按完整列表计
+    const domain = (Domain: string, HTTPSConfig: unknown = null) => ({ Domain, DeployStatus: "Online", Type: "VOD", HTTPSConfig });
+    const lists: Record<number, { hidden?: boolean; d: ReturnType<typeof domain> }[]> = {
+      // 主应用：完整列表第 0 条不展示（真实响应：TotalCount=2，DomainSet 只有默认分发域名，Offset=1 时又返回它）
+      1250000001: [
+        { hidden: true, d: domain("hidden.example.com") },
+        { d: domain("1250000001.vod2.myqcloud.com", { CertExpireTime: "2022-11-05T00:00:00Z", CloudCertId: "" }) },
+      ],
+      // 子应用：45 条、第 3 条不展示，需要翻 3 页
+      1500000002: Array.from({ length: 45 }, (_, i) => ({ hidden: i === 3, d: domain(i === 0 ? "1500000002.vod-qcloud.com" : `v${i}.example.com`) })),
+    };
+    const fetch = fakeFetch((req) => {
+      if (req.action === "DescribeSubAppIds") {
+        return ok({
+          TotalCount: 2,
+          SubAppIdInfoSet: [
+            { SubAppId: 1250000001, SubAppIdName: "PrimaryApplication", Status: "On", IsDefaultApp: true },
+            { SubAppId: 1500000002, SubAppIdName: "dev", Status: "On" },
+          ],
+        });
+      }
+      if (req.action === "DescribeVodDomains") {
+        const { Offset, Limit, SubAppId } = req.json as { Offset: number; Limit: number; SubAppId: number };
+        const all = lists[SubAppId]!;
+        return ok({ TotalCount: all.length, DomainSet: all.slice(Offset, Offset + Limit).filter((x) => !x.hidden).map((x) => x.d) });
+      }
+      return undefined;
+    });
+    const r = await runCli(["domains", "-s", "vod", "--json"], { env: TENCENT_ENV, fetch });
+    expect(r.code).toBe(0);
+    const offsets = (id: number) => fetch.calls.filter((c) => c.action === "DescribeVodDomains" && c.json?.SubAppId === id).map((c) => c.json?.Offset);
+    expect(offsets(1250000001)).toEqual([0]);
+    expect(offsets(1500000002)).toEqual([0, 20, 40]);
+    const names = r.json.data.items.map((d: any) => d.domain);
+    expect(new Set(names).size).toBe(names.length);
+    expect(names).toHaveLength(1 + 44);
+    expect(r.json.data.items.filter((d: any) => d.extra.managed === "platform").map((d: any) => d.domain)).toEqual([
+      "1250000001.vod2.myqcloud.com",
+      "1500000002.vod-qcloud.com",
+    ]);
+    expect(names).not.toContain("v3.example.com");
+    expect(r.json.data.items.find((d: any) => d.domain === "1250000001.vod2.myqcloud.com")).toEqual({
+      provider: "tencent",
+      service: "vod",
+      domain: "1250000001.vod2.myqcloud.com",
+      status: "Online",
+      https: true,
+      extra: { type: "VOD", subAppId: "1250000001", subApp: "PrimaryApplication", managed: "platform" },
+    });
+    expect(r.json.data.items.find((d: any) => d.domain === "v1.example.com")).toMatchObject({ https: false, extra: { subAppId: "1500000002" } });
+    expect(r.json.data.items.find((d: any) => d.domain === "v1.example.com").extra.managed).toBeUndefined();
   });
 
   it("点播：应用列表不可用时退回不带 SubAppId 查询", async () => {

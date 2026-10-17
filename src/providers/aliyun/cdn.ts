@@ -4,7 +4,7 @@ import { compact } from "../../lib/compact.js";
 import { paginate } from "../../lib/paginate.js";
 import { toIso } from "../../lib/time.js";
 import type { DomainRecord } from "../../types.js";
-import type { DomainService } from "../registry.js";
+import type { DomainService, Warn } from "../registry.js";
 import { callRpc } from "./client.js";
 
 interface UserDomain {
@@ -38,41 +38,50 @@ interface Product {
   httpsPageSize: number;
 }
 
+/** 域名列表里的 HTTPS 开关：CDN 为 SslProtocol，DCDN 为 SSLProtocol，直播没有该字段 */
+const sslSwitch = (d: UserDomain) => d.SslProtocol ?? d.SSLProtocol;
+
 /**
  * CDN / DCDN / 直播的接口结构相同：域名列表 + HTTPS 证书列表两次分页查询后按域名合并，
- * 避免逐个域名查证书。HTTPS 列表的时间为北京时间 "YYYY-MM-DD HH:mm:ss"。
+ * 避免逐个域名查证书。HTTPS 列表的时间文档写的是北京时间 "YYYY-MM-DD HH:mm:ss"，实测 CDN / DCDN / 直播都返回 ISO 8601 UTC，toIso 两种都能解析。
+ * 证书列表只用于补全证书信息：没有开启 HTTPS 的域名时不查；查询失败（如无权限）只记一条 issue，
+ * 域名照常输出，HTTPS 以域名列表里的开关为准。
  */
 function cdnLike(p: Product): DomainService<AliyunCredentials> {
   return {
     key: p.service,
     label: p.label,
-    async list(ctx: QueryContext, creds: AliyunCredentials): Promise<DomainRecord[]> {
+    async list(ctx: QueryContext, creds: AliyunCredentials, warn: Warn): Promise<DomainRecord[]> {
       const call = <T>(action: string, params: Record<string, string | number>) =>
         callRpc<T>(ctx, creds, { endpoint: p.endpoint, version: p.version, action, params });
-      const [domains, certs] = await Promise.all([
-        paginate(p.listPageSize, async (page) => {
-          const res = await call<{ Domains?: { PageData?: UserDomain[] }; TotalCount?: number }>(p.listAction, {
-            PageNumber: page,
-            PageSize: p.listPageSize,
+      const domains = await paginate(p.listPageSize, async (page) => {
+        const res = await call<{ Domains?: { PageData?: UserDomain[] }; TotalCount?: number }>(p.listAction, {
+          PageNumber: page,
+          PageSize: p.listPageSize,
+        });
+        return { items: res.Domains?.PageData ?? [], total: res.TotalCount };
+      });
+      // 没有开关字段（直播）时只能靠证书列表判断 HTTPS，有域名就要查
+      const needCerts = domains.some((d) => sslSwitch(d) !== "off");
+      let certs: HttpsCertInfo[] = [];
+      if (needCerts) {
+        try {
+          certs = await paginate(p.httpsPageSize, async (page) => {
+            const res = await call<{ CertInfos?: { CertInfo?: HttpsCertInfo[] }; TotalCount?: number }>(p.httpsAction, {
+              PageNumber: page,
+              PageSize: p.httpsPageSize,
+            });
+            return { items: res.CertInfos?.CertInfo ?? [], total: res.TotalCount };
           });
-          return { items: res.Domains?.PageData ?? [], total: res.TotalCount };
-        }),
-        paginate(p.httpsPageSize, async (page) => {
-          const res = await call<{ CertInfos?: { CertInfo?: HttpsCertInfo[] }; TotalCount?: number }>(p.httpsAction, {
-            PageNumber: page,
-            PageSize: p.httpsPageSize,
-          });
-          return { items: res.CertInfos?.CertInfo ?? [], total: res.TotalCount };
-        }).catch((e: unknown) => {
+        } catch (e) {
           // 账号下没有任何 HTTPS 域名时接口报 NoHttpsDomain，等同空列表
-          if (e instanceof CloudApiError && e.code === "NoHttpsDomain") return [];
-          throw e;
-        }),
-      ]);
+          if (!(e instanceof CloudApiError && e.code === "NoHttpsDomain")) warn(e, "HTTPS 证书列表（用于补全证书信息）");
+        }
+      }
       const certByDomain = new Map(certs.map((c) => [c.DomainName, c]));
       return domains.map((d) => {
         // 域名列表里有 HTTPS 开关就以开关为准；没有该字段时以是否出现在 HTTPS 列表判断
-        const ssl = d.SslProtocol ?? d.SSLProtocol;
+        const ssl = sslSwitch(d);
         const https = ssl === undefined ? certByDomain.has(d.DomainName) : ssl === "on";
         const c = https ? certByDomain.get(d.DomainName) : undefined;
         return compact({

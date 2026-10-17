@@ -17,6 +17,7 @@ interface VodDomain {
 interface VodCertInfo {
   CertId?: string;
   CertName?: string;
+  /** 文档称「证书匹配的域名」，实测为证书的全部 SAN，半角逗号分隔，不是通用名 */
   CertDomainName?: string;
   CertOrg?: string;
   CertType?: string;
@@ -67,7 +68,7 @@ export const vod: DomainService<AliyunCredentials> = {
           ? compact({
               id: c.CertId,
               name: c.CertName,
-              commonName: c.CertDomainName,
+              sans: c.CertDomainName?.split(",").map((s) => s.trim()).filter(Boolean),
               issuer: c.CertOrg,
               notBefore: toIso(c.CertStartTime),
               notAfter: toIso(c.CertExpireTime),

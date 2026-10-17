@@ -17,7 +17,7 @@ interface LiveDomain {
   Region?: string;
   Vhost?: string;
   ProjectName?: string;
-  /** 绑定的 HTTPS 证书的证书链 ID（直播自己的 ID），未绑定时为空 */
+  /** 绑定的 HTTPS 证书的证书链 ID（直播自己的 ID），未绑定或绑定时关闭了 HTTPS 为空 */
   ChainID?: string;
 }
 
@@ -59,7 +59,9 @@ const toCert = (c: LiveCert): CertInfo =>
 
 /**
  * 视频直播：ListDomainDetail 列域名（带绑定证书的 ChainID）+ ListCertV2 证书列表按 ChainID 关联。
- * 直播的读接口不返回 HTTPS 开关（只在 BindCert 写接口里），只能以「绑定了证书」视为开启 HTTPS。
+ * 直播的读接口不返回 HTTPS 开关（只在 BindCert 写接口里）。实测 BindCert 传 HTTPS=false 的域名在 ListDomainDetail / DescribeDomain
+ * 里 ChainID 为空，所以 ChainID 非空即「绑定证书并开启 HTTPS」（边缘节点对 HTTPS=false 的域名仍会用该证书完成 TLS 握手，读接口看不到）。
+ * 推流域名绑证书用于 RTMPS / HTTPS 推流（443 端口），同样列出。
  * ListCertV2 缺省只返回启用中的证书，关联不上的 ChainID 再逐个用 DescribeCertDetailSecretV2 查（V2 不含私钥）。
  */
 export const live: DomainService<AccessKeyCredentials> = {

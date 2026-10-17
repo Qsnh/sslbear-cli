@@ -6,6 +6,7 @@ import { toIso } from "../../lib/time.js";
 import type { DomainRecord } from "../../types.js";
 import type { DomainService, Warn } from "../registry.js";
 import { callTencent } from "./client.js";
+import { asPlatformDomain, isPlatformDomain } from "./platform.js";
 import { enrichFromSsl } from "./ssl.js";
 
 interface LiveDomain {
@@ -58,7 +59,7 @@ export const live: DomainService<TencentCredentials> = {
     const records = domains.map((d) => {
       const b = bindingByDomain.get(d.Name);
       const https = b?.Status === 1;
-      return compact({
+      const record = compact({
         provider: "tencent" as const,
         service: "live",
         domain: d.Name,
@@ -68,6 +69,8 @@ export const live: DomainService<TencentCredentials> = {
         cert: https && b ? compact({ id: b.CloudCertId, name: b.CertificateAlias, notAfter: toIso(b.CertExpireTime) }) : undefined,
         extra: d.Type === undefined ? undefined : { type: d.Type === 1 ? "play" : "push" },
       });
+      // 平台默认推流/播放域名（如 {bizid}.livepush.myqcloud.com）不能绑证书，平台始终用自己的证书提供 HTTPS
+      return isPlatformDomain(d.Name) ? asPlatformDomain(record, true) : record;
     });
     return enrichFromSsl(ctx, creds, warn, records);
   },

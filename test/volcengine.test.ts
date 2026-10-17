@@ -401,6 +401,17 @@ describe("volcengine live", () => {
     });
   });
 
+  it("服务端内部超时 InternalServiceTimeout 自动重试", async () => {
+    let n = 0;
+    const fetch = fakeFetch((req) => {
+      if (req.action === "ListDomainDetail" && n++ === 0) return volcError("InternalServiceTimeout", "Internal Service is timeout. Pls Contact With Admin");
+      return liveRoutes(req);
+    });
+    const r = await runCli(["domains", "-s", "live", "--json"], { env: VOLC_ENV, fetch });
+    expect(r.json.data.issues).toEqual([]);
+    expect(fetch.calls.filter((c) => c.action === "ListDomainDetail").length).toBeGreaterThan(1);
+  });
+
   it("补查证书链失败只记 issue", async () => {
     const fetch = fakeFetch((req) =>
       req.action === "DescribeCertDetailSecretV2" ? volcError("AccessDenied", "User is not authorized", 403) : liveRoutes(req),
@@ -454,8 +465,8 @@ function vodRoutes(req: FakeRequest) {
           HTTPS: {
             Switch: true,
             CertInfoList: [
-              { CertId: "cert-rsa", CertName: "rsa", EffectiveTime: T("2026-09-01T00:00:00Z"), ExpireTime: T("2026-12-01T00:00:00Z") },
-              { CertId: "cert-wild", CertName: "ecc" },
+              { CertId: "cert-rsa", CertName: "play.example.com", EffectiveTime: T("2026-09-01T00:00:00Z"), ExpireTime: T("2026-12-01T00:00:00Z") },
+              { CertId: "cert-wild", CertName: "*.example.com" },
             ],
           },
         },
@@ -492,7 +503,7 @@ describe("volcengine vod", () => {
       https: true,
       cert: {
         id: "cert-wild",
-        name: "ecc",
+        name: "未命名证书",
         commonName: "*.example.com",
         sans: ["*.example.com", "example.com"],
         issuer: "RapidSSL TLS RSA CA G1",
@@ -511,6 +522,66 @@ describe("volcengine vod", () => {
       https: false,
       extra: { space: "s1", region: "cn-north-1", type: "vod_image" },
     });
+  });
+
+  it("DescribeVodDomainConfig 的 CertName 是证书 CN（不是证书名）：单证书带有效期时不再查证书中心", async () => {
+    // 按真实响应脱敏：HTTPS.CertInfo 带 EffectiveTime / ExpireTime / Source，CertName 与 VodInfo.Certificate.CertificateName 都是 CN
+    const fetch = fakeFetch((req) => {
+      if (req.action === "ListSpace" && req.url.host === "vod.volcengineapi.com") return ok([{ SpaceName: "s1", Region: "cn-north-1" }]);
+      if (req.action === "ListSpace") return ok(null);
+      if (req.action === "ListVodDomains") {
+        return ok({
+          VodInfo: { SpaceName: "s1", Total: 1, Domains: [{ Domain: "v.example.com", DomainType: "vod_play", Cname: "v.example.com.bytevdn.com" }] },
+          DomainInfo: { Total: 1, Data: [{ Domain: "v.example.com", HTTPS: true, Status: "online", ServiceRegion: "chinese_mainland", ConfigStatus: "FullDeployed" }] },
+        });
+      }
+      if (req.action === "DescribeVodDomainConfig") {
+        return ok({
+          DomainInfo: {
+            DomainConfig: {
+              HTTPS: {
+                Switch: true,
+                CertInfo: {
+                  CertId: "cert-ecc",
+                  CertName: "v.example.com",
+                  Certificate: { Certificate: "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n", PrivateKey: null },
+                  EffectiveTime: T("2026-10-17T13:09:54Z"),
+                  ExpireTime: T("2027-01-15T13:09:53Z"),
+                  EncryType: "inter_cert",
+                  Source: "cdn_cert_hosting",
+                },
+                CertInfoList: null,
+              },
+            },
+          },
+          VodInfo: { SpaceName: "s1", DomainType: "vod_play", Certificate: { CertificateId: "cert-ecc", CertificateName: "v.example.com", HttpsStatus: "enable" } },
+        });
+      }
+      return undefined;
+    });
+    const r = await runCli(["domains", "-s", "vod", "--json"], { env: VOLC_ENV, fetch });
+    expect(r.json.data.issues).toEqual([]);
+    expect(r.json.data.items[0].cert).toEqual({
+      id: "cert-ecc",
+      commonName: "v.example.com",
+      notBefore: "2026-10-17T13:09:54.000Z",
+      notAfter: "2027-01-15T13:09:53.000Z",
+    });
+    expect(fetch.calls.some((c) => c.action === "CertificateGetInstanceList")).toBe(false);
+  });
+
+  it("配置里只有 VodInfo.Certificate 时，CertificateName 同样作为 CN，有效期从证书中心补", async () => {
+    const fetch = fakeFetch((req) => {
+      if (req.action === "ListSpace" && req.url.host === "vod.volcengineapi.com") return ok([{ SpaceName: "s1" }]);
+      if (req.action === "ListSpace") return ok(null);
+      if (req.action === "ListVodDomains") {
+        return ok({ VodInfo: { Total: 1, Domains: [{ Domain: "v.example.com", DomainType: "vod_play" }] }, DomainInfo: { Total: 1, Data: [{ Domain: "v.example.com", HTTPS: true }] } });
+      }
+      if (req.action === "DescribeVodDomainConfig") return ok({ DomainInfo: { DomainConfig: { HTTPS: { Switch: true } } }, VodInfo: { Certificate: { CertificateId: "cert-wild", CertificateName: "*.example.com" } } });
+      return certCenterRoute(req);
+    });
+    const r = await runCli(["domains", "-s", "vod", "--json"], { env: VOLC_ENV, fetch });
+    expect(r.json.data.items[0].cert).toMatchObject({ id: "cert-wild", name: "未命名证书", commonName: "*.example.com", notAfter: "2026-10-31T23:59:59.000Z" });
   });
 
   it("空间列表按 Offset 翻页", async () => {
@@ -673,17 +744,20 @@ function tosRoutes(req: FakeRequest) {
           { Domain: "www.example.com", Cname: "b1.tos-cn-beijing.volces.com", Forbidden: false, CertId: "cert-wild", Protocol: "tos", CertStatus: "CertBound" },
           { Domain: "http.example.com", Forbidden: false, CertId: "", Protocol: "tos", CertStatus: "CertUnbound" },
           { Domain: "bad.example.com", Forbidden: true, ForbiddenReason: "DomainUnregistered", CertId: "cert-gone", CertStatus: "CertNotExist" },
+          { Domain: "role.example.com", Forbidden: false, ForbiddenReason: "", CertId: "cert-wild", CertStatus: "RoleNotExist", Protocol: "tos" },
+          { Domain: "old.example.com", Forbidden: false, ForbiddenReason: "", CertId: "cert-wild", CertStatus: "CertExpired", Protocol: "tos" },
+          { Domain: "unknown.example.com", Forbidden: false, ForbiddenReason: "", CertId: "cert-wild", CertStatus: "CertUnknown", Protocol: "tos" },
         ],
       },
     };
   }
-  if (host === "b2.tos-cn-shanghai.volces.com") return tosError(404, "NoSuchCustomDomain", "0016-00000008");
+  if (host === "b2.tos-cn-shanghai.volces.com") return tosError(404, "NoSuchBucketCustomDomainConfiguration", "0016-00000008");
   if (host === "b3.tos-cn-guangzhou.volces.com") return tosError(404, "NoSuchBucket", "0006-00000001");
   return undefined;
 }
 
 describe("volcengine tos", () => {
-  it("ListBuckets → 逐桶 ?customdomain（按桶所在地域签名）；绑定证书即 HTTPS，证书从证书中心补全", async () => {
+  it("ListBuckets → 逐桶 ?customdomain（按桶所在地域签名）；绑定证书即 HTTPS（证书已删除 / 跨服务授权失败除外），证书从证书中心补全", async () => {
     const fetch = fakeFetch((req) => tosRoutes(req) ?? certCenterRoute(req));
     const r = await runCli(["domains", "-s", "tos", "--json"], { env: { ...VOLC_ENV, VOLCENGINE_SESSION_TOKEN: "sts" }, fetch });
     expect(r.code).toBe(0);
@@ -729,12 +803,20 @@ describe("volcengine tos", () => {
       https: false,
       extra: { bucket: "b1", region: "cn-beijing" },
     });
-    expect(byDomain["bad.example.com"]).toMatchObject({
+    // 证书已删除 / 跨服务授权失败：TOS 实际下发默认证书，记为未开启，证书 ID 与状态放 extra
+    expect(byDomain["bad.example.com"]).toEqual({
+      provider: "volcengine",
+      service: "tos",
+      domain: "bad.example.com",
       status: "forbidden",
-      https: true,
-      cert: { id: "cert-gone", status: "CertNotExist" },
-      extra: { bucket: "b1", region: "cn-beijing", forbiddenReason: "DomainUnregistered" },
+      https: false,
+      extra: { bucket: "b1", region: "cn-beijing", forbiddenReason: "DomainUnregistered", certId: "cert-gone", certStatus: "CertNotExist" },
     });
+    expect(byDomain["role.example.com"]).toMatchObject({ https: false, extra: { certId: "cert-wild", certStatus: "RoleNotExist" } });
+    expect(byDomain["role.example.com"].cert).toBeUndefined();
+    // 已过期 / 状态未知仍按开启处理，照常给出证书
+    expect(byDomain["old.example.com"]).toMatchObject({ https: true, cert: { id: "cert-wild", status: "CertExpired", notAfter: "2026-10-31T23:59:59.000Z" } });
+    expect(byDomain["unknown.example.com"]).toMatchObject({ https: true, cert: { id: "cert-wild", status: "CertUnknown" } });
   });
 
   it("未开通 TOS（EC 0003-00000003）记为 inactive；429 限流自动重试", async () => {
@@ -748,7 +830,7 @@ describe("volcengine tos", () => {
     const fetch = fakeFetch((req) => (n++ === 0 ? tosError(429, "ExceedAccountQPSLimit", "0004-00000007") : (tosRoutes(req) ?? certCenterRoute(req))));
     const r = await runCli(["domains", "-s", "tos", "--json"], { env: VOLC_ENV, fetch });
     expect(r.code).toBe(0);
-    expect(r.json.data.items).toHaveLength(3);
+    expect(r.json.data.items).toHaveLength(6);
   });
 });
 

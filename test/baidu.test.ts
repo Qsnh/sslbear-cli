@@ -247,3 +247,139 @@ describe("baidu domains", () => {
     expect(r.code).toBe(1);
   });
 });
+
+describe("baidu CDN：HTTPS 列表接口失败的处理", () => {
+  /** 按真实账号响应改写：证书管理列表（ECC + RSA 两张同域名证书） */
+  const LE_CERTS = [
+    {
+      certId: "cert-ecc0000001",
+      certName: "test-ec",
+      certCommonName: "test.example.com",
+      certType: 1,
+      certStartTime: "2026-10-17T13:09:54Z",
+      certStopTime: "2027-01-15T13:09:53Z",
+      canReplace: false,
+      certDNSNames: "*.test.example.com,test.example.com",
+      resources: [{ serviceName: "opencdn", resourceId: "on.test.example.com" }],
+      status: "IN_USE",
+      expired: false,
+      certCreateTime: "2026-10-17T14:15:35Z",
+      // 实测 certUpdateTime 是北京时间却带 Z，CLI 不使用该字段
+      certUpdateTime: "2026-10-17T22:15:35Z",
+    },
+    {
+      certId: "cert-rsa0000001",
+      certName: "test-rsa",
+      certCommonName: "test.example.com",
+      certType: 1,
+      certStartTime: "2026-10-17T13:10:09Z",
+      certStopTime: "2027-01-15T13:10:08Z",
+      canReplace: false,
+      certDNSNames: "*.test.example.com,test.example.com",
+      resources: [],
+      status: "UNUSED",
+      expired: false,
+      certCreateTime: "2026-10-17T14:15:36Z",
+      certUpdateTime: "2026-10-17T22:15:35Z",
+    },
+  ];
+
+  /** 实测：未开通 CDN 的账号 /v2/httpsDomains 无论带什么参数都返回 500 且响应体为空 */
+  const EMPTY_500 = { status: 500, body: "" };
+
+  const HTTPS_CONFIG: Record<string, unknown> = {
+    // 开启 HTTPS 并绑定证书
+    "on.test.example.com": { https: { enabled: true, certId: "cert-ecc0000001", httpRedirect: false, httpsRedirect: false, http2Enabled: true, verifyClient: false, sslProtocols: ["TLSv1.2", "TLSv1.3"] } },
+    // 关闭 HTTPS 但证书仍绑定着（PUT enabled=false 不会解绑证书）
+    "bound-off.test.example.com": { https: { enabled: false, certId: "cert-rsa0000001", httpRedirect: false, httpsRedirect: false, http2Enabled: true, verifyClient: false } },
+    // 从未配置 HTTPS
+    "off.test.example.com": { https: { enabled: false, httpRedirect: false, httpsRedirect: false, http2Enabled: true, verifyClient: false } },
+  };
+
+  function route(req: FakeRequest) {
+    if (req.url.host === "certificate.baidubce.com" && req.url.pathname === "/v1/certificate/detail") return { body: { certs: LE_CERTS } };
+    if (req.url.host !== "cdn.baidubce.com") return undefined;
+    if (req.url.pathname === "/v2/user/domains") {
+      return {
+        body: {
+          domains: [
+            { domain: "on.test.example.com", status: "RUNNING" },
+            { domain: "bound-off.test.example.com", status: "RUNNING" },
+            { domain: "off.test.example.com", status: "STOPPED" },
+            { domain: "broken.test.example.com", status: "RUNNING" },
+          ],
+        },
+      };
+    }
+    if (req.url.pathname === "/v2/httpsDomains") return EMPTY_500;
+    const m = /^\/v2\/domain\/([^/]+)\/config$/.exec(req.url.pathname);
+    if (m && req.url.searchParams.has("https")) {
+      const cfg = HTTPS_CONFIG[m[1]!];
+      return cfg ? { body: cfg } : bceError(500, "InternalError", "We encountered an internal error. Please try again.");
+    }
+    return undefined;
+  }
+
+  it("没有域名时不调 HTTPS 列表接口（未开通 CDN 的账号该接口 500），也不报错", async () => {
+    const fetch = fakeFetch((req) => {
+      if (req.url.pathname === "/v2/user/domains") return { body: { domains: [] } };
+      if (req.url.pathname === "/v2/httpsDomains") return EMPTY_500;
+      return undefined;
+    });
+    const r = await runCli(["domains", "-p", "baidu", "--json"], { env: BAIDU_ENV, fetch });
+    expect(r.code).toBe(0);
+    expect(r.json.data).toEqual({ items: [], issues: [] });
+    expect(fetch.calls.map((c) => c.url.pathname)).toEqual(["/v2/user/domains"]);
+  });
+
+  it("HTTPS 列表接口 500 时退回逐域名查 HTTPS 配置：enabled 才算 HTTPS，证书从证书管理补全，单域名失败只记 issue", async () => {
+    const fetch = fakeFetch(route);
+    const r = await runCli(["domains", "-p", "baidu", "--json"], { env: BAIDU_ENV, fetch, now: "2026-10-17T14:20:00Z" });
+    expect(r.code).toBe(0);
+    const byDomain = Object.fromEntries(r.json.data.items.map((d: any) => [d.domain, d]));
+    expect(byDomain["on.test.example.com"]).toEqual({
+      provider: "baidu",
+      service: "cdn",
+      domain: "on.test.example.com",
+      status: "RUNNING",
+      https: true,
+      cert: {
+        id: "cert-ecc0000001",
+        name: "test-ec",
+        commonName: "test.example.com",
+        sans: ["*.test.example.com", "test.example.com"],
+        notBefore: "2026-10-17T13:09:54.000Z",
+        notAfter: "2027-01-15T13:09:53.000Z",
+      },
+      daysLeft: 89,
+    });
+    expect(byDomain["bound-off.test.example.com"]).toEqual({ provider: "baidu", service: "cdn", domain: "bound-off.test.example.com", status: "RUNNING", https: false });
+    expect(byDomain["off.test.example.com"]).toEqual({ provider: "baidu", service: "cdn", domain: "off.test.example.com", status: "STOPPED", https: false });
+    expect(byDomain["broken.test.example.com"]).toEqual({ provider: "baidu", service: "cdn", domain: "broken.test.example.com", status: "RUNNING", https: false });
+    // 批量接口失败已由逐域名查询兜底，不单独报；只有查不到的那个域名记 issue
+    expect(r.json.data.issues).toEqual([
+      expect.objectContaining({ provider: "baidu", service: "cdn", kind: "error", code: "InternalError", target: "domain broken.test.example.com HTTPS 配置" }),
+    ]);
+    // URL 上 https 只写参数名（与官方 SDK 一致），签名按 https= 计算
+    const configCalls = fetch.calls.filter((c) => c.url.pathname.endsWith("/config"));
+    expect(configCalls).toHaveLength(4);
+    expect(configCalls[0]!.url.search).toBe("?https");
+    expectSigned(configCalls[0]!, "test-ak-baidu", "test-sk-baidu");
+    // 证书管理只拉一次
+    expect(fetch.calls.filter((c) => c.url.host === "certificate.baidubce.com")).toHaveLength(1);
+  });
+
+  it("空响应体的错误在 message 里标明", async () => {
+    const fetch = fakeFetch((req) => (req.url.pathname === "/v2/user/domains" ? EMPTY_500 : undefined));
+    const r = await runCli(["domains", "-p", "baidu", "--json"], { env: BAIDU_ENV, fetch });
+    expect(r.code).toBe(1);
+    expect(JSON.parse(r.stderr)).toMatchObject({ ok: false, status: "HTTP500", issues: [expect.objectContaining({ code: "HTTP500", message: "HTTP 500（响应体为空）" })] });
+  });
+
+  it("CDNNotActivated（实测未开通 CDN 时的错误码，HTTP 500）记为 inactive", async () => {
+    const fetch = fakeFetch(() => bceError(500, "CDNNotActivated", "please activate/open CDN first by BCE console"));
+    const r = await runCli(["domains", "-p", "baidu", "--json"], { env: BAIDU_ENV, fetch });
+    expect(r.code).toBe(0);
+    expect(r.json.data.issues).toEqual([expect.objectContaining({ provider: "baidu", service: "cdn", kind: "inactive", code: "CDNNotActivated" })]);
+  });
+});

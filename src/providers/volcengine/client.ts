@@ -25,6 +25,8 @@ interface VolcEnvelope {
 // 产品自定义的限流错误码（DCDN 为 HTTP 400，veImageX 可能是 HTTP 200），不匹配通用重试规则，加上 Throttling. 前缀交给 withRetry 重试；
 // 网关层限流 FlowLimitExceeded 为 HTTP 429，ServiceUnavailableTemp 匹配 ServiceUnavailable，无需处理
 const THROTTLE_CODES = new Set(["ErrTooManyRequests", "ERR_TOO_MANY_REQUESTS", "600014"]);
+// 服务端内部超时（实测视频直播偶发 InternalServiceTimeout，重试即成功），加上 ServiceUnavailable. 前缀交给 withRetry 重试
+const TRANSIENT_CODES = new Set(["InternalServiceTimeout"]);
 
 /**
  * 调用火山引擎 OpenAPI（HMAC-SHA256 签名），返回 Result。
@@ -74,7 +76,12 @@ export async function callVolc<T>(ctx: QueryContext, creds: AccessKeyCredentials
     // veImageX 的业务错误可能是 HTTP 200 + 空 Code + 非零 CodeN（如未开通 601001），没有 Code 时用 CodeN
     if (err && (err.Code || err.CodeN)) {
       const errCode = err.Code || String(err.CodeN);
-      const code = THROTTLE_CODES.has(errCode) || THROTTLE_CODES.has(String(err.CodeN)) ? `Throttling.${errCode}` : errCode;
+      const code =
+        THROTTLE_CODES.has(errCode) || THROTTLE_CODES.has(String(err.CodeN))
+          ? `Throttling.${errCode}`
+          : TRANSIENT_CODES.has(errCode)
+            ? `ServiceUnavailable.${errCode}`
+            : errCode;
       throw new CloudApiError("volcengine", code, err.Message || errCode, meta!.RequestId, raw.status);
     }
     if (raw.status >= 400) {

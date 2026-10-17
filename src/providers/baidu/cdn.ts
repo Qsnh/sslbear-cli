@@ -2,6 +2,7 @@ import type { AccessKeyCredentials } from "../../lib/env.js";
 import type { QueryContext } from "../../lib/http.js";
 import { compact } from "../../lib/compact.js";
 import { paginate } from "../../lib/paginate.js";
+import { mapLimit } from "../../lib/pool.js";
 import { toIso } from "../../lib/time.js";
 import type { CertInfo, DomainRecord } from "../../types.js";
 import type { DomainService, Warn } from "../registry.js";
@@ -31,6 +32,13 @@ interface HttpsDomain {
   status?: number;
 }
 
+/** GET /v2/domain/{domain}/config?https 的 https 字段 */
+interface HttpsConfig {
+  enabled?: boolean;
+  /** 关闭 HTTPS 时证书可能仍保持绑定（只有显式传 certId="" 才解绑），此时不算 HTTPS */
+  certId?: string;
+}
+
 /** /v2/httpsDomains 的 pageSize 上限为 100 */
 const HTTPS_PAGE = 100;
 
@@ -53,37 +61,70 @@ function earliest(certs: CertInfo[]): CertInfo | undefined {
   return dated[0] ?? certs[0];
 }
 
+/** 「开启了 HTTPS 的域名列表」批量接口，按域名归组服务端证书 */
+async function httpsDomainsBatch(ctx: QueryContext, creds: AccessKeyCredentials): Promise<Map<string, CertInfo[]>> {
+  const rows = await paginate(HTTPS_PAGE, async (page) => {
+    const res = await callBce<{ count?: number | string; rows?: HttpsDomain[] | null }>(ctx, creds, {
+      host: HOST,
+      path: "/v2/httpsDomains",
+      query: { pageNo: String(page), pageSize: String(HTTPS_PAGE) },
+    });
+    // 文档示例里 count 是字符串
+    const total = Number(res.count);
+    return { items: res.rows ?? [], total: Number.isFinite(total) ? total : undefined };
+  });
+  const byDomain = new Map<string, CertInfo[]>();
+  for (const row of rows) {
+    // 客户端证书是双向认证用的 CA，不是网站对外提供的证书
+    if (row.certType === 2) continue;
+    const list = byDomain.get(row.domain) ?? [];
+    list.push(toCert(row));
+    byDomain.set(row.domain, list);
+  }
+  return byDomain;
+}
+
+/**
+ * 批量接口失败时的退路：逐域名查 HTTPS 配置（并发 5），enabled 且有证书 ID 才算 HTTPS，
+ * 证书详情之后统一从证书管理按 ID 补全。单个域名失败只记 issue，该域名按未开启 HTTPS 输出。
+ */
+async function httpsPerDomain(ctx: QueryContext, creds: AccessKeyCredentials, warn: Warn, domains: UserDomain[]): Promise<Map<string, CertInfo[]>> {
+  const byDomain = new Map<string, CertInfo[]>();
+  await mapLimit(domains, 5, async (d) => {
+    try {
+      const res = await callBce<{ https?: HttpsConfig | null }>(ctx, creds, {
+        host: HOST,
+        path: `/v2/domain/${d.domain}/config`,
+        query: { https: "" },
+      });
+      const https = res.https;
+      if (https?.enabled && https.certId) byDomain.set(d.domain, [{ id: https.certId }]);
+    } catch (e) {
+      warn(e, `domain ${d.domain} HTTPS 配置`);
+    }
+  });
+  return byDomain;
+}
+
 /**
  * 域名列表 + 「开启了 HTTPS 的域名列表」两次查询后按域名合并，避免逐域名查配置。
  * 出现在 HTTPS 列表里即为已开启 HTTPS；列表只给证书 ID 没给到期时间的，从证书管理按 ID 补全。
+ * 没有域名时不查 HTTPS 列表（未开通 CDN 的账号该接口固定返回响应体为空的 HTTP 500）；
+ * HTTPS 列表接口失败时退回逐域名查询 HTTPS 配置。
  */
 export const cdn: DomainService<AccessKeyCredentials> = {
   key: "cdn",
   label: "CDN",
   async list(ctx: QueryContext, creds: AccessKeyCredentials, warn: Warn): Promise<DomainRecord[]> {
-    const [domains, httpsRows] = await Promise.all([
-      // 该接口不分页，一次返回全部域名及状态
-      callBce<{ domains?: UserDomain[] | null }>(ctx, creds, { host: HOST, path: "/v2/user/domains", query: { status: "ALL" } }).then(
-        (res) => res.domains ?? [],
-      ),
-      paginate(HTTPS_PAGE, async (page) => {
-        const res = await callBce<{ count?: number | string; rows?: HttpsDomain[] | null }>(ctx, creds, {
-          host: HOST,
-          path: "/v2/httpsDomains",
-          query: { pageNo: String(page), pageSize: String(HTTPS_PAGE) },
-        });
-        // 文档示例里 count 是字符串
-        const total = Number(res.count);
-        return { items: res.rows ?? [], total: Number.isFinite(total) ? total : undefined };
-      }),
-    ]);
-    const certsByDomain = new Map<string, CertInfo[]>();
-    for (const row of httpsRows) {
-      // 客户端证书是双向认证用的 CA，不是网站对外提供的证书
-      if (row.certType === 2) continue;
-      const list = certsByDomain.get(row.domain) ?? [];
-      list.push(toCert(row));
-      certsByDomain.set(row.domain, list);
+    // 该接口不分页，一次返回全部域名及状态
+    const res = await callBce<{ domains?: UserDomain[] | null }>(ctx, creds, { host: HOST, path: "/v2/user/domains", query: { status: "ALL" } });
+    const domains = res.domains ?? [];
+    if (domains.length === 0) return [];
+    let certsByDomain: Map<string, CertInfo[]>;
+    try {
+      certsByDomain = await httpsDomainsBatch(ctx, creds);
+    } catch {
+      certsByDomain = await httpsPerDomain(ctx, creds, warn, domains);
     }
     const records = domains.map((d) => {
       const certs = certsByDomain.get(d.domain);

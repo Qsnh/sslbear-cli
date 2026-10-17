@@ -11,6 +11,7 @@ export interface Page<T> {
  * 这样即使接口悄悄把 pageSize 截小也不会漏数据；没有 total 时以不足一页为结束。
  * 页码分页的接口用 page（从 1 开始）；偏移量分页的接口用 offset（已取到的条数），
  * 不要用 (page - 1) * pageSize 换算，否则接口截小 pageSize 时会跳过中间的数据。
+ * 例外：服务端先分页再过滤、返回条数少于 pageSize 的接口（如腾讯云点播域名列表）不能用 offset，需自行按页长翻页。
  */
 export async function paginate<T>(pageSize: number, fetchPage: (page: number, offset: number) => Promise<Page<T>>): Promise<T[]> {
   const all: T[] = [];

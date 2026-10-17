@@ -44,8 +44,9 @@ interface DomainPage {
 
 interface VodCert {
   CertId?: string;
+  /** 与 CDN 的 CertInfo 一致，是证书的 CN（实测为证书通用名），不是证书中心里的备注名 */
   CertName?: string;
-  /** Unix 秒；文档只写明了 CertId，其余字段有就用、缺了从证书中心补 */
+  /** Unix 秒（实测有返回；缺了从证书中心补）。实测还带完整证书链 Certificate.Certificate（PEM，不含私钥），未使用 */
   EffectiveTime?: number;
   ExpireTime?: number;
 }
@@ -54,6 +55,7 @@ interface DomainConfig {
   DomainInfo?: {
     DomainConfig?: { HTTPS?: { Switch?: boolean; CertInfo?: VodCert | null; CertInfoList?: VodCert[] | null } | null } | null;
   } | null;
+  /** CertificateName 同样是证书 CN */
   VodInfo?: { Certificate?: { CertificateId?: string; CertificateName?: string } | null } | null;
 }
 
@@ -155,9 +157,9 @@ export const vod: DomainService<AccessKeyCredentials> = {
       const list = https?.CertInfoList?.length ? https.CertInfoList : https?.CertInfo ? [https.CertInfo] : [];
       const certs: CertInfo[] = list
         .filter((c) => c.CertId)
-        .map((c) => compact({ id: c.CertId, name: c.CertName, notBefore: seconds(c.EffectiveTime), notAfter: seconds(c.ExpireTime) }));
+        .map((c) => compact({ id: c.CertId, commonName: c.CertName, notBefore: seconds(c.EffectiveTime), notAfter: seconds(c.ExpireTime) }));
       const fallback = configs[i]?.VodInfo?.Certificate;
-      if (certs.length === 0 && fallback?.CertificateId) certs.push(compact({ id: fallback.CertificateId, name: fallback.CertificateName }));
+      if (certs.length === 0 && fallback?.CertificateId) certs.push(compact({ id: fallback.CertificateId, commonName: fallback.CertificateName }));
       return { on, certs };
     });
     const filled = await completeCerts(ctx, creds, warn, candidates.flatMap((c) => c.certs));

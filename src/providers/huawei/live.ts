@@ -7,7 +7,7 @@ import { toIso } from "../../lib/time.js";
 import type { CertInfo, DomainRecord } from "../../types.js";
 import type { DomainService, Warn } from "../registry.js";
 import { callHuawei, listProjects } from "./client.js";
-import { earliest } from "./common.js";
+import { earliest, parsePem } from "./common.js";
 import { enrichFromScm } from "./scm.js";
 
 /**
@@ -35,16 +35,43 @@ interface LiveDomain {
 
 interface LiveCert {
   play_domain: string;
-  /** UTC "YYYY-MM-DDTHH:mm:ssZ" */
+  /** "YYYY-MM-DDTHH:mm:ssZ"，文档写 UTC，实测比证书真实有效期早 8 小时，见 infoTime */
   start_time?: string;
   expire_time?: string;
   /** 0 国际标准证书，1 国密证书 */
   cert_type?: number;
+  /** 国密证书：1 签名证书，2 加密证书 */
+  gm_cert_type?: number;
   /** scm 云证书管理服务，user 自有证书 */
   source?: string;
   /** 仅 scm 来源的证书有名称与 ID */
   cert_name?: string;
   cert_id?: string;
+}
+
+/** ShowDomainHttpsCert：播放域名当前配置的证书内容（PEM，私钥不返回） */
+interface HttpsCertConfig {
+  certificate?: string | null;
+  tls_certificate?: { certificate?: string | null } | null;
+  gm_certificate?: { sign_certificate?: string | null; enc_certificate?: string | null } | null;
+}
+
+/**
+ * ShowCertificateInfo 的 start_time / expire_time 虽然带 Z，实测比证书真实有效期早 8 小时
+ * （证书 notAfter 13:09:53Z 返回 05:09:53Z，像是把 UTC 时间当北京时间又换算了一次）。
+ * 时间优先取 ShowDomainHttpsCert 的 PEM，拿不到 PEM 时才用它并补回 8 小时。
+ */
+const INFO_SKEW_MS = 8 * 3_600_000;
+function infoTime(s: string | undefined): string | undefined {
+  const iso = toIso(s);
+  return iso && new Date(Date.parse(iso) + INFO_SKEW_MS).toISOString();
+}
+
+/** 按证书类型取对应的 PEM：国际证书取 tls_certificate（旧字段 certificate 兜底），国密取签名 / 加密证书 */
+function pemFor(c: LiveCert, cfg: HttpsCertConfig | undefined) {
+  if (!cfg) return undefined;
+  if (c.cert_type === 1) return parsePem(c.gm_cert_type === 2 ? cfg.gm_certificate?.enc_certificate : cfg.gm_certificate?.sign_certificate);
+  return parsePem(cfg.tls_certificate?.certificate || cfg.certificate);
 }
 
 // 文档里 ShowDomain 的失败示例是 404 LIVE.103011019（资源不存在），列表接口报这个按没有数据处理
@@ -59,21 +86,34 @@ async function listRegion(ctx: QueryContext, creds: AccessKeyCredentials, region
     callHuawei<{ domain_info?: LiveDomain[] | null }>(ctx, creds, { host, path: `/v1/${projectId}/domain`, projectId })
       .then((res) => res.domain_info ?? [])
       .catch((e: unknown) => emptyIfNotFound(e, [])),
-    paginate(CERT_PAGE, async (_page, offset) => {
+    paginate(CERT_PAGE, async (page) => {
       const res = await callHuawei<{ certificates_info?: LiveCert[] | null; total?: number }>(ctx, creds, {
         host,
         path: `/v2/${projectId}/certificates`,
-        query: { offset, limit: CERT_PAGE },
+        // 文档说 offset 是「偏移量」，实测是从 0 开始的页码：total=2 时 offset=1&limit=2 报 LIVE.100011001 page too large
+        query: { offset: page - 1, limit: CERT_PAGE },
         projectId,
       });
       return { items: res.certificates_info ?? [], total: res.total };
     }).catch((e: unknown) => emptyIfNotFound(e, [])),
   ]);
-  return { domains, certs };
+  // 只对证书列表里出现、且确实是本地域播放域名的域名逐个取 PEM
+  const pulls = new Set(domains.filter((d) => d.domain_type !== "push").map((d) => d.domain));
+  const withCert = [...new Set(certs.map((c) => c.play_domain))].filter((d) => pulls.has(d));
+  const configs = new Map<string, HttpsCertConfig | { error: unknown }>();
+  await mapLimit(withCert, 5, async (domain) => {
+    try {
+      configs.set(domain, await callHuawei<HttpsCertConfig>(ctx, creds, { host, path: `/v1/${projectId}/guard/https-cert`, query: { domain }, projectId }));
+    } catch (error) {
+      configs.set(domain, { error });
+    }
+  });
+  return { domains, certs, configs };
 }
 
 /**
- * 逐地域查直播域名 + 播放域名的 HTTPS 证书列表（ShowCertificateInfo 批量接口，带到期时间），按域名合并。
+ * 逐地域查直播域名 + 播放域名的 HTTPS 证书列表（ShowCertificateInfo 批量接口），按域名合并；
+ * 配了证书的播放域名再查 ShowDomainHttpsCert 取 PEM，解析出 CN / SAN / 签发者和准确的有效期。
  * 直播没有单独的 HTTPS 开关：播放域名配置了证书即开启 HTTPS，删除证书即关闭；推流域名不支持 HTTPS。
  */
 export const live: DomainService<AccessKeyCredentials> = {
@@ -106,11 +146,14 @@ export const live: DomainService<AccessKeyCredentials> = {
       // 国密证书的签名证书与加密证书各占一条，一个域名可能有多条
       const certsByDomain = new Map<string, (CertInfo & { source?: string })[]>();
       for (const c of data.certs) {
+        const cfg = data.configs.get(c.play_domain);
+        const pem = pemFor(c, cfg && !("error" in cfg) ? cfg : undefined);
         const cert = compact({
           id: c.cert_id,
           name: c.cert_name,
-          notBefore: toIso(c.start_time),
-          notAfter: toIso(c.expire_time),
+          ...pem,
+          notBefore: pem?.notBefore ?? infoTime(c.start_time),
+          notAfter: pem?.notAfter ?? infoTime(c.expire_time),
           source: c.source,
         });
         certsByDomain.set(c.play_domain, [...(certsByDomain.get(c.play_domain) ?? []), cert]);
@@ -119,6 +162,8 @@ export const live: DomainService<AccessKeyCredentials> = {
         // 接口若不按地域隔离会在多个地域返回同一域名，只保留第一次出现的
         if (seen.has(d.domain)) continue;
         seen.add(d.domain);
+        const cfg = data.configs.get(d.domain);
+        if (cfg && "error" in cfg) warn(cfg.error, `domain ${d.domain} HTTPS 证书内容（到期时间改用证书列表）`);
         const best = earliest(certsByDomain.get(d.domain) ?? []);
         const { source, ...cert } = best ?? {};
         records.push(
