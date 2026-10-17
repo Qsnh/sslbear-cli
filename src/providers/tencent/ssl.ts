@@ -71,9 +71,13 @@ export async function sslCertsById(
   }
 }
 
+const needsExpiry = (r: DomainRecord) => !!r.cert?.id && !r.cert.notAfter;
+/** 点播、COS 的证书配置只有 ID（和到期时间），没有证书名，表格里只能显示 ID */
+const needsName = (r: DomainRecord) => !!r.cert?.id && !r.cert.name;
+
 /**
- * 有些服务只返回证书 ID 而缺到期时间等信息，用 SSL 证书列表按 ID 补全。
- * 补全失败只记一条 issue，域名本身照常返回。
+ * 有些服务只返回证书 ID 而缺到期时间、证书名等信息，用 SSL 证书列表按 ID 补全；服务给出的字段不覆盖。
+ * 补全失败（如没有 SSL 只读权限）时，有域名缺到期时间才记一条 issue（只缺证书名不影响到期判断），域名本身照常返回。
  */
 export async function enrichFromSsl(
   ctx: QueryContext,
@@ -81,14 +85,29 @@ export async function enrichFromSsl(
   warn: Warn,
   records: DomainRecord[],
 ): Promise<DomainRecord[]> {
-  const pending = records.filter((r) => r.cert?.id && !r.cert.notAfter);
+  const pending = records.filter((r) => needsExpiry(r) || needsName(r));
   if (pending.length === 0) return records;
-  const byId = await sslCertsById(ctx, creds, warn);
-  if (!byId) return records;
+  let certs: CertificateRecord[];
+  try {
+    certs = await listSslCertificates(ctx, creds);
+  } catch (e) {
+    if (pending.some(needsExpiry)) warn(e, "SSL 证书列表（用于补全到期时间）");
+    return records;
+  }
+  const byId = new Map(certs.map((c) => [c.id, c]));
   for (const r of pending) {
     const c = byId.get(r.cert!.id!);
     if (!c) continue;
-    r.cert = compact({ ...r.cert, name: r.cert!.name ?? c.name, commonName: c.commonName, sans: c.sans, notBefore: c.notBefore, notAfter: c.notAfter, status: r.cert!.status ?? c.status });
+    const cert = r.cert!;
+    r.cert = compact({
+      ...cert,
+      name: cert.name ?? c.name,
+      commonName: cert.commonName ?? c.commonName,
+      sans: cert.sans ?? c.sans,
+      notBefore: cert.notBefore ?? c.notBefore,
+      notAfter: cert.notAfter ?? c.notAfter,
+      status: cert.status ?? c.status,
+    });
   }
   return records;
 }

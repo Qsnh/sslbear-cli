@@ -315,7 +315,9 @@ describe("tencent domains", () => {
     const r = await runCli(["domains", "-s", "vod", "--json"], { env: TENCENT_ENV, fetch });
     expect(r.code).toBe(0);
     expect(fetch.calls.filter((c) => c.action === "DescribeVodDomains")).toHaveLength(2);
-    expect(fetch.calls.some((c) => c.action === "DescribeCertificates")).toBe(false);
+    // 证书缺名称时会按 ID 拉 SSL 证书列表补名称；拉取失败（这里没有路由）不记 issue，因为到期时间已有
+    expect(fetch.calls.filter((c) => c.action === "DescribeCertificates")).toHaveLength(1);
+    expect(r.json.data.issues).toEqual([]);
     expect(r.json.data.items).toEqual([
       {
         provider: "tencent",
@@ -336,6 +338,29 @@ describe("tencent domains", () => {
         extra: { type: "VOD", subAppId: "1500001", subApp: "主应用" },
       },
     ]);
+  });
+
+  it("点播：证书只有 ID 和到期时间时，从 SSL 证书列表补名称、CN、SAN，到期时间以点播为准", async () => {
+    const fetch = fakeFetch((req) => {
+      if (req.action === "DescribeSubAppIds") return ok({ TotalCount: 0, SubAppIdInfoSet: [] });
+      if (req.action === "DescribeVodDomains") {
+        return ok({
+          TotalCount: 1,
+          DomainSet: [{ Domain: "v.example.com", DeployStatus: "Online", Type: "VOD", HTTPSConfig: { CloudCertId: "ssl-1", CertExpireTime: "2026-10-29T23:59:59Z" } }],
+        });
+      }
+      return sslRoute(req);
+    });
+    const r = await runCli(["domains", "-s", "vod", "--json"], { env: TENCENT_ENV, fetch });
+    expect(r.json.data.items[0].cert).toEqual({
+      id: "ssl-1",
+      name: "wild",
+      commonName: "*.example.com",
+      sans: ["*.example.com", "example.com"],
+      notBefore: "2026-08-01T00:00:00.000Z",
+      notAfter: "2026-10-29T23:59:59.000Z",
+      status: "已通过",
+    });
   });
 
   it("点播：TotalCount 含不展示的域名时按页长翻页，同一域名不重复列出；默认分发域名标记为平台域名", async () => {

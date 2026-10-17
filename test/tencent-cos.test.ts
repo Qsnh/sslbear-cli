@@ -158,8 +158,8 @@ describe("tencent cos", () => {
       expect.objectContaining({ service: "cos", kind: "error", target: "bucket locked-1250000000", code: "AccessDenied", requestId: "req-AccessDenied" }),
       expect.objectContaining({ service: "cos", kind: "error", target: "domain dl.example.com", code: "InternalError" }),
     ]);
-    // 有到期时间的不需要 SSL 证书列表
-    expect(fetch.calls.some((c) => c.url.host === "ssl.tencentcloudapi.com")).toBe(false);
+    // 证书缺名称时会按 ID 拉 SSL 证书列表补名称；有到期时间，拉取失败（这里没有路由）不记 issue
+    expect(fetch.calls.filter((c) => c.url.host === "ssl.tencentcloudapi.com")).toHaveLength(1);
   });
 
   it("请求格式：GET + q-sign 签名头，签 host 与所有请求参数", async () => {

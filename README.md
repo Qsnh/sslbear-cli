@@ -144,7 +144,7 @@ sslbear-cli domains [选项]
 - 百度智能云：`CdnReadAccessPolicy`（CDN 只读）、`CASReadPolicy`（证书管理只读，需产品级权限）。
 - 七牛云：没有现成的只读系统策略，可用主账号 AK，或给 IAM 子账号自定义策略授权 `cdn/GetDomainList`、`cdn/GetDomainInfo`。
 
-部分服务的域名接口只返回证书 ID，会用该云的证书列表按 ID 补全到期时间（腾讯云直播、点播、EdgeOne、COS，火山引擎 DCDN、TOS、点播、veImageX，华为云直播、OBS，百度智能云 CDN，七牛云 CDN），因此建议同时授予证书服务的只读权限；补全失败只记一条 issue，域名照常输出。阿里云 CDN、DCDN、直播的证书信息来自各自的 HTTPS 证书列表接口，查不到（如缺权限）时同样只记一条 issue、域名照常输出（CDN、DCDN 的 HTTPS 以域名列表里的开关为准；直播没有开关，此时显示为关闭）。
+部分服务的域名接口只返回证书 ID，会用该云的证书列表按 ID 补全到期时间、证书名等信息（腾讯云直播、点播、EdgeOne、COS，火山引擎 DCDN、TOS、点播、veImageX，华为云直播、OBS，百度智能云 CDN，七牛云 CDN），因此建议同时授予证书服务的只读权限；补全失败只记一条 issue，域名照常输出。阿里云 CDN、DCDN、直播的证书信息来自各自的 HTTPS 证书列表接口，查不到（如缺权限）时同样只记一条 issue、域名照常输出（CDN、DCDN 的 HTTPS 以域名列表里的开关为准；直播没有开关，此时显示为关闭）。
 
 缺少某个服务的权限时，只有该服务会出现在 `issues` 里，其余服务照常输出。
 
