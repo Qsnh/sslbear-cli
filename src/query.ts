@@ -2,13 +2,17 @@ import type { Env } from "./lib/env.js";
 import { CloudApiError, type QueryContext } from "./lib/http.js";
 import { daysUntil } from "./lib/time.js";
 import { aliyun } from "./providers/aliyun/index.js";
+import { baidu } from "./providers/baidu/index.js";
+import { huawei } from "./providers/huawei/index.js";
+import { qiniu } from "./providers/qiniu/index.js";
 import { requiredEnvNames, type ProviderDef } from "./providers/registry.js";
 import { tencent } from "./providers/tencent/index.js";
+import { volcengine } from "./providers/volcengine/index.js";
 import type { CertificateRecord, DomainRecord, Provider } from "./types.js";
 
 // 各厂商凭证类型不同，注册表里统一擦除；调用时凭证与 provider 一一对应
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export const PROVIDER_DEFS: Record<Provider, ProviderDef<any>> = { aliyun, tencent };
+export const PROVIDER_DEFS: Record<Provider, ProviderDef<any>> = { aliyun, tencent, volcengine, huawei, baidu, qiniu };
 
 export interface QueryIssue {
   provider: Provider;

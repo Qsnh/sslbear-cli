@@ -1,10 +1,14 @@
-export type Provider = "aliyun" | "tencent";
+export type Provider = "aliyun" | "tencent" | "volcengine" | "huawei" | "baidu" | "qiniu";
 
-export const PROVIDERS: readonly Provider[] = ["aliyun", "tencent"];
+export const PROVIDERS: readonly Provider[] = ["aliyun", "tencent", "volcengine", "huawei", "baidu", "qiniu"];
 
 export const PROVIDER_LABEL: Record<Provider, string> = {
   aliyun: "阿里云",
   tencent: "腾讯云",
+  volcengine: "火山引擎",
+  huawei: "华为云",
+  baidu: "百度智能云",
+  qiniu: "七牛云",
 };
 
 /** 证书信息，各云厂商字段归一后的结果；时间统一为 ISO 8601 (UTC) */
@@ -35,7 +39,7 @@ export interface DomainRecord {
   extra?: Record<string, string | undefined>;
 }
 
-/** 证书服务（阿里云数字证书管理服务 / 腾讯云 SSL 证书）里的一张证书 */
+/** 证书服务（阿里云数字证书管理服务、腾讯云 SSL 证书等）里的一张证书 */
 export interface CertificateRecord extends CertInfo {
   provider: Provider;
   id: string;

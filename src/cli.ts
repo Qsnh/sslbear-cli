@@ -140,7 +140,7 @@ function emit<T>(opts: OutputOptions, result: { issues: QueryIssue[]; succeeded:
 
 export function buildProgram(deps: Deps, output: OutputOptions = { json: false }): Command {
   const program = new Command("sslbear-cli")
-    .description("证书熊 CLI：查询阿里云、腾讯云云服务上的域名及其 SSL 证书（凭证从环境变量读取）")
+    .description("证书熊 CLI：查询阿里云、腾讯云、火山引擎、华为云、百度智能云、七牛云等云服务上的域名及其 SSL 证书（凭证从环境变量读取）")
     .version(VERSION)
     .exitOverride();
   // JSON 模式下参数错误由 run() 统一输出为 JSON，屏蔽 commander 自带的文本报错与帮助
@@ -164,7 +164,7 @@ export function buildProgram(deps: Deps, output: OutputOptions = { json: false }
   });
 
   withQuery(
-    program.command("certs").description("列出证书服务中的证书（阿里云数字证书管理服务 / 腾讯云 SSL 证书），按剩余天数升序"),
+    program.command("certs").description("列出各云厂商证书服务中的证书（如阿里云数字证书管理服务、腾讯云 SSL 证书），按剩余天数升序"),
   ).action(async (opts: QueryOpts) => {
     const out = { json: !!opts.json };
     const ctx = createContext(deps, opts);

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { loadEnvFile, mask, parseDotenv, readAliyun, readTencent } from "../src/lib/env.js";
+import { CloudApiError, withRetry } from "../src/lib/http.js";
 import { displayWidth, renderTable } from "../src/lib/table.js";
 import { daysUntil, toIso } from "../src/lib/time.js";
 import { xmlBlocks, xmlText } from "../src/lib/xml.js";
@@ -135,5 +136,27 @@ describe("xml", () => {
     const xml = "<R><Cname><Domain>a.com</Domain></Cname><Cname><Domain>b&amp;c.com</Domain></Cname></R>";
     expect(xmlBlocks(xml, "Cname").map((b) => xmlText(b, "Domain"))).toEqual(["a.com", "b&c.com"]);
     expect(xmlText(xml, "Missing")).toBeUndefined();
+  });
+});
+
+describe("withRetry", () => {
+  const ctx = { fetch, timeoutMs: 1000, now: new Date(), env: {}, sleep: async () => {} };
+  it("HTTP 429 即使错误码不像限流也重试", async () => {
+    let n = 0;
+    const r = await withRetry(ctx, async () => {
+      if (n++ === 0) throw new CloudApiError("qiniu", "HTTP429", "too many requests", undefined, 429);
+      return "ok";
+    });
+    expect([r, n]).toEqual(["ok", 2]);
+  });
+  it("其他错误不重试", async () => {
+    let n = 0;
+    await expect(
+      withRetry(ctx, async () => {
+        n++;
+        throw new CloudApiError("qiniu", "HTTP400", "bad request", undefined, 400);
+      }),
+    ).rejects.toThrow("bad request");
+    expect(n).toBe(1);
   });
 });

@@ -33,14 +33,15 @@ export interface RawResponse {
 const RETRYABLE = /Throttl|RequestLimitExceeded|ServiceUnavailable|^Timeout$|^NetworkError$/;
 const MAX_ATTEMPTS = 3;
 
-/** 限流、超时和网络错误自动重试（指数退避），其余错误原样抛出 */
+/** 限流（含 HTTP 429）、超时和网络错误自动重试（指数退避），其余错误原样抛出 */
 export async function withRetry<T>(ctx: QueryContext, fn: () => Promise<T>): Promise<T> {
   const sleep = ctx.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   for (let attempt = 1; ; attempt++) {
     try {
       return await fn();
     } catch (e) {
-      if (!(e instanceof CloudApiError) || !RETRYABLE.test(e.code) || attempt >= MAX_ATTEMPTS) throw e;
+      const retryable = e instanceof CloudApiError && (RETRYABLE.test(e.code) || e.httpStatus === 429);
+      if (!retryable || attempt >= MAX_ATTEMPTS) throw e;
       await sleep(500 * 2 ** (attempt - 1));
     }
   }

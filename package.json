@@ -1,7 +1,7 @@
 {
   "name": "sslbear-cli",
   "version": "0.1.0",
-  "description": "证书熊 CLI：查询阿里云、腾讯云云服务上的域名及其 SSL 证书",
+  "description": "证书熊 CLI：查询阿里云、腾讯云、火山引擎、华为云、百度智能云、七牛云云服务上的域名及其 SSL 证书",
   "type": "module",
   "bin": {
     "sslbear-cli": "dist/index.js"
@@ -25,6 +25,10 @@
     "certificate",
     "aliyun",
     "tencentcloud",
+    "volcengine",
+    "huaweicloud",
+    "baiducloud",
+    "qiniu",
     "cdn",
     "sslbear"
   ],

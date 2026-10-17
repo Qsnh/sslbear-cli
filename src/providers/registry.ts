@@ -48,9 +48,10 @@ export function envKeyStatus(def: ProviderDef<unknown>, env: Env, mask: (v: stri
   const f = r.state === "missing" ? def.envFamilies[0]! : r.family;
   const get = (name: string) => env[name]?.trim() || undefined;
   const id = get(f.id);
-  return [
+  const keys: EnvKeyStatus[] = [
     { name: f.id, required: true, set: !!id, ...(id && { masked: mask(id) }) },
     { name: f.secret, required: true, set: !!get(f.secret) },
-    { name: f.token, required: false, set: !!get(f.token) },
   ];
+  if (f.token) keys.push({ name: f.token, required: false, set: !!get(f.token) });
+  return keys;
 }

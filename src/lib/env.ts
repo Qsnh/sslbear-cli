@@ -55,6 +55,13 @@ export interface TencentCredentials {
   sessionToken?: string;
 }
 
+/** 火山引擎、华为云、百度智能云、七牛云共用：AccessKey + SecretKey，部分厂商支持 STS 临时凭证 */
+export interface AccessKeyCredentials {
+  accessKeyId: string;
+  secretAccessKey: string;
+  securityToken?: string;
+}
+
 /**
  * 每家云厂商支持的变量名族：官方 SDK 变量名在前，常见别名在后。
  * 同一组凭证（ID / Secret / Token）只从同一个名族里取，不跨名族拼凑。
@@ -65,16 +72,24 @@ export const ENV_FAMILIES = {
     { id: "ALIYUN_ACCESS_KEY_ID", secret: "ALIYUN_ACCESS_KEY_SECRET", token: "ALIYUN_SECURITY_TOKEN" },
   ],
   tencent: [{ id: "TENCENTCLOUD_SECRET_ID", secret: "TENCENTCLOUD_SECRET_KEY", token: "TENCENTCLOUD_SESSION_TOKEN" }],
+  volcengine: [{ id: "VOLCENGINE_ACCESS_KEY", secret: "VOLCENGINE_SECRET_KEY", token: "VOLCENGINE_SESSION_TOKEN" }],
+  huawei: [
+    { id: "HUAWEICLOUD_SDK_AK", secret: "HUAWEICLOUD_SDK_SK", token: "HUAWEICLOUD_SDK_SECURITY_TOKEN" },
+    { id: "HW_ACCESS_KEY", secret: "HW_SECRET_KEY", token: "HW_SECURITY_TOKEN" },
+  ],
+  baidu: [{ id: "BAIDUCLOUD_ACCESS_KEY", secret: "BAIDUCLOUD_SECRET_KEY", token: "BAIDUCLOUD_SESSION_TOKEN" }],
+  // 七牛云没有临时凭证
+  qiniu: [{ id: "QINIU_ACCESS_KEY", secret: "QINIU_SECRET_KEY" }],
 } as const;
 
 export interface EnvFamily {
   id: string;
   secret: string;
-  token: string;
+  token?: string;
 }
 
 export function familyNames(families: readonly EnvFamily[]): string[] {
-  return families.flatMap((f) => [f.id, f.secret, f.token]);
+  return families.flatMap((f) => [f.id, f.secret, ...(f.token ? [f.token] : [])]);
 }
 
 const value = (env: Env, name: string) => env[name]?.trim() || undefined;
@@ -91,7 +106,7 @@ export function resolveFamily(env: Env, families: readonly EnvFamily[]): Credent
   const id = value(env, family.id);
   const secret = value(env, family.secret);
   if (!id || !secret) return { state: "incomplete", family, missing: [!id ? family.id : family.secret] };
-  const token = value(env, family.token);
+  const token = family.token && value(env, family.token);
   return { state: "ok", family, id, secret, ...(token && { token }) };
 }
 
@@ -107,6 +122,15 @@ export function readTencent(env: Env): Credentials<TencentCredentials> {
   const r = resolveFamily(env, ENV_FAMILIES.tencent);
   if (r.state !== "ok") return r;
   return { state: "ok", credentials: { secretId: r.id, secretKey: r.secret, ...(r.token && { sessionToken: r.token }) } };
+}
+
+/** 读取通用 AccessKey 凭证 */
+export function readAccessKey(families: readonly EnvFamily[]) {
+  return (env: Env): Credentials<AccessKeyCredentials> => {
+    const r = resolveFamily(env, families);
+    if (r.state !== "ok") return r;
+    return { state: "ok", credentials: { accessKeyId: r.id, secretAccessKey: r.secret, ...(r.token && { securityToken: r.token }) } };
+  };
 }
 
 /** 展示用脱敏：保留首尾各 4 位 */

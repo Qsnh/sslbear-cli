@@ -173,6 +173,21 @@ describe("env 与 .env", () => {
     expect(tencent.keys.map((k: any) => k.name)).toEqual(["TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY", "TENCENTCLOUD_SESSION_TOKEN"]);
   });
 
+  it("env 列出所有云厂商：别名族按实际生效的展示，七牛云没有 Token 变量", async () => {
+    const r = await runCli(["env", "--json"], { env: { HW_ACCESS_KEY: "hw-ak-0123456789", HW_SECRET_KEY: "hw-sk", QINIU_ACCESS_KEY: "qn-ak" } });
+    const byProvider = Object.fromEntries(r.json.data.providers.map((p: any) => [p.provider, p]));
+    expect(Object.keys(byProvider)).toEqual(["aliyun", "tencent", "volcengine", "huawei", "baidu", "qiniu"]);
+    expect(byProvider.huawei).toMatchObject({ state: "ok" });
+    expect(byProvider.huawei.keys.map((k: any) => k.name)).toEqual(["HW_ACCESS_KEY", "HW_SECRET_KEY", "HW_SECURITY_TOKEN"]);
+    expect(byProvider.qiniu).toMatchObject({ state: "incomplete" });
+    expect(byProvider.qiniu.keys).toEqual([
+      { name: "QINIU_ACCESS_KEY", required: true, set: true, masked: "*****" },
+      { name: "QINIU_SECRET_KEY", required: true, set: false },
+    ]);
+    expect(byProvider.volcengine.keys.map((k: any) => k.name)).toEqual(["VOLCENGINE_ACCESS_KEY", "VOLCENGINE_SECRET_KEY", "VOLCENGINE_SESSION_TOKEN"]);
+    expect(byProvider.baidu.keys.map((k: any) => k.name)).toEqual(["BAIDUCLOUD_ACCESS_KEY", "BAIDUCLOUD_SECRET_KEY", "BAIDUCLOUD_SESSION_TOKEN"]);
+  });
+
   it("自动加载当前目录 .env", async () => {
     const dir = mkdtempSync(join(tmpdir(), "sslbear-cli-"));
     writeFileSync(join(dir, ".env"), "TENCENTCLOUD_SECRET_ID=from-file-id\nTENCENTCLOUD_SECRET_KEY=from-file-key\n");
