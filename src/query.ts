@@ -34,17 +34,19 @@ export interface Selection {
   services?: string[];
 }
 
-interface Target {
+export interface Target {
   def: ProviderDef<unknown>;
   creds: unknown;
 }
 
+export type ProviderDefs = Record<Provider, ProviderDef<any>>; // eslint-disable-line @typescript-eslint/no-explicit-any
+
 /** 解析要查询的云厂商：显式指定但未配置、或配置不完整时报参数错误 */
-export function resolveTargets(env: Env, providers?: Provider[]): Target[] {
+export function resolveTargets(env: Env, providers?: Provider[], defs: ProviderDefs = PROVIDER_DEFS): Target[] {
   const explicit = providers && providers.length > 0;
   const targets: Target[] = [];
-  for (const p of explicit ? providers : (Object.keys(PROVIDER_DEFS) as Provider[])) {
-    const def = PROVIDER_DEFS[p];
+  for (const p of explicit ? providers : (Object.keys(defs) as Provider[])) {
+    const def = defs[p];
     const state = def.readCredentials(env);
     if (state.state === "incomplete") {
       throw new UsageError(`${p} 凭证不完整，缺少环境变量 ${state.missing.join(", ")}`);
@@ -56,13 +58,13 @@ export function resolveTargets(env: Env, providers?: Provider[]): Target[] {
     targets.push({ def, creds: state.credentials });
   }
   if (targets.length === 0) {
-    const hints = Object.values(PROVIDER_DEFS).map((d) => `${d.provider}: ${requiredEnvNames(d).join("、")}`);
+    const hints = Object.values(defs).map((d) => `${d.provider}: ${requiredEnvNames(d).join("、")}`);
     throw new UsageError(`未检测到任何云厂商凭证，请设置环境变量（或写入当前目录 .env）：\n  ${hints.join("\n  ")}`);
   }
   return targets;
 }
 
-function toIssue(def: ProviderDef<unknown>, service: string, e: unknown, target?: string): QueryIssue {
+export function toIssue(def: ProviderDef<unknown>, service: string, e: unknown, target?: string): QueryIssue {
   const where = { provider: def.provider, service, ...(target && { target }) };
   if (e instanceof CloudApiError) {
     return {
@@ -83,8 +85,8 @@ export interface DomainQueryResult {
   succeeded: number;
 }
 
-export async function queryDomains(ctx: QueryContext, sel: Selection): Promise<DomainQueryResult> {
-  const targets = resolveTargets(ctx.env, sel.providers);
+export async function queryDomains(ctx: QueryContext, sel: Selection, defs: ProviderDefs = PROVIDER_DEFS): Promise<DomainQueryResult> {
+  const targets = resolveTargets(ctx.env, sel.providers, defs);
   const jobs = targets.flatMap(({ def, creds }) => {
     const services = sel.services?.length ? def.services.filter((s) => sel.services!.includes(s.key)) : def.services;
     return services.map((svc) => ({ def, svc, creds }));
