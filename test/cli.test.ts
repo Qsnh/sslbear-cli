@@ -50,6 +50,7 @@ function mixedRoutes(req: FakeRequest) {
     };
   }
   if (host === "teo.tencentcloudapi.com") return { body: { Response: { TotalCount: 0, Zones: [] } } };
+  if (host === "service.cos.myqcloud.com") return { body: "<ListAllMyBucketsResult><Buckets></Buckets></ListAllMyBucketsResult>" };
   if (host === "live.tencentcloudapi.com") return { body: { Response: { AllCount: 0, DomainList: [], TotalNum: 0, LiveDomainCertBindings: [] } } };
   if (host === "vod.tencentcloudapi.com") return { body: { Response: { TotalCount: 0, DomainSet: [], SubAppIdInfoSet: [] } } };
   return undefined;

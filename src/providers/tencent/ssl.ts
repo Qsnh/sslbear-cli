@@ -56,9 +56,24 @@ export function listSslCertificates(ctx: QueryContext, creds: TencentCredentials
   return cached(ctx, `ssl:${creds.secretId}`, () => fetchAll(ctx, creds));
 }
 
+/** 按 ID 索引的 SSL 证书；拉取失败（如没有 SSL 只读权限）只记一条 issue 并返回 undefined */
+export async function sslCertsById(
+  ctx: QueryContext,
+  creds: TencentCredentials,
+  warn: Warn,
+): Promise<Map<string, CertificateRecord> | undefined> {
+  try {
+    const certs = await listSslCertificates(ctx, creds);
+    return new Map(certs.map((c) => [c.id, c]));
+  } catch (e) {
+    warn(e, "SSL 证书列表（用于补全到期时间）");
+    return undefined;
+  }
+}
+
 /**
  * 有些服务只返回证书 ID 而缺到期时间等信息，用 SSL 证书列表按 ID 补全。
- * 补全失败（如没有 SSL 只读权限）只记一条 issue，域名本身照常返回。
+ * 补全失败只记一条 issue，域名本身照常返回。
  */
 export async function enrichFromSsl(
   ctx: QueryContext,
@@ -68,14 +83,8 @@ export async function enrichFromSsl(
 ): Promise<DomainRecord[]> {
   const pending = records.filter((r) => r.cert?.id && !r.cert.notAfter);
   if (pending.length === 0) return records;
-  let certs: CertificateRecord[];
-  try {
-    certs = await listSslCertificates(ctx, creds);
-  } catch (e) {
-    warn(e, "SSL 证书列表（用于补全到期时间）");
-    return records;
-  }
-  const byId = new Map(certs.map((c) => [c.id, c]));
+  const byId = await sslCertsById(ctx, creds, warn);
+  if (!byId) return records;
   for (const r of pending) {
     const c = byId.get(r.cert!.id!);
     if (!c) continue;

@@ -1,6 +1,7 @@
 import { ENV_FAMILIES, readTencent, type TencentCredentials } from "../../lib/env.js";
 import { defineProvider } from "../registry.js";
 import { cdn } from "./cdn.js";
+import { cos } from "./cos.js";
 import { live } from "./live.js";
 import { listSslCertificates } from "./ssl.js";
 import { teo } from "./teo.js";
@@ -19,7 +20,7 @@ export const tencent = defineProvider<TencentCredentials>({
   provider: "tencent",
   envFamilies: ENV_FAMILIES.tencent,
   readCredentials: readTencent,
-  services: [cdn, teo, live, vod],
+  services: [cdn, teo, cos, live, vod],
   listCertificates: listSslCertificates,
   isInactive: (code) => INACTIVE_CODES.has(code),
 });

@@ -152,6 +152,70 @@ describe("tencent domains", () => {
     expect(r.json.data.issues).toEqual([
       expect.objectContaining({ service: "teo", kind: "error", target: "zone broken.io", code: "InternalError.ProxyServer" }),
     ]);
+    // 证书都带 ExpireTime 时不拉 SSL 证书列表
+    expect(fetch.calls.some((c) => c.action === "DescribeCertificates")).toBe(false);
+  });
+
+  it("EdgeOne：证书列表只有 CertId 时从 SSL 列表补全后再取最早到期；免费证书模式也算 HTTPS", async () => {
+    const fetch = fakeFetch((req) => {
+      if (req.action === "DescribeZones") return ok({ TotalCount: 1, Zones: [{ ZoneId: "zone-1", ZoneName: "example.com" }] });
+      if (req.action === "DescribeAccelerationDomains") {
+        expect(req.json).toEqual({ ZoneId: "zone-1", Offset: 0, Limit: 200 });
+        return ok({
+          TotalCount: 2,
+          AccelerationDomains: [
+            // 官方示例里 List 只带 CertId
+            { DomainName: "www.example.com", DomainStatus: "online", Certificate: { Mode: "sslcert", List: [{ CertId: "ssl-1" }, { CertId: "ssl-late", ExpireTime: "2027-06-01T00:00:00Z" }] } },
+            { DomainName: "free.example.com", DomainStatus: "online", Certificate: { Mode: "eofreecert", List: [{ CertId: "eo-free", ExpireTime: "2026-12-24T15:59:59Z", Status: "deployed" }] } },
+          ],
+        });
+      }
+      return sslRoute(req);
+    });
+    const r = await runCli(["domains", "-s", "teo", "--json"], { env: TENCENT_ENV, fetch });
+    expect(r.code).toBe(0);
+    expect(r.json.data.items).toEqual([
+      {
+        provider: "tencent",
+        service: "teo",
+        domain: "www.example.com",
+        status: "online",
+        https: true,
+        cert: { id: "ssl-1", name: "wild", commonName: "*.example.com", sans: ["*.example.com", "example.com"], notBefore: "2026-08-01T00:00:00.000Z", notAfter: "2026-10-29T23:59:59.000Z" },
+        extra: { zoneId: "zone-1", zone: "example.com", certMode: "sslcert" },
+        daysLeft: 14,
+      },
+      {
+        provider: "tencent",
+        service: "teo",
+        domain: "free.example.com",
+        status: "online",
+        https: true,
+        cert: { id: "eo-free", notAfter: "2026-12-24T15:59:59.000Z", status: "deployed" },
+        extra: { zoneId: "zone-1", zone: "example.com", certMode: "eofreecert" },
+        daysLeft: 70,
+      },
+    ]);
+    expect(fetch.calls.filter((c) => c.action === "DescribeCertificates")).toHaveLength(1);
+  });
+
+  it("EdgeOne：SSL 列表补全失败只记 issue，域名照常返回", async () => {
+    const fetch = fakeFetch((req) => {
+      if (req.action === "DescribeZones") return ok({ TotalCount: 1, Zones: [{ ZoneId: "zone-1", ZoneName: "example.com" }] });
+      if (req.action === "DescribeAccelerationDomains") {
+        return ok({ TotalCount: 1, AccelerationDomains: [{ DomainName: "www.example.com", Certificate: { Mode: "sslcert", List: [{ CertId: "ssl-1" }] } }] });
+      }
+      if (req.action === "DescribeCertificates") return tcError("UnauthorizedOperation", "no permission");
+      return undefined;
+    });
+    const r = await runCli(["domains", "-s", "teo", "--json"], { env: TENCENT_ENV, fetch });
+    expect(r.code).toBe(0);
+    expect(r.json.data.items).toEqual([
+      { provider: "tencent", service: "teo", domain: "www.example.com", https: true, cert: { id: "ssl-1" }, extra: { zoneId: "zone-1", zone: "example.com", certMode: "sslcert" } },
+    ]);
+    expect(r.json.data.issues).toEqual([
+      expect.objectContaining({ service: "teo", kind: "error", target: "SSL 证书列表（用于补全到期时间）", code: "UnauthorizedOperation" }),
+    ]);
   });
 
   it("直播：按域名合并证书绑定，缺到期时间的从 SSL 列表补", async () => {
