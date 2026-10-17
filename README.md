@@ -69,6 +69,7 @@ sslbear-cli domains [选项]
 | --- | --- | --- |
 | aliyun | `cdn` | CDN |
 | aliyun | `dcdn` | 全站加速 DCDN |
+| aliyun | `esa` | 边缘安全加速 ESA（站点下开启代理加速的记录、SaaS 域名） |
 | aliyun | `oss` | 对象存储 OSS（自定义域名） |
 | aliyun | `live` | 视频直播 |
 | aliyun | `vod` | 视频点播 |
@@ -100,14 +101,15 @@ sslbear-cli domains [选项]
 
 ## 所需权限
 
-只需各产品的只读权限，可在 RAM / CAM 控制台给子账号授予对应产品的 ReadOnly 系统策略（CDN、DCDN、OSS、视频直播、视频点播、数字证书管理服务；腾讯云 CDN、EdgeOne、云直播、云点播、SSL 证书）。腾讯云直播、点播里只返回证书 ID 的域名，会用 SSL 证书列表补全到期时间，因此建议同时授予 SSL 证书只读权限。
+只需各产品的只读权限，可在 RAM / CAM 控制台给子账号授予对应产品的 ReadOnly 系统策略（CDN、DCDN、边缘安全加速 ESA（`AliyunESAReadOnlyAccess`）、OSS、视频直播、视频点播、数字证书管理服务；腾讯云 CDN、EdgeOne、云直播、云点播、SSL 证书）。腾讯云直播、点播里只返回证书 ID 的域名，会用 SSL 证书列表补全到期时间，因此建议同时授予 SSL 证书只读权限。
 
 缺少某个服务的权限时，只有该服务会出现在 `issues` 里，其余服务照常输出。
 
 ## 已知限制
 
 - 阿里云视频点播只查询上海地域（`vod.cn-shanghai.aliyuncs.com`）。
-- 暂不支持腾讯云 COS 自定义域名和阿里云边缘安全加速 ESA。经过 CDN 加速的 COS 域名会出现在腾讯云 CDN 的结果里。
+- 阿里云 ESA 只查询中国站接入点（`esa.cn-hangzhou.aliyuncs.com`），国际站（`ap-southeast-1` 接入点）暂未适配。ESA 的证书配置在站点上，记录绑定的证书按证书通用名和 SAN 匹配得出；多张证书都匹配时按 ESA 的选择优先级取有效期内、配置时间较晚的那张，RSA 与 ECC 证书同时有效时取先到期的那张。HTTPS 列要求站点的 SSL/TLS 配置（全局配置与 SSL/TLS 规则）对该域名开启了 HTTPS，并且有已签发的匹配证书（只有申请中 / 申请失败的证书记为关闭）。JSON 里 `extra.httpsSwitch` 为开关状态 `on` / `off` / `partial`，`extra.httpsRule` 为决定结果的规则名；partial 表示有规则的条件无法按域名判断（如引用了自定义列表，或用了无法解析的写法），此时按开启处理并照常展示证书，宁可多报到期；SSL/TLS 配置查询失败时没有 `httpsSwitch`，HTTPS 只按证书判断。泛域名记录按记录名本身（如 `*.example.com`）匹配规则；SaaS 域名以其自身的 SSL 开关为准。只解析不加速的记录不列出，边缘函数、边缘容器和四层加速的记录暂不支持。
+- 暂不支持腾讯云 COS 自定义域名。经过 CDN 加速的 COS 域名会出现在腾讯云 CDN 的结果里。
 - 阿里云 CAS 证书列表接口只返回到期日期、不含具体时刻，按到期当天 23:59:59（北京时间）计算剩余天数。
 
 ## 开发

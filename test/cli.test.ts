@@ -246,6 +246,7 @@ describe("审查发现问题的回归测试", () => {
         "dcdn.aliyuncs.com": "DcdnServiceNotFound",
         "live.aliyuncs.com": "LiveServiceNotFound",
         "vod.cn-shanghai.aliyuncs.com": "VodServiceNotFound",
+        "esa.cn-hangzhou.aliyuncs.com": "EsaService.NotOpen",
       };
       const code = inactive[req.url.host];
       if (code) return { status: 403, body: { Code: code, Message: "not activated" } };
@@ -261,6 +262,7 @@ describe("审查发现问题的回归测试", () => {
     expect(err.issues.map((i: any) => `${i.service}:${i.kind}`).sort()).toEqual([
       "cdn:inactive",
       "dcdn:inactive",
+      "esa:inactive",
       "live:inactive",
       "oss:error",
       "vod:inactive",

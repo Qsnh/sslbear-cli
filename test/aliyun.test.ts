@@ -203,6 +203,285 @@ describe("aliyun domains", () => {
   });
 });
 
+const ESA_HOST = "esa.cn-hangzhou.aliyuncs.com";
+
+/** ESA：example.com 有五张证书（含一张已过期、一张 ECC），example.net 只有已过期和申请中的证书且不支持 SaaS 域名 */
+function esaRoutes(req: FakeRequest) {
+  if (req.url.host !== ESA_HOST) return undefined;
+  const site = req.url.searchParams.get("SiteId");
+  if (req.action === "ListSites") {
+    return {
+      body: {
+        TotalCount: 2,
+        Sites: [
+          { SiteId: 1001, SiteName: "example.com", Status: "active" },
+          { SiteId: 1002, SiteName: "example.net", Status: "pending" },
+        ],
+      },
+    };
+  }
+  if (req.action === "ListRecords") {
+    const records: Record<string, unknown[]> = {
+      "1001": [
+        { RecordName: "www.example.com", RecordType: "CNAME", Proxied: true },
+        { RecordName: "API.example.com", RecordType: "A/AAAA", Proxied: true },
+        { RecordName: "deep.a.example.com", RecordType: "CNAME", Proxied: true },
+        { RecordName: "*.example.com", RecordType: "CNAME", Proxied: true },
+        { RecordName: "admin.example.com", RecordType: "CNAME", Proxied: true },
+        { RecordName: "dns-only.example.com", RecordType: "A/AAAA", Proxied: false },
+      ],
+      "1002": [
+        { RecordName: "shop.example.net", RecordType: "CNAME", Proxied: true },
+        { RecordName: "new.example.net", RecordType: "CNAME", Proxied: true },
+      ],
+    };
+    return { body: { TotalCount: records[site!]!.length, Records: records[site!] } };
+  }
+  if (req.action === "ListCertificates") {
+    const certs: Record<string, unknown[]> = {
+      "1001": [
+        { Id: "c-expired", Name: "www-old", Type: "free", Status: "Expired", CommonName: "www.example.com", PubAlg: "RSA", NotBefore: "2026-06-01 00:00:00", NotAfter: "2026-09-01 00:00:00", CreateTime: "2026-06-01 00:00:00" },
+        { Id: "c-wild", Name: "wild", Type: "upload", Status: "OK", CommonName: "*.example.com", SAN: "*.example.com,example.com", Issuer: "DigiCert", PubAlg: "RSA", NotBefore: "2026-09-01 12:00:00", NotAfter: "2026-11-30 12:00:00", CreateTime: "2026-09-01 12:30:00" },
+        { Id: "c-www-early", Name: "www-early", Type: "upload", Status: "OK", CommonName: "www.example.com", PubAlg: "RSA", NotBefore: "2026-08-01 00:00:00", NotAfter: "2027-08-01 00:00:00", CreateTime: "2026-08-01 00:10:00" },
+        { Id: "c-www", Name: "www-new", Type: "cas", Status: "OK", CommonName: "www.example.com", SAN: "www.example.com", PubAlg: "RSA", NotBefore: "2026-10-01 00:00:00", NotAfter: "2027-03-01 00:00:00", CreateTime: "2026-07-01 00:00:00", UpdateTime: "2026-10-01 00:10:00" },
+        { Id: "c-api-ecc", Name: "api-ecc", Type: "upload", Status: "OK", CommonName: "api.example.com", PubAlg: "ECDSA", NotBefore: "2026-10-01 00:00:00", NotAfter: "2027-05-01 00:00:00", CreateTime: "2026-10-02 00:00:00" },
+      ],
+      "1002": [
+        { Id: "n-older", Type: "upload", Status: "Expired", CommonName: "shop.example.net", NotAfter: "2026-05-01 00:00:00", CreateTime: "2026-09-01 00:00:00" },
+        { Id: "n-old", Type: "upload", Status: "Expired", CommonName: "shop.example.net", NotAfter: "2026-08-01 00:00:00", CreateTime: "2025-08-01 00:00:00" },
+        { Id: "n-new", Type: "free", Status: "Applying", CommonName: "new.example.net" },
+      ],
+    };
+    return { body: { TotalCount: certs[site!]!.length, Result: certs[site!] } };
+  }
+  if (req.action === "ListHttpsBasicConfigurations") {
+    // example.net 没有任何 SSL/TLS 配置，按默认开启；example.com 的规则乱序返回，按序号生效
+    if (site === "1002") return { body: { TotalCount: 0, Configs: [] } };
+    return {
+      body: {
+        TotalCount: 4,
+        Configs: [
+          { ConfigType: "global", Https: "on" },
+          { ConfigType: "rule", RuleName: "example-on", Sequence: 10, RuleEnable: "on", Rule: '(ends_with(http.host, ".example.com"))', Https: "on" },
+          { ConfigType: "rule", RuleName: "admin-off", Sequence: 5, RuleEnable: "on", Rule: '(http.host eq "admin.example.com")', Https: "off" },
+          { ConfigType: "rule", RuleName: "disabled", Sequence: 1, RuleEnable: "off", Rule: "true", Https: "off" },
+        ],
+      },
+    };
+  }
+  if (req.action === "ListCustomHostnames") {
+    if (site === "1002") return rpcError(400, "ErrSiteIdNoteEnterprise", "This feature is unavailable because your website is not associated with an Enterprise plan.");
+    return {
+      body: {
+        TotalCount: 2,
+        Hostnames: [
+          { Hostname: "shop.customer.com", Status: "active", SslFlag: "on", CertType: "free", CertStatus: "OK", CertNotAfter: "2026-12-01T00:00:00Z", RecordName: "origin.example.com" },
+          { Hostname: "plain.customer.com", Status: "pending", SslFlag: "off", CertType: "free" },
+        ],
+      },
+    };
+  }
+  return undefined;
+}
+
+describe("aliyun esa", () => {
+  it("站点下加速记录按 CN / SAN 匹配站点证书，SaaS 域名取自带的证书信息", async () => {
+    const fetch = fakeFetch(esaRoutes);
+    const r = await runCli(["domains", "-s", "esa", "--json"], { env: ALIYUN_ENV, fetch });
+    expect(r.code).toBe(0);
+    expect(r.json.data.issues).toEqual([]);
+    const byDomain = Object.fromEntries(r.json.data.items.map((d: any) => [d.domain, d]));
+    expect(Object.keys(byDomain).sort()).toEqual([
+      "*.example.com",
+      "API.example.com",
+      "admin.example.com",
+      "deep.a.example.com",
+      "new.example.net",
+      "plain.customer.com",
+      "shop.customer.com",
+      "shop.example.net",
+      "www.example.com",
+    ]);
+    // 多张有效证书都匹配时，配置（含原地更新）较晚的生效，即使另一张到期更晚；证书时间按 UTC 解析
+    expect(byDomain["www.example.com"]).toEqual({
+      provider: "aliyun",
+      service: "esa",
+      domain: "www.example.com",
+      status: "active",
+      https: true,
+      cert: {
+        id: "c-www",
+        name: "www-new",
+        commonName: "www.example.com",
+        sans: ["www.example.com"],
+        notBefore: "2026-10-01T00:00:00.000Z",
+        notAfter: "2027-03-01T00:00:00.000Z",
+        status: "OK",
+      },
+      extra: { siteId: "1001", site: "example.com", certType: "cas", httpsSwitch: "on", httpsRule: "example-on" },
+      daysLeft: 137,
+    });
+    // 域名大小写不敏感，泛域名证书覆盖一级子域；RSA 与 ECC 证书同时有效时报告先到期的那张
+    expect(byDomain["API.example.com"]).toMatchObject({
+      https: true,
+      cert: { id: "c-wild", issuer: "DigiCert", sans: ["*.example.com", "example.com"], notAfter: "2026-11-30T12:00:00.000Z" },
+      extra: { certType: "upload" },
+      daysLeft: 46,
+    });
+    expect(byDomain["*.example.com"]).toMatchObject({ https: true, cert: { id: "c-wild" } });
+    // 泛域名证书不覆盖多级子域
+    expect(byDomain["deep.a.example.com"]).toEqual({
+      provider: "aliyun",
+      service: "esa",
+      domain: "deep.a.example.com",
+      status: "active",
+      https: false,
+      extra: { siteId: "1001", site: "example.com", httpsSwitch: "on", httpsRule: "example-on" },
+    });
+    // SSL/TLS 规则关闭了 HTTPS：即使有匹配的有效证书也记为未开启，且不展示证书
+    expect(byDomain["admin.example.com"]).toEqual({
+      provider: "aliyun",
+      service: "esa",
+      domain: "admin.example.com",
+      status: "active",
+      https: false,
+      extra: { siteId: "1001", site: "example.com", httpsSwitch: "off", httpsRule: "admin-off" },
+    });
+    // 没有有效证书时取最近过期的那张；只有申请中的证书时记为未开启 HTTPS，但保留证书状态
+    expect(byDomain["shop.example.net"]).toMatchObject({ status: "pending", https: true, cert: { id: "n-old", status: "Expired" }, daysLeft: -75 });
+    expect(byDomain["new.example.net"]).toMatchObject({ https: false, cert: { id: "n-new", status: "Applying" }, extra: { httpsSwitch: "on" } });
+    expect(byDomain["new.example.net"].extra.httpsRule).toBeUndefined();
+    expect(byDomain["new.example.net"].daysLeft).toBeUndefined();
+    expect(byDomain["shop.customer.com"]).toEqual({
+      provider: "aliyun",
+      service: "esa",
+      domain: "shop.customer.com",
+      status: "active",
+      https: true,
+      cert: { notAfter: "2026-12-01T00:00:00.000Z", status: "OK" },
+      extra: { siteId: "1001", site: "example.com", hostType: "saas", certType: "free" },
+      daysLeft: 47,
+    });
+    expect(byDomain["plain.customer.com"]).toMatchObject({ https: false, extra: { hostType: "saas" } });
+    expect(byDomain["plain.customer.com"].cert).toBeUndefined();
+
+    const records = fetch.calls.filter((c) => c.action === "ListRecords");
+    expect(records.every((c) => c.url.searchParams.get("Proxied") === "true")).toBe(true);
+    expect(fetch.calls[0]!.url.searchParams.get("Version")).toBe("2024-09-10");
+  });
+
+  it("站点证书翻页取完后再匹配", async () => {
+    const certs = Array.from({ length: 25 }, (_, i) => ({ Id: `c${i}`, Status: "OK", CommonName: `h${i}.example.com`, NotAfter: "2027-01-01 00:00:00" }));
+    const fetch = fakeFetch((req) => {
+      if (req.action === "ListSites") return { body: { TotalCount: 1, Sites: [{ SiteId: 1001, SiteName: "example.com", Status: "active" }] } };
+      if (req.action === "ListRecords") return { body: { TotalCount: 1, Records: [{ RecordName: "h22.example.com", Proxied: true }] } };
+      if (req.action === "ListCertificates") {
+        const page = Number(req.url.searchParams.get("PageNumber"));
+        const size = Number(req.url.searchParams.get("PageSize"));
+        return { body: { TotalCount: certs.length, Result: certs.slice((page - 1) * size, page * size) } };
+      }
+      if (req.action === "ListCustomHostnames") return { body: { TotalCount: 0, Hostnames: [] } };
+      if (req.action === "ListHttpsBasicConfigurations") return { body: { TotalCount: 0, Configs: [] } };
+      return undefined;
+    });
+    const r = await runCli(["domains", "-s", "esa", "--json"], { env: ALIYUN_ENV, fetch });
+    expect(fetch.calls.filter((c) => c.action === "ListCertificates")).toHaveLength(2);
+    expect(r.json.data.items).toEqual([expect.objectContaining({ domain: "h22.example.com", https: true, cert: expect.objectContaining({ id: "c22" }) })]);
+  });
+
+  it("SSL/TLS 规则条件无法判断时，命中与否结果不同才记为 partial", async () => {
+    const fetch = fakeFetch((req) => {
+      if (req.action === "ListSites") return { body: { TotalCount: 1, Sites: [{ SiteId: 1001, SiteName: "example.com", Status: "active" }] } };
+      if (req.action === "ListRecords") {
+        const records = ["a.example.com", "ab.example.com", "b.example.com", "c.example.com"].map((RecordName) => ({ RecordName, Proxied: true }));
+        return { body: { TotalCount: records.length, Records: records } };
+      }
+      if (req.action === "ListCertificates") {
+        return { body: { TotalCount: 1, Result: [{ Id: "w", Status: "OK", CommonName: "*.example.com", NotAfter: "2027-01-01 00:00:00" }] } };
+      }
+      if (req.action === "ListHttpsBasicConfigurations") {
+        return {
+          body: {
+            TotalCount: 4,
+            Configs: [
+              { ConfigType: "global", Https: "off" },
+              // 列表引用无法判断；对 b、c 来说 starts_with 已为 false，整条规则确定不命中
+              { ConfigType: "rule", RuleName: "vip", Sequence: 1, Rule: '(http.host in $vip and starts_with(http.host, "a"))', Https: "on" },
+              { ConfigType: "rule", RuleName: "b-on", Sequence: 2, Rule: '(http.host eq "b.example.com")' },
+              { ConfigType: "rule", RuleName: "ab-on", Sequence: 3, Rule: '(starts_with(http.host, "ab"))', Https: "on" },
+            ],
+          },
+        };
+      }
+      if (req.action === "ListCustomHostnames") return { body: { TotalCount: 0, Hostnames: [] } };
+      return undefined;
+    });
+    const r = await runCli(["domains", "-s", "esa", "--json"], { env: ALIYUN_ENV, fetch });
+    const byDomain = Object.fromEntries(r.json.data.items.map((d: any) => [d.domain, d]));
+    expect(byDomain["a.example.com"]).toMatchObject({ https: true, cert: { id: "w" }, extra: { httpsSwitch: "partial", httpsRule: "vip" } });
+    // vip 是否命中无法判断，但不命中时后面的 ab-on 也会开启，结果确定
+    expect(byDomain["ab.example.com"]).toMatchObject({ https: true, extra: { httpsSwitch: "on" } });
+    expect(byDomain["ab.example.com"].extra.httpsRule).toBeUndefined();
+    // 规则未写 Https 时按默认开启
+    expect(byDomain["b.example.com"]).toMatchObject({ https: true, extra: { httpsSwitch: "on", httpsRule: "b-on" } });
+    expect(byDomain["c.example.com"]).toEqual({
+      provider: "aliyun",
+      service: "esa",
+      domain: "c.example.com",
+      status: "active",
+      https: false,
+      extra: { siteId: "1001", site: "example.com", httpsSwitch: "off" },
+    });
+  });
+
+  it("查不到 SSL/TLS 配置时只记 issue，记录仍按证书输出", async () => {
+    const fetch = fakeFetch((req) => {
+      if (req.action === "ListHttpsBasicConfigurations" && req.url.searchParams.get("SiteId") === "1001") {
+        return rpcError(403, "NoPermission", "You are not authorized to operate on the specified resource.");
+      }
+      return esaRoutes(req);
+    });
+    const r = await runCli(["domains", "-s", "esa", "--json"], { env: ALIYUN_ENV, fetch });
+    const byDomain = Object.fromEntries(r.json.data.items.map((d: any) => [d.domain, d]));
+    expect(byDomain["admin.example.com"]).toMatchObject({ https: true, cert: { id: "c-wild" } });
+    expect(byDomain["admin.example.com"].extra.httpsSwitch).toBeUndefined();
+    expect(byDomain["shop.example.net"].extra.httpsSwitch).toBe("on");
+    expect(r.json.data.issues).toEqual([
+      expect.objectContaining({ service: "esa", kind: "error", code: "NoPermission", target: "site example.com SSL/TLS 配置" }),
+    ]);
+  });
+
+  it("单个站点查询失败只记 issue，其余站点照常返回", async () => {
+    const fetch = fakeFetch((req) => {
+      const site = req.url.searchParams.get("SiteId");
+      if (req.action === "ListRecords" && site === "1002") return rpcError(500, "InternalError", "boom");
+      if (req.action === "ListCustomHostnames" && site === "1001") return rpcError(400, "InternalException", "saas boom");
+      return esaRoutes(req);
+    });
+    const r = await runCli(["domains", "-s", "esa", "--json"], { env: ALIYUN_ENV, fetch });
+    expect(r.code).toBe(0);
+    expect(r.json.data.items.map((d: any) => d.domain).sort()).toEqual([
+      "*.example.com",
+      "API.example.com",
+      "admin.example.com",
+      "deep.a.example.com",
+      "www.example.com",
+    ]);
+    expect(r.json.data.issues).toEqual([
+      expect.objectContaining({ service: "esa", kind: "error", code: "InternalException", target: "site example.com SaaS 域名" }),
+      expect.objectContaining({ service: "esa", kind: "error", code: "InternalError", target: "site example.net" }),
+    ]);
+  });
+
+  it("ESA 未开通记为 inactive", async () => {
+    const fetch = fakeFetch((req) => (req.url.host === ESA_HOST ? rpcError(403, "EsaService.NotOpen", "ESA service has not opend.") : undefined));
+    const r = await runCli(["domains", "-s", "esa", "--json"], { env: ALIYUN_ENV, fetch });
+    expect(r.code).toBe(0);
+    expect(r.json.data.items).toEqual([]);
+    expect(r.json.data.issues).toEqual([expect.objectContaining({ service: "esa", kind: "inactive", code: "EsaService.NotOpen" })]);
+  });
+});
+
 const LIST_BUCKETS = `<?xml version="1.0" encoding="UTF-8"?>
 <ListAllMyBucketsResult>
   <Owner><ID>1</ID><DisplayName>1</DisplayName></Owner>
