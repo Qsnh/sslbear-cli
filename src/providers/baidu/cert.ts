@@ -66,9 +66,13 @@ export function listBaiduCertificates(ctx: QueryContext, creds: AccessKeyCredent
 /** CDN 的 BOS 默认域名等场景用平台通用证书，证书管理里查不到，无需补全 */
 const COMMON_CERT_ID = "cert-common";
 
+const needsExpiry = (r: DomainRecord) => !!r.cert?.id && r.cert.id !== COMMON_CERT_ID && !r.cert.notAfter;
+/** CDN 的 HTTPS 域名列表不给通用名与 SAN */
+const needsNames = (r: DomainRecord) => !!r.cert?.id && r.cert.id !== COMMON_CERT_ID && !r.cert.commonName;
+
 /**
- * 域名接口缺到期时间时，用证书管理的列表按证书 ID 补全。
- * 补全失败（如没有证书管理只读权限）只记一条 issue，域名本身照常返回。
+ * 域名接口缺到期时间或通用名 / SAN 时，用证书管理的列表按证书 ID 补全；域名接口给出的有效期不覆盖。
+ * 补全失败（如没有证书管理只读权限）时，有域名缺到期时间才记一条 issue，域名本身照常返回。
  */
 export async function enrichFromCertService(
   ctx: QueryContext,
@@ -76,26 +80,27 @@ export async function enrichFromCertService(
   warn: Warn,
   records: DomainRecord[],
 ): Promise<DomainRecord[]> {
-  const pending = records.filter((r) => r.cert?.id && r.cert.id !== COMMON_CERT_ID && !r.cert.notAfter);
+  const pending = records.filter((r) => needsExpiry(r) || needsNames(r));
   if (pending.length === 0) return records;
   let certs: CertificateRecord[];
   try {
     certs = await listBaiduCertificates(ctx, creds);
   } catch (e) {
-    warn(e, "证书管理列表（用于补全到期时间）");
+    if (pending.some(needsExpiry)) warn(e, "证书管理列表（用于补全到期时间）");
     return records;
   }
   const byId = new Map(certs.map((c) => [c.id, c]));
   for (const r of pending) {
     const c = byId.get(r.cert!.id!);
     if (!c) continue;
+    const cert = r.cert!;
     r.cert = compact({
-      ...r.cert,
-      name: r.cert!.name ?? c.name,
-      commonName: r.cert!.commonName ?? c.commonName,
-      sans: c.sans,
-      notBefore: c.notBefore,
-      notAfter: c.notAfter,
+      ...cert,
+      name: cert.name ?? c.name,
+      commonName: cert.commonName ?? c.commonName,
+      sans: cert.sans ?? c.sans,
+      notBefore: cert.notBefore ?? c.notBefore,
+      notAfter: cert.notAfter ?? c.notAfter,
     });
   }
   return records;

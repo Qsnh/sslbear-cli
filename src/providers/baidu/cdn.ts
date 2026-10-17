@@ -21,7 +21,7 @@ interface HttpsDomain {
   domain: string;
   certId?: string;
   certName?: string;
-  /** 平台通用证书时为 "-" */
+  /** 字段名像通用名，实测装的是证书名（与 certName 相同），不使用；通用名与 SAN 从证书管理补全 */
   certCommonName?: string;
   /** CDN API 的时间统一为 UTC ISO 8601（如 2019-07-17T08:00:00Z），通用证书时为 "-" */
   certStartTime?: string;
@@ -48,7 +48,6 @@ function toCert(row: HttpsDomain): CertInfo {
   return compact({
     id: row.certId,
     name: row.certName,
-    commonName: placeholder(row.certCommonName),
     notBefore: toIso(placeholder(row.certStartTime)),
     notAfter: toIso(placeholder(row.certStopTime)),
     status: row.status === undefined ? undefined : String(row.status),

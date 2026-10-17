@@ -116,10 +116,11 @@ describe("baidu certs", () => {
 /** 第 1 页塞满 100 条不在域名列表里的记录，验证按 count 翻页 */
 const FILLER = Array.from({ length: 100 }, (_, i) => ({ domain: `old${i}.example.net`, certId: "cert-x", certType: 1, status: 1 }));
 
+// 实测 HTTPS 域名列表的 certCommonName 装的是证书名，CLI 不用它
 const HTTPS_ROWS = [
   // 同一域名 RSA + 国密两张服务端证书，取先到期的
-  { domain: "www.example.com", certId: "cert-rsa", certName: "rsa", certCommonName: "www.example.com", certStartTime: "2026-01-01T00:00:00Z", certStopTime: "2027-01-01T00:00:00Z", certType: 1, status: 1 },
-  { domain: "www.example.com", certId: "cert-sm2", certName: "sm2", certCommonName: "www.example.com", certStartTime: "2026-01-01T00:00:00Z", certStopTime: "2026-12-01T00:00:00Z", certType: 1, status: 1 },
+  { domain: "www.example.com", certId: "cert-rsa", certName: "rsa", certCommonName: "rsa", certStartTime: "2026-01-01T00:00:00Z", certStopTime: "2027-01-01T00:00:00Z", certType: 1, status: 1 },
+  { domain: "www.example.com", certId: "cert-sm2", certName: "sm2", certCommonName: "sm2", certStartTime: "2026-01-01T00:00:00Z", certStopTime: "2026-12-01T00:00:00Z", certType: 1, status: 1 },
   // 双向认证的客户端证书不算
   { domain: "www.example.com", certId: "cert-clientca01", certName: "client-ca", certStartTime: "2026-01-01T00:00:00Z", certStopTime: "2026-10-20T00:00:00Z", certType: 2, status: 1 },
   // 时间为占位符，从证书管理按 ID 补全
@@ -168,7 +169,6 @@ describe("baidu domains", () => {
       cert: {
         id: "cert-sm2",
         name: "sm2",
-        commonName: "www.example.com",
         notBefore: "2026-01-01T00:00:00.000Z",
         notAfter: "2026-12-01T00:00:00.000Z",
         status: "1",
@@ -381,5 +381,47 @@ describe("baidu CDN：HTTPS 列表接口失败的处理", () => {
     const r = await runCli(["domains", "-p", "baidu", "--json"], { env: BAIDU_ENV, fetch });
     expect(r.code).toBe(0);
     expect(r.json.data.issues).toEqual([expect.objectContaining({ provider: "baidu", service: "cdn", kind: "inactive", code: "CDNNotActivated" })]);
+  });
+});
+
+describe("baidu CDN 证书通用名", () => {
+  it("HTTPS 域名列表的 certCommonName 实为证书名：通用名与 SAN 从证书管理补全，有效期以 CDN 为准", async () => {
+    const fetch = fakeFetch((req) => {
+      if (req.url.pathname === "/v2/user/domains") return { body: { domains: [{ domain: "img.example.com", status: "RUNNING" }] } };
+      if (req.url.pathname === "/v2/httpsDomains") {
+        return {
+          body: {
+            count: 1,
+            rows: [{ domain: "img.example.com", certId: "cert-wild000001", certName: "wild", certCommonName: "wild", certStartTime: "2026-08-01T00:00:00Z", certStopTime: "2026-10-30T23:59:59Z", certType: 1, status: 1 }],
+          },
+        };
+      }
+      return certRoute(req);
+    });
+    const r = await runCli(["domains", "-p", "baidu", "--json"], { env: BAIDU_ENV, fetch });
+    expect(r.json.data.items[0].cert).toEqual({
+      id: "cert-wild000001",
+      name: "wild",
+      commonName: "*.example.com",
+      sans: ["*.example.com", "example.com"],
+      notBefore: "2026-08-01T00:00:00.000Z",
+      notAfter: "2026-10-30T23:59:59.000Z",
+      status: "1",
+    });
+    expect(r.json.data.issues).toEqual([]);
+  });
+
+  it("只缺通用名时证书管理拉取失败不记 issue", async () => {
+    const fetch = fakeFetch((req) => {
+      if (req.url.pathname === "/v2/user/domains") return { body: { domains: [{ domain: "img.example.com", status: "RUNNING" }] } };
+      if (req.url.pathname === "/v2/httpsDomains") {
+        return { body: { count: 1, rows: [{ domain: "img.example.com", certId: "cert-x", certName: "x", certStopTime: "2026-10-30T23:59:59Z", certType: 1, status: 1 }] } };
+      }
+      if (req.url.host === "certificate.baidubce.com") return bceError(403, "AccessDenied", "denied");
+      return undefined;
+    });
+    const r = await runCli(["domains", "-p", "baidu", "--json"], { env: BAIDU_ENV, fetch });
+    expect(r.json.data.items[0]).toMatchObject({ https: true, cert: { id: "cert-x", name: "x", notAfter: "2026-10-30T23:59:59.000Z" } });
+    expect(r.json.data.issues).toEqual([]);
   });
 });
