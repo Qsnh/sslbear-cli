@@ -22,6 +22,8 @@ export interface CertInfo {
   notAfter?: string;
   /** 云厂商返回的原始状态值 */
   status?: string;
+  /** 证书密钥算法，双证书服务用来区分同一域名上的两张证书 */
+  algorithm?: "RSA" | "ECC" | "SM2";
 }
 
 /** 某个云服务上配置的一个域名，以及它当前绑定的证书 */
@@ -33,6 +35,8 @@ export interface DomainRecord {
   status?: string;
   https: boolean;
   cert?: CertInfo;
+  /** 域名同时绑了多张证书（RSA + ECC 双证书、国际 + 国密）时列出全部；cert 为其中最早到期的一张 */
+  certs?: CertInfo[];
   /** 证书剩余天数，负数表示已过期；无证书或无到期时间时缺省 */
   daysLeft?: number;
   /** bucket / zone / region 等定位信息 */

@@ -1,0 +1,82 @@
+import { daysUntil } from "../lib/time.js";
+import type { CertInfo, DomainRecord } from "../types.js";
+import type { LocalCert } from "./cert.js";
+
+/** 用户定的更新窗口：当前证书 30 天内到期才直接替换，超过需用户二次确认（--force） */
+export const RENEW_WITHIN_DAYS = 30;
+
+/** 两张证书到期时间相差在此范围内视为同一张：有的服务只精确到天，华为证书列表的时间还差 8 小时 */
+export const SAME_CERT_TOLERANCE_MS = 48 * 3_600_000;
+
+export type SkipReason =
+  | "platform_managed"
+  | "unsupported"
+  | "https_off"
+  | "already_current"
+  | "unknown_expiry"
+  | "newer_current"
+  | "not_due"
+  | "shared_cert_blocked";
+
+/** 这几类跳过需要用户二次确认后加 --force 才执行 */
+export const NEEDS_CONFIRM: ReadonlySet<SkipReason> = new Set<SkipReason>(["unknown_expiry", "newer_current", "not_due"]);
+
+export const CONFIRM_HINT = "确需提前更换请向用户确认后加 --force 重新执行（可配合 -d 只针对这些域名）";
+
+export interface Decision {
+  kind: "deploy" | "update" | "skip";
+  reason?: SkipReason;
+  message?: string;
+  needsConfirm?: boolean;
+  /** 将被替换的旧证书 */
+  oldCert?: CertInfo;
+  oldDaysLeft?: number;
+}
+
+export interface DecideOptions {
+  /** 被 --domain 点名 */
+  named: boolean;
+  force: boolean;
+  now: Date;
+  /** 服务或记录不支持部署的原因 */
+  unsupported?: string;
+}
+
+/** 新证书要替换的那张：双证书时取同算法的，没有同算法的取另一张国际证书；国密证书不参与 */
+export function pickOldCert(record: DomainRecord, algorithm: LocalCert["algorithm"]): CertInfo | undefined {
+  const all = record.certs?.length ? record.certs : record.cert ? [record.cert] : [];
+  const intl = all.filter((c) => c.algorithm !== "SM2");
+  return intl.find((c) => c.algorithm === algorithm) ?? intl[0];
+}
+
+const day = (iso: string) => iso.slice(0, 10);
+
+/** 设计文档的决策表，按顺序第一条命中即定 */
+export function decide(record: DomainRecord, cert: LocalCert, o: DecideOptions): Decision {
+  const skip = (reason: SkipReason, message: string): Decision => ({ kind: "skip", reason, message });
+  if (record.extra?.managed === "platform") return skip("platform_managed", "平台默认域名，由云厂商提供证书");
+  if (o.unsupported) return skip("unsupported", o.unsupported);
+  if (!record.https) {
+    return o.named ? { kind: "deploy" } : skip("https_off", "未开启 HTTPS；如需部署请用 --domain 点名该域名");
+  }
+
+  const oldCert = pickOldCert(record, cert.algorithm);
+  const oldDaysLeft = daysUntil(oldCert?.notAfter, o.now);
+  const base = { ...(oldCert && { oldCert }), ...(oldDaysLeft !== undefined && { oldDaysLeft }) };
+  const oldMs = Date.parse(oldCert?.notAfter ?? "");
+  const newMs = Date.parse(cert.notAfter);
+  if (Number.isFinite(oldMs) && Math.abs(oldMs - newMs) <= SAME_CERT_TOLERANCE_MS) {
+    return { ...skip("already_current", "已是该证书（到期时间相同）"), ...base };
+  }
+
+  let confirm: [SkipReason, string] | undefined;
+  if (!Number.isFinite(oldMs)) confirm = ["unknown_expiry", "查不到当前证书的到期时间"];
+  else if (oldMs - newMs > SAME_CERT_TOLERANCE_MS) {
+    confirm = ["newer_current", `当前证书 ${day(oldCert!.notAfter!)} 到期，比新证书（${day(cert.notAfter)}）还晚`];
+  } else if (oldDaysLeft! > RENEW_WITHIN_DAYS) confirm = ["not_due", `当前证书还剩 ${oldDaysLeft} 天，未到更新时间`];
+
+  if (confirm && !o.force) {
+    return { kind: "skip", reason: confirm[0], message: `${confirm[1]}；${CONFIRM_HINT}`, needsConfirm: true, ...base };
+  }
+  return { kind: "update", ...base };
+}
