@@ -7,7 +7,7 @@ import { toIso } from "../../lib/time.js";
 import { xmlBlocks, xmlText } from "../../lib/xml.js";
 import type { CertInfo, DomainRecord } from "../../types.js";
 import type { DeployInput, DeployOutcome, DeployTarget, DomainService, Warn } from "../registry.js";
-import { certName, earliest, orderCerts } from "./common.js";
+import { certName, earliest, orderCerts, PEM_FALLBACK_NOTE, scmCertIdOrPem } from "./common.js";
 import { enrichFromScm } from "./scm.js";
 import { obsAuthorization, obsStringToSign } from "./sign.js";
 
@@ -123,23 +123,29 @@ const xmlEscape = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").
 
 /**
  * 设置桶的自定义域名（SetBucketCustomdomain）：证书按 CertificateType 分别设置，只设 server（国际服务端证书），
- * 国密（server_sm）与客户端 CA 证书（client）不动。带上 CCM 证书 ID（OBS 要求托管证书的 ID 必须是 CCM 上的）与 PEM。
+ * 国密（server_sm）与客户端 CA 证书（client）不动。带上 CCM 证书 ID（OBS 要求托管证书的 ID 必须是 CCM 上的）与 PEM；
+ * CCM 拒收没有 CN 的证书时不带证书 ID，只传 PEM（自管证书，OBS 自动生成 ID）。
  * 自定义域名没有单独的 HTTPS 开关，绑定服务端证书即支持 HTTPS，deploy 与 update 的请求相同。
  */
 async function applyObs(ctx: QueryContext, creds: AccessKeyCredentials, target: DeployTarget, input: DeployInput): Promise<DeployOutcome> {
   let certId: string | undefined;
+  let uploaded = false;
   for (const record of target.records) {
     const { bucket, region } = record.extra ?? {};
     if (!bucket || !region) throw new CloudApiError("huawei", "MissingBucket", `自定义域名 ${record.domain} 缺少所属 bucket / region`);
-    certId ??= await input.certId();
+    if (!uploaded) {
+      certId = await scmCertIdOrPem(input);
+      uploaded = true;
+    }
     const body =
-      `<CustomDomainConfiguration><Name>${xmlEscape(certName(input.cert))}</Name><CertificateId>${xmlEscape(certId)}</CertificateId>` +
+      `<CustomDomainConfiguration><Name>${xmlEscape(certName(input.cert))}</Name>` +
+      (certId ? `<CertificateId>${xmlEscape(certId)}</CertificateId>` : "") +
       `<Certificate>${xmlEscape(input.cert.certPem)}</Certificate><PrivateKey>${xmlEscape(input.cert.keyPem)}</PrivateKey>` +
       `<CertificateType>server</CertificateType></CustomDomainConfiguration>`;
     const search = `?customdomain=${record.domain}`;
     await obsSend(ctx, creds, { host: `${bucket}.obs.${region}.myhuaweicloud.com`, method: "PUT", resource: `/${bucket}/${search}`, search, body });
   }
-  return compact({ certId });
+  return compact({ certId, note: uploaded && !certId ? PEM_FALLBACK_NOTE : undefined });
 }
 
 /** 对象存储 OBS 的自定义域名：先列桶，再逐个桶查自定义域名与绑定的证书（并发 5） */

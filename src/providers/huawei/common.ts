@@ -1,7 +1,9 @@
 import { X509Certificate } from "node:crypto";
 import type { LocalCert } from "../../deploy/cert.js";
 import { compact } from "../../lib/compact.js";
+import { CloudApiError } from "../../lib/http.js";
 import type { CertInfo, DomainRecord } from "../../types.js";
+import type { DeployInput } from "../registry.js";
 
 /** 一个域名挂多张证书（国际 + 国密等）时取最早到期的那张，没有到期时间的排最后 */
 export function earliest<T extends CertInfo>(certs: readonly T[]): T | undefined {
@@ -29,6 +31,22 @@ export function smCertLocked(record: DomainRecord): string | undefined {
   const source = record.extra?.smCertSource;
   return source && source !== "scm" ? SM_CERT_LOCKED : undefined;
 }
+
+/**
+ * 先上传到云证书管理服务（CCM）取证书 ID；CCM 拒收没有通用名（CN）、只有 SAN 的证书（如 Let's Encrypt 短期证书），
+ * 实测报 HTTP 400 SCM.0009「No domain name is bonded with the certificate」，此时返回 undefined，由调用方改为直接传 PEM。
+ * 其它上传失败照常抛出。
+ */
+export async function scmCertIdOrPem(input: DeployInput): Promise<string | undefined> {
+  try {
+    return await input.certId();
+  } catch (e) {
+    if (e instanceof CloudApiError && e.code === "SCM.0009") return undefined;
+    throw e;
+  }
+}
+
+export const PEM_FALLBACK_NOTE = "云证书管理服务（CCM）不接受没有通用名（CN）的证书（SCM.0009），已改为直接上传证书内容绑定，该证书在 certs 里看不到";
 
 /** deploy 模式（查询时 HTTPS 未开启）写入前读到的配置显示 HTTPS 其实已开启：不写入，交给重新执行按更新规则判断 */
 export const HTTPS_ALREADY_ENABLED = "该域名的 HTTPS 已开启（与查询时不同），未做修改；请重新执行，按更新规则判断";
