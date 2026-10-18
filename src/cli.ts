@@ -190,17 +190,32 @@ function deployData(r: DeployReport) {
   return { dryRun: r.dryRun, cert: r.cert, uploads: r.uploads, results: r.results, issues: r.issues };
 }
 
-/** 有任一域名失败即 exit 1：JSON 模式把完整报告平铺在 stderr 的错误对象里，调用方仍能逐个域名判断 */
+/**
+ * 有任一域名失败、或所有查询都失败即 exit 1：JSON 模式把完整报告平铺在 stderr 的错误对象里，调用方仍能逐个域名判断
+ * （所有查询都失败时点名的域名也有逐条的失败结果）
+ */
 function emitDeploy(opts: OutputOptions, report: DeployReport): void {
   const failed = report.results.filter((r) => r.action === "failed");
-  if (failed.length > 0) {
-    if (!opts.json) console.log(renderDeploy(report));
+  const errors = report.issues.filter((i) => i.kind === "error");
+  const noneSucceeded = report.succeeded === 0 && errors.length > 0;
+  if (failed.length > 0 || noneSucceeded) {
+    // 查询全部失败且没有逐条结果时不打印表格：「在所选云厂商上没有找到」会误导
+    if (!opts.json && report.results.length > 0) console.log(renderDeploy(report));
     printIssues(opts, report.issues);
-    const head = `${failed.length} 个域名部署失败${report.dryRun ? "（--dry-run 预览，未做任何修改）" : ""}`;
-    const message = opts.json
-      ? `${head}：${failed.map((r) => `${r.provider ? `${r.provider}/${r.service} ` : ""}${r.domain} ${r.code}`).join("；")}`
-      : head;
-    fail(opts, "DeployFailed", message, 1, deployData(report));
+    const parts: string[] = [];
+    if (noneSucceeded) {
+      // 表格模式下每条问题已逐行打印，这里只给结论；JSON 模式在 message 里带上错误明细
+      parts.push(
+        opts.json
+          ? `没有任何查询成功：${errors.map((e) => `${e.provider}/${e.service}${e.target ? ` ${e.target}` : ""} ${e.code} ${e.message}`).join("；")}`
+          : `没有任何查询成功（${errors.length} 项失败），请检查凭证与权限`,
+      );
+    }
+    if (failed.length > 0) {
+      const head = `${failed.length} 个域名部署失败${report.dryRun ? "（--dry-run 预览，未做任何修改）" : ""}`;
+      parts.push(opts.json ? `${head}：${failed.map((r) => `${r.provider ? `${r.provider}/${r.service} ` : ""}${r.domain} ${r.code}`).join("；")}` : head);
+    }
+    fail(opts, "DeployFailed", parts.join("。"), 1, deployData(report));
   }
   if (opts.json) outJson(deployData(report));
   else console.log(renderDeploy(report));
@@ -220,19 +235,37 @@ const DEPLOY_DESCRIPTION = `把本地证书（fullchain + 私钥）部署到云�
 
 部署规则：
   - 只处理证书覆盖的域名：与证书 SAN 精确匹配，*.example.com 只覆盖一级子域（不含 example.com 本身）
-  - 已开启 HTTPS 的域名：当前证书 30 天内到期（含已过期）时直接替换；还有 30 天以上、查不到到期时间、
-    或比新证书还晚时跳过并标记 needsConfirm，须先向用户确认，用户同意后加 --force 重新执行（可配合 -d 只针对这些域名）
+  - 已开启 HTTPS 的域名：当前证书 30 天内到期（含已过期）时直接替换；还有 30 天以上、查不到到期时间、比新证书还晚、
+    或与新证书同时到期但签发时间不同（重签的证书）时跳过并标记 needsConfirm，须先向用户确认，
+    用户同意后加 --force 重新执行（可配合 -d 只针对这些域名）
   - 未开启 HTTPS 的域名默认不动；用 -d 点名后部署并开启 HTTPS
   - 已是这张证书的域名自动跳过，重复执行是安全的
+  - 证书挂在多条记录共享的配置上（如阿里云 ESA 站点）时，同组被证书覆盖的记录要么一起更新、要么都不动
+  - 查询失败、无法判断 HTTPS 现状的域名不做修改，记为失败（可稍后重试）
   - 人在终端里直接运行（非 --json）时，会列出需确认的域名并当场询问是否提前更换`;
 
 const DEPLOY_HELP_AFTER = `
 --json 结果：data.results 每项对应一个域名，action 为 deployed / updated / would_deploy / would_update / skipped / failed；
 skipped 的 reason 为跳过原因，needsConfirm: true 的须先问用户；failed 带 code、requestId，retryable 表示能否原样重试。
 
+跳过原因（reason）：
+  platform_managed     平台默认域名，由云厂商提供证书
+  unsupported          该服务 / 记录不支持通过 CLI 部署（message 写明原因）
+  https_off            未开启 HTTPS 且未用 -d 点名
+  already_current      已是这张证书
+  unknown_expiry       查不到当前证书的到期时间（需确认）
+  newer_current        当前证书比新证书到期还晚（需确认）
+  not_due              当前证书还有 30 天以上才到期（需确认）
+  same_expiry          当前证书与新证书到期时间相同但签发时间不同，可能是重签的证书（需确认）
+  shared_cert_blocked  证书挂在共享的配置上，同组有记录挡住了更新；message 列出挡住的记录与放行方法
+需确认的跳过带 needsConfirm: true：须先向用户确认，用户同意后加 --force 重新执行。
+
+failed 的常见 code：HttpsStateUnknown（查询该域名的 HTTPS 配置失败，无法判断现状，未做修改，可稍后重试）、
+DomainNotFound（-d 点名的域名在所选云厂商 / 服务上找不到）、NotCovered（-d 点名的域名不被证书覆盖），其余为云接口的错误码。
+
 退出码：
   0  没有失败（全部成功或跳过，包括什么都没改）
-  1  有域名部署失败（--json 时 stderr 输出 {"ok":false,"status":"DeployFailed",...}，带完整的 results），或所有查询都失败
+  1  有域名部署失败，或所有查询都失败（--json 时 stderr 输出 {"ok":false,"status":"DeployFailed",...}，带完整的 results、issues）
   2  参数、证书文件或凭证配置错误（未做任何修改）
 
 示例：
@@ -285,14 +318,16 @@ export function buildProgram(deps: Deps, output: OutputOptions = { json: false }
       .option("-p, --provider <list>", `只处理指定云厂商，逗号分隔（${PROVIDERS.join(", ")}）；默认为所有已配置凭证的云厂商`, csv)
       .option("-s, --service <list>", `只处理指定服务，逗号分隔（取值同 domains）。${serviceHelp}`, csv)
       .option("-d, --domain <list>", "只处理这些域名（精确匹配，逗号分隔，可重复）；点名的域名没开 HTTPS 时会部署并开启。与 domains 命令的 -d（关键字过滤）不同", csv)
-      .option("--force", "当前证书还有 30 天以上才到期（或到期时间查不到、比新证书还晚）时也替换；AI 调用前须先向用户确认")
+      .option("--force", "当前证书还有 30 天以上才到期（或到期时间查不到、比新证书还晚、与新证书同时到期但签发时间不同）时也替换；AI 调用前须先向用户确认")
       .option("--dry-run", "只输出计划，不做任何写操作（也不上传证书）"),
   )
     .addHelpText("after", DEPLOY_HELP_AFTER)
     .action(async (opts: DeployCliOpts) => {
       const out = { json: !!opts.json };
       const defs = deps.defs ?? PROVIDER_DEFS;
-      // -d 写了但解析为空（如 -d ","）时不能退化成处理全部域名
+      // -p / -s / -d 写了但解析为空（如 -d ","、-p ""）时不能退化成处理全部
+      if (opts.provider?.length === 0) throw new UsageError("--provider 不能为空");
+      if (opts.service?.length === 0) throw new UsageError("--service 不能为空");
       if (opts.domain?.length === 0) throw new UsageError("--domain 不能为空");
       const sel: DeployOptions = {
         providers: validateProviders(opts.provider),
@@ -303,8 +338,8 @@ export function buildProgram(deps: Deps, output: OutputOptions = { json: false }
       };
       const ctx = createContext(deps, opts);
       const cert = loadLocalCert(readInput(deps, "--cert", opts.cert), readInput(deps, "--key", opts.key), ctx.now);
+      // 所有查询都失败也照常出计划：点名的域名得到逐条的失败结果，由 emitDeploy 以 DeployFailed + 完整报告退出
       const query = await queryForDeploy(ctx, sel, defs);
-      failIfNoneSucceeded(out, query);
       let plan = buildPlan(ctx, cert, sel, query, defs);
       if (!out.json && !sel.dryRun && !sel.force && deps.confirm) {
         plan = await confirmEarly(deps.confirm, plan, () => buildPlan(ctx, cert, { ...sel, force: true }, query, defs));

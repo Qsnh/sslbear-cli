@@ -100,6 +100,31 @@ describe("deploy 参数与证书校验", () => {
     expect(list).not.toHaveBeenCalled();
   });
 
+  it("-p / -s 给了空值时 exit 2，不会退化成全部云厂商 / 服务", async () => {
+    const { defs, list } = fakeDefs([rec("a.example.com")], okDeployer());
+    for (const [args, flag] of [
+      [["-p", ""], "--provider"],
+      [["-p", ","], "--provider"],
+      [["-s", ""], "--service"],
+      [["-s", " , "], "--service"],
+    ] as const) {
+      const r = await deploy([...args, "--json"], { defs });
+      expect(r.code, args.join(" ")).toBe(2);
+      expect(JSON.parse(r.stderr)).toMatchObject({ status: "UsageError", message: expect.stringContaining(flag) });
+    }
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it("--help 列出全部跳过原因，需确认的条件包含重签证书", async () => {
+    const r = await runCli(["deploy", "--help"]);
+    expect(r.code).toBe(0);
+    for (const reason of ["platform_managed", "unsupported", "https_off", "already_current", "unknown_expiry", "newer_current", "not_due", "same_expiry", "shared_cert_blocked"]) {
+      expect(r.stdout).toContain(reason);
+    }
+    expect(r.stdout).toContain("HttpsStateUnknown");
+    expect(r.stdout).toContain("签发时间不同");
+  });
+
   it("证书与私钥按 cwd 解析成绝对路径后读取", async () => {
     const { defs } = fakeDefs([rec("a.example.com")], okDeployer());
     const readFile = vi.fn((path: string) => readFileSync(join(FIX, basename(path)), "utf8"));
@@ -195,16 +220,41 @@ describe("deploy 范围、执行与输出契约", () => {
     expect(err.results).toEqual([expect.objectContaining({ domain: "ghost.example.com", action: "failed", code: "DomainNotFound" })]);
   });
 
-  it("所有查询都失败：与 domains 一致 exit 1，stderr 带 issues", async () => {
-    const { defs, list } = fakeDefs([], okDeployer());
+  it("所有查询都失败：exit 1，stderr 为 DeployFailed + 完整报告，点名的域名逐条失败", async () => {
+    const { defs, list, upload } = fakeDefs([], okDeployer());
     list.mockRejectedValue(new CloudApiError("aliyun", "Forbidden.RAM", "User not authorized", "rid-9", 403));
-    const j = await deploy(["--json"], { defs });
-    expect(j.code).toBe(1);
-    expect(JSON.parse(j.stderr)).toMatchObject({ ok: false, status: "Forbidden.RAM", issues: [expect.objectContaining({ service: "cdn", code: "Forbidden.RAM" })] });
+    for (const dry of [[], ["--dry-run"]]) {
+      const j = await deploy(["--json", ...dry], { defs });
+      expect(j.code, dry.join(" ")).toBe(1);
+      expect(j.stdout).toBe("");
+      const err = JSON.parse(j.stderr);
+      expect(Object.keys(err)).toEqual(["ok", "status", "message", "dryRun", "cert", "uploads", "results", "issues"]);
+      expect(err).toMatchObject({
+        ok: false,
+        status: "DeployFailed",
+        dryRun: dry.length > 0,
+        uploads: [],
+        results: [],
+        issues: [expect.objectContaining({ service: "cdn", code: "Forbidden.RAM" })],
+      });
+      expect(err.message).toMatch(/^没有任何查询成功：aliyun\/cdn Forbidden\.RAM User not authorized/);
+    }
+
+    const named = await deploy(["-d", "a.example.com", "--json"], { defs });
+    expect(named.code).toBe(1);
+    const err = JSON.parse(named.stderr);
+    expect(err).toMatchObject({ status: "DeployFailed", dryRun: false });
+    expect(err.results).toEqual([expect.objectContaining({ domain: "a.example.com", action: "failed", code: "DomainNotFound", retryable: false })]);
+    expect(err.results[0].message).toContain("aliyun/cdn");
+    expect(err.message).toContain("没有任何查询成功");
+    expect(err.message).toContain("1 个域名部署失败");
+    expect(upload).not.toHaveBeenCalled();
+
     const t = await deploy([], { defs });
     expect(t.code).toBe(1);
     expect(t.stderr).toContain("警告：aliyun/cdn 查询失败：Forbidden.RAM User not authorized（RequestId: rid-9）");
-    expect(t.stderr).toContain("没有任何查询成功");
+    expect(t.stderr).toContain("错误：没有任何查询成功");
+    expect(t.stdout).not.toContain("没有找到");
   });
 });
 

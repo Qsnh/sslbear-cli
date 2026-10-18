@@ -33,9 +33,14 @@ export interface RawResponse {
 const RETRYABLE = /Throttl|RequestLimitExceeded|ServiceUnavailable|^Timeout$|^NetworkError$/;
 const MAX_ATTEMPTS = 3;
 
+/** 按错误码判断是否值得原样重试（限流、超时、网络错误）；只有错误码时用（如查询阶段记下的 issue） */
+export function isRetryableCode(code: string): boolean {
+  return RETRYABLE.test(code);
+}
+
 /** 限流（含 HTTP 429）、超时和网络错误值得原样重试 */
 export function isRetryable(e: unknown): boolean {
-  return e instanceof CloudApiError && (RETRYABLE.test(e.code) || e.httpStatus === 429);
+  return e instanceof CloudApiError && (isRetryableCode(e.code) || e.httpStatus === 429);
 }
 
 /** 可重试的错误自动重试（指数退避），其余错误原样抛出 */
