@@ -165,7 +165,7 @@ sslbear-cli deploy --cert <fullchain.pem> --key <privkey.pem> [选项]
 ```
 
 - `action`：`deployed`（原先没开 HTTPS）、`updated`（替换旧证书）、`skipped`、`failed`；`--dry-run` 时为 `would_deploy` / `would_update` / `skipped` / `failed`。
-- `failed` 带 `code`、`message`、`requestId`（有的话）和 `retryable`（能否原样重试）。常见 code：`HttpsStateUnknown`（查询该域名的 HTTPS 配置失败，无法判断现状，未做修改，可稍后重试）、`DomainNotFound`（`-d` 点名的域名找不到）、`NotCovered`（`-d` 点名的域名不被证书覆盖）、`HttpsAlreadyEnabled`（写入前发现 HTTPS 已被开启，与查询时不同，重新执行即可）、`CertWithoutCommonName`（该服务不接受没有 CN 的证书，见「已知限制」），其余为云接口的错误码。
+- `failed` 带 `code`、`message`、`requestId`（有的话）和 `retryable`（能否原样重试）。常见 code：`HttpsStateUnknown`（查询该域名的 HTTPS 配置失败，无法判断现状，未做修改，可稍后重试）、`DomainNotFound`（`-d` 点名的域名找不到）、`NotCovered`（`-d` 点名的域名不被证书覆盖）、`HttpsAlreadyEnabled` / `HttpsDisabled`（写入前发现 HTTPS 已被开启 / 关闭，与查询时不同，未做修改，重新执行即可）、`CertWithoutCommonName`（该服务不接受没有 CN 的证书，见「已知限制」），其余为云接口的错误码。
 - `shared_cert_blocked`：证书挂在多个域名共享的配置上（目前是阿里云 ESA 站点），同组有记录不能一起更换时整组跳过，message 列出挡住的记录与放行方法。
 - 退出码：`0` 没有失败（全部成功或跳过，包括什么都没改）；`1` 有域名部署失败或所有查询都失败，stderr 输出 `{"ok":false,"status":"DeployFailed","message":…}`，同一个对象里带完整的 `results`、`uploads`、`issues`；`2` 参数、证书文件或凭证配置错误（未做任何修改）。
 
