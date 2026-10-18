@@ -17,6 +17,8 @@ const read = (f: string) => readFileSync(join(FIX, f), "utf8");
 const NOW = new Date("2026-10-15T00:00:00Z");
 const RSA = loadLocalCert(read("rsa-fullchain.pem"), read("rsa-key.pem"), NOW);
 const ECC = loadLocalCert(read("ecc-fullchain.pem"), read("ecc-key.pem"), NOW);
+/** 没有 subject、只有 SAN 的证书（如 Let's Encrypt 短期证书） */
+const NO_CN = loadLocalCert(read("san-only-fullchain.pem"), read("san-only-key.pem"), NOW);
 const CREDS = { accessKeyId: "AKLTtest0000", secretAccessKey: "testsecret" };
 const VOLC_ENV = { VOLCENGINE_ACCESS_KEY: "AKLTtest0000", VOLCENGINE_SECRET_KEY: "testsecret" };
 
@@ -204,6 +206,16 @@ describe("volcengine cdn 部署", () => {
       code: "DeployCertFailed",
       message: expect.stringContaining("域名与证书不匹配"),
     });
+  });
+
+  it("没有通用名（CN）的证书被拒（实测 InternalError.DomainSystemError「参数校验错误」）时说明原因，保留错误码与 RequestId", async () => {
+    const { ctx } = setup((req) => (req.action === "BatchDeployCert" ? volcError("InternalError.DomainSystemError", "参数校验错误, 请确认后重试。") : undefined));
+    const err = await deployer("cdn").apply(ctx, CREDS, target(rec("cdn", "www.example.com")), input(NO_CN)).catch((e) => e);
+    expect(err).toBeInstanceOf(CloudApiError);
+    expect(err).toMatchObject({ code: "InternalError.DomainSystemError", requestId: "rid-err", message: expect.stringMatching(/CDN 不接受没有通用名（CN）的证书.*参数校验错误/) });
+    // 有 CN 的证书遇到同样的错误码不改写
+    const same = await deployer("cdn").apply(ctx, CREDS, target(rec("cdn", "www.example.com")), input(RSA)).catch((e) => e);
+    expect(same.message).toBe("参数校验错误, 请确认后重试。");
   });
 
   it("双证书但查不到证书算法时不处理", () => {
@@ -557,6 +569,18 @@ describe("volcengine vod 部署", () => {
     expect((fetch.calls[1]!.json as any).UpdateCdnConfigParam.HTTPS.CertInfo).toBeUndefined();
   });
 
+  it("没有通用名（CN）的证书被拒（实测 InternalError.CdnDomainSystemError）时说明原因", async () => {
+    const base = routes({ Switch: true, CertInfo: { CertId: "cert-old" } });
+    const { ctx } = setup((req) =>
+      req.action === "UpdateVodDomainConfig" ? volcError("InternalError.CdnDomainSystemError", "InternalError.CdnDomainSystemError:Cdn Domain System Error, please retry later") : base(req),
+    );
+    const record = rec("vod", "v.example.com", { extra, cert: { id: "cert-old" } });
+    await expect(deployer("vod").apply(ctx, CREDS, target(record), input(NO_CN))).rejects.toMatchObject({
+      code: "InternalError.CdnDomainSystemError",
+      message: expect.stringMatching(/点播不接受没有通用名（CN）的证书/),
+    });
+  });
+
   it("柔佛地域的空间走 ap-southeast-1 的 endpoint", async () => {
     const { fetch, ctx } = setup(routes({ Switch: true, CertInfo: { CertId: "cert-old" } }, "vod.ap-southeast-1.volcengineapi.com"));
     await deployer("vod").apply(ctx, CREDS, target(rec("vod", "v.example.com", { extra: { ...extra, region: "ap-southeast-1" } })), input());
@@ -672,6 +696,16 @@ describe("volcengine live 部署", () => {
       expect(fetch.calls.filter((c) => c.action === "CreateCert")).toHaveLength(1);
     });
 
+    it("没有通用名（CN）的证书 CreateCert 被拒（实测 InvalidParam「db error」）时说明原因，不重发", async () => {
+      const base = routes();
+      const { fetch, ctx } = setup((req) => (req.action === "CreateCert" ? volcError("InvalidParam", "[1002000] InvalidParam: db error", 400) : base(req)));
+      await expect(deployer("live").apply(ctx, CREDS, target(pull), input(NO_CN))).rejects.toMatchObject({
+        code: "InvalidParam",
+        message: expect.stringMatching(/视频直播不接受没有通用名（CN）的证书.*db error/),
+      });
+      expect(fetch.calls.filter((c) => c.action === "CreateCert")).toHaveLength(1);
+    });
+
     it("候选证书的详情查不到（拿不到指纹）时按不是同一张处理，照常上传", async () => {
       const { fetch, ctx } = setup(routes([{ ChainID: "chain-gone", NotAfter: RSA.notAfter, ProjectName: "default" }]));
       expect((await deployer("live").apply(ctx, CREDS, target(pull), input(RSA))).certId).toBe("chain-new");
@@ -724,22 +758,95 @@ describe("volcengine live 部署", () => {
 describe("volcengine imagex 部署", () => {
   const extra = { serviceId: "svc1", serviceName: "pics", region: "cn-north-1" };
 
-  it("更新：UpdateImageBatchDomainCert 只关联证书", async () => {
-    const { fetch, ctx } = setup((req) => (req.action === "UpdateImageBatchDomainCert" ? ok({}) : undefined));
+  // 实测 GetDomainConfig 的 https_config（开启 HTTPS 的域名）
+  const liveCfg = {
+    enable_https: true,
+    force_https: true,
+    cert_id: "cert-old",
+    enable_http2: false,
+    enable_quic: true,
+    enable_ocsp: true,
+    tls_versions: ["tlsv1.0", "tlsv1.1", "tlsv1.2"],
+    enable_force_redirect: true,
+    force_redirect_type: "http2https",
+    force_redirect_code: "302",
+    hsts: { enabled: true, subdomain: "include", ttl: 600 },
+    cert: { id: "cert-old", common_name: "img.example.com", not_after: 1800000000 },
+  };
+
+  it("更新：UpdateImageBatchDomainCert 实测一律 InvalidParameter，改为读出 https_config 后用 UpdateHttps 整块写回、只换证书", async () => {
+    const { fetch, ctx } = setup((req) => {
+      if (req.action === "GetDomainConfig") return ok({ domain: "img.example.com", https_config: liveCfg });
+      if (req.action === "UpdateHttps") return ok("ok");
+      return undefined;
+    });
     const out = await deployer("imagex").apply(ctx, CREDS, target(rec("imagex", "img.example.com", { extra, cert: { id: "cert-old" } })), input());
     expect(out).toEqual({ certId: "cert-new" });
-    const call = fetch.calls[0]!;
-    expect(call.method).toBe("POST");
-    expect(call.url.href).toBe("https://imagex.volcengineapi.com/?Action=UpdateImageBatchDomainCert&Version=2018-08-01");
-    expect(call.headers.authorization).toMatch(/\/cn-north-1\/ImageX\/request, /);
-    expect(call.json).toEqual({ cert_id: "cert-new", domain: "img.example.com" });
+    expect(fetch.calls.map((c) => c.action)).toEqual(["GetDomainConfig", "UpdateHttps"]);
+    const update = fetch.calls[1]!;
+    expect(update.method).toBe("POST");
+    expect(update.url.href).toBe("https://imagex.volcengineapi.com/?Action=UpdateHttps&ServiceId=svc1&Version=2018-08-01");
+    expect(update.headers.authorization).toMatch(/\/cn-north-1\/ImageX\/request, /);
+    // HSTS 的写入字段与读出的一样是 enabled（SDK 模型里的 enable 实测不生效）
+    expect(update.json).toEqual({
+      domain: "img.example.com",
+      https: {
+        enable_https: true,
+        cert_id: "cert-new",
+        enable_http2: false,
+        enable_quic: true,
+        enable_ocsp: true,
+        tls_versions: ["tlsv1.0", "tlsv1.1", "tlsv1.2"],
+        enable_force_redirect: true,
+        force_redirect_type: "http2https",
+        force_redirect_code: "302",
+        hsts: { enabled: true, subdomain: "include", ttl: 600 },
+      },
+    });
+  });
+
+  it("没有通用名（CN）的证书不处理：实测接口照收、边缘却一直下发旧证书，不读配置、不上传、不写入", async () => {
+    const { fetch, ctx } = setup((req) => {
+      if (req.action === "GetDomainConfig") return ok({ https_config: liveCfg });
+      if (req.action === "UpdateHttps") return ok("ok");
+      return undefined;
+    });
+    for (const record of [rec("imagex", "img.example.com", { extra, cert: { id: "cert-old" } }), rec("imagex", "img.example.com", { https: false, extra })]) {
+      const inp = input(NO_CN);
+      const err = await deployer("imagex").apply(ctx, CREDS, target(record), inp).catch((e) => e);
+      expect(err).toBeInstanceOf(CloudApiError);
+      expect(err).toMatchObject({ code: "CertWithoutCommonName", message: expect.stringMatching(/通用名（CN）.*边缘/) });
+      expect(isRetryable(err)).toBe(false);
+      expect(inp.uploads()).toBe(0);
+    }
+    expect(fetch.calls).toHaveLength(0);
+  });
+
+  it("更新时读到 HTTPS 已关闭（与查询时不同）：不写入、不上传", async () => {
+    const { fetch, ctx } = setup((req) => {
+      if (req.action === "GetDomainConfig") return ok({ https_config: { ...liveCfg, enable_https: false } });
+      if (req.action === "UpdateHttps") return ok("ok");
+      return undefined;
+    });
+    const inp = input();
+    await expect(deployer("imagex").apply(ctx, CREDS, target(rec("imagex", "img.example.com", { extra, cert: { id: "cert-old" } })), inp)).rejects.toMatchObject({
+      code: "HttpsDisabled",
+    });
+    expect(fetch.calls.map((c) => c.action)).toEqual(["GetDomainConfig"]);
+    expect(inp.uploads()).toBe(0);
   });
 
   it("柔佛地域走 ap-southeast-1 的 endpoint", async () => {
-    const { fetch, ctx } = setup((req) => (req.action === "UpdateImageBatchDomainCert" ? ok({}) : undefined));
+    const { fetch, ctx } = setup((req) => {
+      if (req.action === "GetDomainConfig") return ok({ https_config: liveCfg });
+      if (req.action === "UpdateHttps") return ok("ok");
+      return undefined;
+    });
     await deployer("imagex").apply(ctx, CREDS, target(rec("imagex", "img.example.com", { extra: { ...extra, region: "ap-southeast-1" } })), input());
-    expect(fetch.calls[0]!.url.host).toBe("imagex.ap-southeast-1.volcengineapi.com");
-    expect(fetch.calls[0]!.headers.authorization).toMatch(/\/ap-southeast-1\/ImageX\/request, /);
+    for (const c of fetch.calls) {
+      expect(c.url.host).toBe("imagex.ap-southeast-1.volcengineapi.com");
+      expect(c.headers.authorization).toMatch(/\/ap-southeast-1\/ImageX\/request, /);
+    }
   });
 
   it("部署：先读域名配置，UpdateHttps 开启 HTTPS 并绑定证书（ServiceId 在 query、配置在 JSON 体）", async () => {
@@ -749,7 +856,7 @@ describe("volcengine imagex 部署", () => {
       return undefined;
     });
     const out = await deployer("imagex").apply(ctx, CREDS, target(rec("imagex", "img.example.com", { https: false, extra })), input());
-    expect(out).toEqual({ certId: "cert-new", note: expect.stringMatching(/TLS.*OCSP/) });
+    expect(out).toEqual({ certId: "cert-new", note: expect.stringMatching(/TLS 版本按默认/) });
     const [get, update] = fetch.calls;
     expect(get!.url.search).toBe("?Action=GetDomainConfig&DomainName=img.example.com&ServiceId=svc1&Version=2018-08-01");
     expect(update!.method).toBe("POST");
@@ -772,6 +879,31 @@ describe("volcengine imagex 部署", () => {
     });
     expect(fetch.calls.map((c) => c.action)).toEqual(["GetDomainConfig"]);
     expect(inp.uploads()).toBe(0);
+  });
+
+  it("部署：读得到的 TLS 版本、QUIC、OCSP、强制跳转、HSTS 都原样带上，不提示默认值", async () => {
+    const { fetch, ctx } = setup((req) => {
+      if (req.action === "GetDomainConfig") return ok({ https_config: { ...liveCfg, enable_https: false, cert_id: "" } });
+      if (req.action === "UpdateHttps") return ok("ok");
+      return undefined;
+    });
+    const out = await deployer("imagex").apply(ctx, CREDS, target(rec("imagex", "img.example.com", { https: false, extra })), input());
+    expect(out).toEqual({ certId: "cert-new" });
+    expect(fetch.calls[1]!.json).toEqual({
+      domain: "img.example.com",
+      https: {
+        enable_https: true,
+        cert_id: "cert-new",
+        enable_http2: false,
+        enable_quic: true,
+        enable_ocsp: true,
+        tls_versions: ["tlsv1.0", "tlsv1.1", "tlsv1.2"],
+        enable_force_redirect: true,
+        force_redirect_type: "http2https",
+        force_redirect_code: "302",
+        hsts: { enabled: true, subdomain: "include", ttl: 600 },
+      },
+    });
   });
 
   it("部署时原先开着强制跳转 HTTPS 的照样带上", async () => {

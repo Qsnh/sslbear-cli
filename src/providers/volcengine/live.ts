@@ -9,7 +9,7 @@ import { toIso } from "../../lib/time.js";
 import type { CertInfo, DomainRecord } from "../../types.js";
 import type { DomainService, Warn } from "../registry.js";
 import { callVolc, callVolcOnce, type VolcRequest } from "./client.js";
-import { certName, pemFingerprints } from "./common.js";
+import { certName, explainNoCommonName, pemFingerprints } from "./common.js";
 
 interface LiveDomain {
   Domain: string;
@@ -121,7 +121,9 @@ function liveChainId(ctx: QueryContext, creds: AccessKeyCredentials, cert: Local
           ProjectName: project,
           Rsa: { Pubkey: cert.certPem, Prikey: cert.keyPem },
         }),
-      );
+      ).catch((e) => {
+        throw explainNoCommonName(e, cert, "视频直播", ["InvalidParam"]);
+      });
       if (!created.ChainID) throw new CloudApiError("volcengine", "InvalidResponse", "上传证书后视频直播没有返回证书链 ID");
       return created.ChainID;
     }),

@@ -32,18 +32,32 @@ interface ServiceDomain {
   is_default?: boolean;
 }
 
+/** GetDomainConfig 的 HTTPS 配置；实测除开关外还返回 TLS 版本、QUIC、OCSP、强制跳转、HSTS，可整块读出再写回 */
+interface HttpsConfig {
+  enable_https?: boolean;
+  enable_http2?: boolean;
+  enable_quic?: boolean;
+  enable_ocsp?: boolean;
+  /** 未开启过 HTTPS 的域名为 null */
+  tls_versions?: string[] | null;
+  /** 是否强制跳转 HTTPS（旧字段，与 enable_force_redirect 同义） */
+  force_https?: boolean;
+  enable_force_redirect?: boolean;
+  /** http2https / https2http */
+  force_redirect_type?: string;
+  /** 301 / 302 */
+  force_redirect_code?: string;
+  /** 读写字段名都是 enabled（SDK 模型里的 enable 实测写入不生效） */
+  hsts?: { enabled?: boolean; subdomain?: string; ttl?: number } | null;
+  /** HTTPS 关闭时可能残留，不能用来判断是否开启 */
+  cert_id?: string;
+  /** 文档未列出、仅 SDK 模型里有：{ id, common_name, not_after（Unix 秒） } */
+  cert?: { id?: string; common_name?: string; not_after?: number } | null;
+}
+
 interface DomainConfig {
   status?: string;
-  https_config?: {
-    enable_https?: boolean;
-    enable_http2?: boolean;
-    /** 是否强制跳转 HTTPS */
-    force_https?: boolean;
-    /** HTTPS 关闭时可能残留，不能用来判断是否开启 */
-    cert_id?: string;
-    /** 文档未列出、仅 SDK 模型里有：{ id, common_name, not_after（Unix 秒） } */
-    cert?: { id?: string; common_name?: string; not_after?: number } | null;
-  } | null;
+  https_config?: HttpsConfig | null;
 }
 
 /** 2018-08-01 为 snake_case，SDK 用的 2023-05-01 为 PascalCase，两种都认 */
@@ -70,8 +84,38 @@ const NO_DOMAIN = /^(601012|ERR_SERVICE_NO_AVAIL_DOMAIN)$/;
 const seconds = (n?: number) => (n ? toIso(n) : undefined);
 const asArray = <T>(v: unknown): T[] => (Array.isArray(v) ? (v as T[]) : []);
 
-/** 开启 HTTPS 时 UpdateHttps 必填、但读接口拿不到原值的 TLS 版本，取 CDN 文档的默认值 */
+/** 读不到 TLS 版本（从未开过 HTTPS 的域名为 null）时 UpdateHttps 必填的默认值，取 CDN 文档的默认值 */
 const DEFAULT_TLS_VERSIONS = ["tlsv1.1", "tlsv1.2", "tlsv1.3"];
+
+/**
+ * UpdateHttps 是整块覆盖：把读出的 https_config 原样转成写入的 https 块，只开启 HTTPS 并换成新证书。
+ * 读不到的项按控制台开启 HTTPS 的默认行为（HTTP/2 开启、TLS 1.1–1.3），用了 TLS 默认值时返回提示。
+ */
+function httpsBlock(h: HttpsConfig, certId: string): { https: Record<string, unknown>; note?: string } {
+  const tls = h.tls_versions?.length ? h.tls_versions : undefined;
+  // 新字段 enable_force_redirect 优先；只有旧字段 force_https 时按 HTTP → HTTPS 301
+  const redirect =
+    h.enable_force_redirect !== undefined
+      ? {
+          enable_force_redirect: h.enable_force_redirect,
+          ...(h.force_redirect_type && { force_redirect_type: h.force_redirect_type }),
+          ...(h.force_redirect_code && { force_redirect_code: h.force_redirect_code }),
+        }
+      : h.force_https
+        ? { enable_force_redirect: true, force_redirect_type: "http2https", force_redirect_code: "301" }
+        : {};
+  const https = {
+    enable_https: true,
+    cert_id: certId,
+    enable_http2: h.enable_http2 ?? true,
+    ...(h.enable_quic !== undefined && { enable_quic: h.enable_quic }),
+    enable_ocsp: h.enable_ocsp ?? false,
+    tls_versions: tls ?? DEFAULT_TLS_VERSIONS,
+    ...redirect,
+    ...(h.hsts && { hsts: compact({ enabled: h.hsts.enabled, subdomain: h.hsts.subdomain, ttl: h.hsts.ttl }) }),
+  };
+  return { https, ...(!tls && { note: "已开启 HTTPS；TLS 版本按默认 tlsv1.1–1.3，如需调整请到 veImageX 控制台" }) };
+}
 
 const write = <T>(ctx: QueryContext, creds: AccessKeyCredentials, region: string, action: string, body: Record<string, unknown>, query?: Record<string, string>) =>
   callVolc<T>(ctx, creds, { host: REGIONS[region]!, service: "ImageX", region, version: "2018-08-01", action, method: "POST", params: body, ...(query && { query }) });
@@ -178,19 +222,23 @@ export const imagex: DomainService<AccessKeyCredentials> = {
     unsupported: (record) =>
       !record.extra?.serviceId || !REGIONS[record.extra.region ?? ""] ? "缺少所属服务或地域信息" : undefined,
     /**
-     * 更新：UpdateImageBatchDomainCert 只把证书中心的证书关联到域名，其他 HTTPS 配置不动。
-     * 部署：UpdateHttps 是整块覆盖且 TLS 版本、OCSP 为必填，而 GetDomainConfig 只读得到 HTTPS / HTTP2 / 强制 HTTPS 三个开关，
-     * 所以读得到的照原值带上，TLS 版本取默认 tlsv1.1–1.3、不开 OCSP（域名原先没开 HTTPS，这些本来就是待定的新配置）。
-     * 读到的 HTTPS 其实已开启时不写入（整块覆盖会把 TLS 版本、OCSP 等改成默认值）。
+     * 部署与更新都用 UpdateHttps：先 GetDomainConfig 读出 https_config，整块写回、只开启 HTTPS 并换证书，
+     * HTTP/2、QUIC、OCSP、TLS 版本、强制跳转、HSTS 原样带上。
+     * 文档里的 UpdateImageBatchDomainCert（只关联证书）实测无论参数怎么传都返回 InvalidParameter（CodeN 600003），不用。
+     * 读到的开关与查询时不同（部署时已开启、更新时已关闭）不写入，先核对再取证书 ID，核对不过不会上传证书。
+     * 没有通用名（CN）的证书实测 UpdateHttps 照收、域名配置也显示新证书，但边缘节点一直下发旧证书（带 CN 的证书 2 分钟内生效），
+     * 所以直接不处理（不读、不传、不写），以免报「已更新」而实际没有生效。
      */
     async apply(ctx, creds, target, input) {
+      if (!input.cert.commonName) {
+        throw new CloudApiError(
+          "volcengine",
+          "CertWithoutCommonName",
+          "veImageX 实测会接受没有通用名（CN）的证书（如 Let's Encrypt 的短期证书），但边缘节点不会生效、仍下发原来的证书；未做修改，请改用带通用名的证书",
+        );
+      }
       const [record] = target.records;
       const { serviceId, region } = record!.extra as { serviceId: string; region: string };
-      if (target.mode === "update") {
-        const certId = await input.certId();
-        await write(ctx, creds, region, "UpdateImageBatchDomainCert", { cert_id: certId, domain: record!.domain });
-        return { certId };
-      }
       const cfg = await callVolc<DomainConfig>(ctx, creds, {
         host: REGIONS[region]!,
         service: "ImageX",
@@ -200,29 +248,15 @@ export const imagex: DomainService<AccessKeyCredentials> = {
         method: "GET",
         params: { ServiceId: serviceId, DomainName: record!.domain },
       });
-      if (cfg.https_config?.enable_https === true) throw httpsAlreadyEnabled();
+      const on = cfg.https_config?.enable_https === true;
+      if (target.mode === "deploy" && on) throw httpsAlreadyEnabled();
+      if (target.mode === "update" && !on) {
+        throw new CloudApiError("volcengine", "HttpsDisabled", `域名 ${record!.domain} 的 HTTPS 已关闭（与查询时不同），未替换证书；如需部署并开启 HTTPS 请用 --domain 点名后重新执行`);
+      }
       const certId = await input.certId();
-      const https = cfg.https_config ?? {};
-      await write(
-        ctx,
-        creds,
-        region,
-        "UpdateHttps",
-        {
-          domain: record!.domain,
-          https: {
-            enable_https: true,
-            cert_id: certId,
-            // 读不到时按控制台开启 HTTPS 的默认行为（同时开启 HTTP/2）
-            enable_http2: https.enable_http2 ?? true,
-            enable_ocsp: false,
-            tls_versions: DEFAULT_TLS_VERSIONS,
-            ...(https.force_https && { enable_force_redirect: true, force_redirect_type: "http2https", force_redirect_code: "301" }),
-          },
-        },
-        { ServiceId: serviceId },
-      );
-      return { certId, note: "已开启 HTTPS；TLS 版本按默认 tlsv1.1–1.3、未开 OCSP，如需调整请到 veImageX 控制台" };
+      const { https, note } = httpsBlock(cfg.https_config ?? {}, certId);
+      await write(ctx, creds, region, "UpdateHttps", { domain: record!.domain, https }, { ServiceId: serviceId });
+      return { certId, ...(note && { note }) };
     },
   },
 };

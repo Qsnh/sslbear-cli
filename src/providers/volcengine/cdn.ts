@@ -7,7 +7,7 @@ import type { CertInfo, DomainRecord } from "../../types.js";
 import type { DomainService, Warn } from "../registry.js";
 import { fillDualAlgorithms } from "./certs.js";
 import { callVolc } from "./client.js";
-import { AMBIGUOUS_DUAL, HTTPS_UNKNOWN, ambiguousCerts, ambiguousDual, certsToKeep, earliest, splitList } from "./common.js";
+import { AMBIGUOUS_DUAL, HTTPS_UNKNOWN, ambiguousCerts, ambiguousDual, certsToKeep, earliest, explainNoCommonName, splitList } from "./common.js";
 
 interface CdnDomain {
   Domain: string;
@@ -132,6 +132,8 @@ export const cdn: DomainService<AccessKeyCredentials> = {
         CertId: certId,
         CertId2: keep[0]?.id,
         Domain: record!.domain,
+      }).catch((e) => {
+        throw explainNoCommonName(e, input.cert, " CDN ", ["InternalError.DomainSystemError"]);
       });
       const failed = (res.DeployResult ?? []).find((r) => r.Status !== "success");
       if (failed) throw new CloudApiError("volcengine", "DeployCertFailed", `关联证书失败：${failed.ErrorMsg || failed.Status || "未知原因"}`);
