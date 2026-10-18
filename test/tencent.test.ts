@@ -174,6 +174,39 @@ describe("tencent domains", () => {
     expect(fetch.calls.some((c) => c.action === "DescribeCertificates")).toBe(false);
   });
 
+  it("EdgeOne：RSA + ECC 双证书时 certs 列出全部，并按 SignAlgo 标出算法", async () => {
+    const fetch = fakeFetch((req) => {
+      if (req.action === "DescribeZones") return ok({ TotalCount: 1, Zones: [{ ZoneId: "zone-1", ZoneName: "example.io" }] });
+      if (req.action === "DescribeAccelerationDomains") {
+        return ok({
+          TotalCount: 1,
+          AccelerationDomains: [
+            {
+              DomainName: "www.example.io",
+              DomainStatus: "online",
+              Certificate: {
+                Mode: "sslcert",
+                List: [
+                  { CertId: "ecc", Alias: "ecc", ExpireTime: "2027-03-01T00:00:00Z", SignAlgo: "ECC 256", Status: "deployed" },
+                  { CertId: "rsa", Alias: "rsa", ExpireTime: "2026-12-01T00:00:00Z", SignAlgo: "RSA 2048", Status: "deployed" },
+                ],
+              },
+            },
+          ],
+        });
+      }
+      return undefined;
+    });
+    const r = await runCli(["domains", "-s", "teo", "--json"], { env: TENCENT_ENV, fetch });
+    expect(r.json.data.items[0]).toMatchObject({
+      cert: { id: "rsa", algorithm: "RSA" },
+      certs: [
+        { id: "rsa", name: "rsa", notAfter: "2026-12-01T00:00:00.000Z", status: "deployed", algorithm: "RSA" },
+        { id: "ecc", name: "ecc", notAfter: "2027-03-01T00:00:00.000Z", status: "deployed", algorithm: "ECC" },
+      ],
+    });
+  });
+
   it("EdgeOne：证书列表只有 CertId 时从 SSL 列表补全后再取最早到期；免费证书模式也算 HTTPS", async () => {
     const fetch = fakeFetch((req) => {
       if (req.action === "DescribeZones") return ok({ TotalCount: 1, Zones: [{ ZoneId: "zone-1", ZoneName: "example.com" }] });
@@ -200,6 +233,10 @@ describe("tencent domains", () => {
         status: "online",
         https: true,
         cert: { id: "ssl-1", name: "wild", commonName: "*.example.com", sans: ["*.example.com", "example.com"], notBefore: "2026-08-01T00:00:00.000Z", notAfter: "2026-10-29T23:59:59.000Z" },
+        certs: [
+          { id: "ssl-1", name: "wild", commonName: "*.example.com", sans: ["*.example.com", "example.com"], notBefore: "2026-08-01T00:00:00.000Z", notAfter: "2026-10-29T23:59:59.000Z" },
+          { id: "ssl-late", notAfter: "2027-06-01T00:00:00.000Z" },
+        ],
         extra: { zoneId: "zone-1", zone: "example.com", certMode: "sslcert" },
         daysLeft: 14,
       },

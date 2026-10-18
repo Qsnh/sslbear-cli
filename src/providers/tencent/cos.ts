@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { TencentCredentials } from "../../lib/env.js";
 import { CloudApiError, send, withRetry, type QueryContext, type RawResponse } from "../../lib/http.js";
 import { compact } from "../../lib/compact.js";
@@ -5,7 +6,7 @@ import { mapLimit } from "../../lib/pool.js";
 import { toIso } from "../../lib/time.js";
 import { xmlBlocks, xmlText } from "../../lib/xml.js";
 import type { DomainRecord } from "../../types.js";
-import type { DomainService, Warn } from "../registry.js";
+import type { Deployer, DomainService, Warn } from "../registry.js";
 import { cosAuthorization, cosEncode } from "./sign.js";
 import { enrichFromSsl } from "./ssl.js";
 
@@ -31,16 +32,30 @@ function cosError(raw: RawResponse): CloudApiError {
   return new CloudApiError("tencent", code, detail, xmlText(raw.text, "RequestId"), raw.status);
 }
 
-/** 以 GET 调用 COS XML 接口（路径固定为 /），返回响应 XML */
-async function cosGet(ctx: QueryContext, creds: TencentCredentials, host: string, query: Record<string, string>): Promise<string> {
+/**
+ * 调用 COS XML 接口（路径固定为 /），返回响应 XML。带请求体时同时签 Content-MD5 与 Content-Type
+ * （COS 的 PUT Bucket 子资源接口要求 Content-MD5）。
+ */
+async function cosRequest(
+  ctx: QueryContext,
+  creds: TencentCredentials,
+  method: "GET" | "PUT",
+  host: string,
+  query: Record<string, string>,
+  body?: string,
+): Promise<string> {
   return withRetry(ctx, async () => {
     const now = Math.floor(Date.now() / 1000);
     const headers: Record<string, string> = {};
+    if (body !== undefined) {
+      headers["content-md5"] = createHash("md5").update(body).digest("base64");
+      headers["content-type"] = "application/xml";
+    }
     if (creds.sessionToken) headers["x-cos-security-token"] = creds.sessionToken;
     headers.Authorization = cosAuthorization({
       secretId: creds.secretId,
       secretKey: creds.secretKey,
-      method: "GET",
+      method,
       path: "/",
       query,
       headers: { host, ...headers },
@@ -50,11 +65,14 @@ async function cosGet(ctx: QueryContext, creds: TencentCredentials, host: string
     const qs = Object.entries(query)
       .map(([k, v]) => (v ? `${cosEncode(k)}=${cosEncode(v)}` : cosEncode(k)))
       .join("&");
-    const raw = await send(ctx, "tencent", `https://${host}/${qs ? `?${qs}` : ""}`, { method: "GET", headers });
+    const raw = await send(ctx, "tencent", `https://${host}/${qs ? `?${qs}` : ""}`, { method, headers, ...(body !== undefined && { body }) });
     if (raw.status >= 400) throw cosError(raw);
     return raw.text;
   });
 }
+
+const cosGet = (ctx: QueryContext, creds: TencentCredentials, host: string, query: Record<string, string>) =>
+  cosRequest(ctx, creds, "GET", host, query);
 
 /** 官方 Java SDK 对 GET Bucket domain / domain certificate 都把 404 视为「没有配置」 */
 const isNotFound = (e: unknown) => e instanceof CloudApiError && e.httpStatus === 404;
@@ -135,6 +153,27 @@ async function getDomainCert(ctx: QueryContext, creds: TencentCredentials, d: Co
 /** ValidityBegin / ValidityExpire 是 Unix 时间戳（SDK 里为 int64），0 或空表示没有 */
 const timestampToIso = (v: string | undefined) => (v && /^\d+$/.test(v) && Number(v) > 0 ? toIso(Number(v)) : undefined);
 
+const xmlEscape = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+/**
+ * PUT Bucket domaincertificate：按 SSL 证书 ID 给自定义域名绑定证书，绑定后即开启 HTTPS（接口也收 PEM，
+ * 统一走 SSL 证书服务便于复用）。该接口只管证书，不涉及自定义域名的其他配置，deploy / update 是同一个请求。
+ */
+const deployer: Deployer<TencentCredentials> = {
+  async apply(ctx, creds, target, input) {
+    const record = target.records[0]!;
+    const bucket = record.extra?.bucket;
+    const region = record.extra?.region;
+    if (!bucket || !region) throw new CloudApiError("tencent", "MissingBucket", `COS 域名 ${record.domain} 缺少 bucket / region 信息`);
+    const certId = await input.certId();
+    const body =
+      `<DomainCertificate><CertificateInfo><CertType>CustomCert</CertType><CustomCert><CertId>${xmlEscape(certId)}</CertId></CustomCert></CertificateInfo>` +
+      `<DomainList><DomainName>${xmlEscape(record.domain)}</DomainName></DomainList></DomainCertificate>`;
+    await cosRequest(ctx, creds, "PUT", bucketHost({ name: bucket, region }), { domaincertificate: "" }, body);
+    return { certId };
+  },
+};
+
 /**
  * 对象存储 COS 的自定义源站域名：先列 bucket，再逐个 bucket 查自定义域名，最后逐个域名查证书配置（各阶段并发 5）。
  * HTTPS 以域名证书配置的 Status 为 Enabled 为准；只给了证书 ID 没给有效期的从 SSL 证书列表补。
@@ -176,4 +215,5 @@ export const cos: DomainService<TencentCredentials> = {
     });
     return enrichFromSsl(ctx, creds, warn, records);
   },
+  deployer,
 };

@@ -1,10 +1,10 @@
 import type { TencentCredentials } from "../../lib/env.js";
-import type { QueryContext } from "../../lib/http.js";
+import { CloudApiError, type QueryContext } from "../../lib/http.js";
 import { compact } from "../../lib/compact.js";
 import { paginate } from "../../lib/paginate.js";
 import { toIso } from "../../lib/time.js";
 import type { DomainRecord } from "../../types.js";
-import type { DomainService, Warn } from "../registry.js";
+import type { Deployer, DomainService, Warn } from "../registry.js";
 import { callTencent } from "./client.js";
 import { asPlatformDomain, isPlatformDomain } from "./platform.js";
 import { enrichFromSsl } from "./ssl.js";
@@ -31,6 +31,37 @@ const BINDING_PAGE = 50;
 
 const call = <T>(ctx: QueryContext, creds: TencentCredentials, action: string, payload: Record<string, unknown>) =>
   callTencent<T>(ctx, creds, { service: "live", version: "2018-08-01", action, payload });
+
+interface BindResult {
+  MismatchedDomainNames?: string[] | null;
+  /** 操作失败的域名，包括 MismatchedDomainNames 里的 */
+  Errors?: { DomainName?: string; Code?: string; Message?: string }[] | null;
+  RequestId?: string;
+}
+
+/**
+ * ModifyLiveDomainCertBindings 按 SSL 证书 ID 绑定播放域名：update 时 HTTPS 启用状态传 -1（保持不变），
+ * deploy 时传 1（启用）。批量接口受理后单个域名的失败放在 Errors / MismatchedDomainNames 里，需要逐一检查。
+ */
+const deployer: Deployer<TencentCredentials> = {
+  unsupported(record) {
+    return record.extra?.type === "push" ? "推流域名不能绑定 HTTPS 证书（直播证书只用于播放域名）" : undefined;
+  },
+  async apply(ctx, creds, target, input) {
+    const domain = target.records[0]!.domain;
+    const certId = await input.certId();
+    const res = await call<BindResult>(ctx, creds, "ModifyLiveDomainCertBindings", {
+      DomainInfos: [{ DomainName: domain, Status: target.mode === "deploy" ? 1 : -1 }],
+      CloudCertId: certId,
+    });
+    const err = res.Errors?.find((e) => !e.DomainName || e.DomainName === domain);
+    if (err) throw new CloudApiError("tencent", err.Code ?? "Unknown", err.Message ?? "绑定证书失败", res.RequestId);
+    if (res.MismatchedDomainNames?.includes(domain)) {
+      throw new CloudApiError("tencent", "CertDomainMismatch", "证书与该域名不匹配，直播已跳过绑定", res.RequestId);
+    }
+    return { certId };
+  },
+};
 
 /** 直播域名 + 域名证书绑定关系两次分页查询后按域名合并；绑定里缺到期时间的从 SSL 证书列表补 */
 export const live: DomainService<TencentCredentials> = {
@@ -74,4 +105,5 @@ export const live: DomainService<TencentCredentials> = {
     });
     return enrichFromSsl(ctx, creds, warn, records);
   },
+  deployer,
 };

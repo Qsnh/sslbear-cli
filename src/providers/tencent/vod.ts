@@ -5,7 +5,7 @@ import { paginate } from "../../lib/paginate.js";
 import { mapLimit } from "../../lib/pool.js";
 import { toIso } from "../../lib/time.js";
 import type { DomainRecord } from "../../types.js";
-import type { DomainService, Warn } from "../registry.js";
+import type { Deployer, DomainService, Warn } from "../registry.js";
 import { callTencent } from "./client.js";
 import { asPlatformDomain, isPlatformDomain } from "./platform.js";
 import { enrichFromSsl } from "./ssl.js";
@@ -56,6 +56,30 @@ async function listAppDomains(ctx: QueryContext, creds: TencentCredentials, app:
 }
 
 /**
+ * SetVodDomainCertificate(Operation=Set) 按 SSL 证书 ID 设置证书，设置即开启 HTTPS，只涉及证书；
+ * 2023-12-25 之后开通点播的账号必须带应用 ID（list 时已记在 extra.subAppId）。
+ */
+const deployer: Deployer<TencentCredentials> = {
+  unsupported(record) {
+    if (record.extra?.type === "EdgeOne") return "该域名由 EdgeOne 分发，证书需在 EdgeOne 上配置";
+    if (record.status === "Locked") return "域名处于锁定状态（Locked），暂时无法变更配置";
+    return undefined;
+  },
+  async apply(ctx, creds, target, input) {
+    const record = target.records[0]!;
+    const certId = await input.certId();
+    const subAppId = record.extra?.subAppId;
+    await call(ctx, creds, "SetVodDomainCertificate", {
+      Domain: record.domain,
+      Operation: "Set",
+      CertID: certId,
+      ...(subAppId && { SubAppId: Number(subAppId) }),
+    });
+    return { certId };
+  },
+};
+
+/**
  * 2023-12-25 之后开通点播的账号必须按应用（SubAppId）查域名：先列应用再逐个查；
  * 未启用多应用的老账号应用列表为空，直接不带 SubAppId 查一次。
  */
@@ -101,4 +125,5 @@ export const vod: DomainService<TencentCredentials> = {
     });
     return enrichFromSsl(ctx, creds, warn, records);
   },
+  deployer,
 };
