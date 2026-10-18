@@ -1,6 +1,6 @@
 import { CloudApiError, isRetryable, type QueryContext } from "../lib/http.js";
 import { mapLimit } from "../lib/pool.js";
-import { PROVIDER_DEFS, queryDomains, resolveTargets, type ProviderDefs, type QueryIssue } from "../query.js";
+import { PROVIDER_DEFS, queryDomains, resolveTargets, type DomainQueryResult, type ProviderDefs, type QueryIssue } from "../query.js";
 import type { DeployTarget, DomainService, ProviderDef } from "../providers/registry.js";
 import type { CertInfo, DomainRecord, Provider } from "../types.js";
 import { certCovers, normalizeDomain, type LocalCert } from "./cert.js";
@@ -111,8 +111,17 @@ function resolveShared(group: Candidate[]): { blockedBy: Candidate[]; confirmabl
   return { blockedBy, confirmable: blockedBy.length > 0 && blockedBy.every((c) => c.inScope && c.decision.needsConfirm) };
 }
 
+/** 查询所选云厂商 / 服务上的现状；与 buildPlan 拆开，终端确认后可用同一份结果重新出计划，不再查一遍云接口 */
+export function queryForDeploy(ctx: QueryContext, opts: DeployOptions, defs: ProviderDefs = PROVIDER_DEFS): Promise<DomainQueryResult> {
+  return queryDomains(ctx, { providers: opts.providers, services: opts.services }, defs);
+}
+
 export async function planDeploy(ctx: QueryContext, cert: LocalCert, opts: DeployOptions, defs: ProviderDefs = PROVIDER_DEFS): Promise<DeployPlan> {
-  const query = await queryDomains(ctx, { providers: opts.providers, services: opts.services }, defs);
+  return buildPlan(ctx, cert, opts, await queryForDeploy(ctx, opts, defs), defs);
+}
+
+/** 按查询结果出计划（纯计算，不调用云接口） */
+export function buildPlan(ctx: QueryContext, cert: LocalCert, opts: DeployOptions, query: DomainQueryResult, defs: ProviderDefs = PROVIDER_DEFS): DeployPlan {
   const targets = new Map(resolveTargets(ctx.env, opts.providers, defs).map((t) => [t.def.provider, t]));
   const named = opts.domains?.length ? new Set(opts.domains.map(normalizeDomain)) : undefined;
   const results: DeployResult[] = [];
