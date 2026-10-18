@@ -35,6 +35,9 @@ interface DomainConfig {
   status?: string;
   https_config?: {
     enable_https?: boolean;
+    enable_http2?: boolean;
+    /** 是否强制跳转 HTTPS */
+    force_https?: boolean;
     /** HTTPS 关闭时可能残留，不能用来判断是否开启 */
     cert_id?: string;
     /** 文档未列出、仅 SDK 模型里有：{ id, common_name, not_after（Unix 秒） } */
@@ -65,6 +68,12 @@ const NO_DOMAIN = /^(601012|ERR_SERVICE_NO_AVAIL_DOMAIN)$/;
 
 const seconds = (n?: number) => (n ? toIso(n) : undefined);
 const asArray = <T>(v: unknown): T[] => (Array.isArray(v) ? (v as T[]) : []);
+
+/** 开启 HTTPS 时 UpdateHttps 必填、但读接口拿不到原值的 TLS 版本，取 CDN 文档的默认值 */
+const DEFAULT_TLS_VERSIONS = ["tlsv1.1", "tlsv1.2", "tlsv1.3"];
+
+const write = <T>(ctx: QueryContext, creds: AccessKeyCredentials, region: string, action: string, body: Record<string, unknown>, query?: Record<string, string>) =>
+  callVolc<T>(ctx, creds, { host: REGIONS[region]!, service: "ImageX", region, version: "2018-08-01", action, method: "POST", params: body, ...(query && { query }) });
 
 /**
  * veImageX：逐地域列服务 → 每个服务 GetServiceDomains 列域名 → 逐域名 GetDomainConfig 读 HTTPS 开关与证书 ID。
@@ -157,5 +166,54 @@ export const imagex: DomainService<AccessKeyCredentials> = {
       });
     });
     return enrichFromCertCenter(ctx, creds, warn, records);
+  },
+  deployer: {
+    unsupported: (record) =>
+      !record.extra?.serviceId || !REGIONS[record.extra.region ?? ""] ? "缺少所属服务或地域信息" : undefined,
+    /**
+     * 更新：UpdateImageBatchDomainCert 只把证书中心的证书关联到域名，其他 HTTPS 配置不动。
+     * 部署：UpdateHttps 是整块覆盖且 TLS 版本、OCSP 为必填，而 GetDomainConfig 只读得到 HTTPS / HTTP2 / 强制 HTTPS 三个开关，
+     * 所以读得到的照原值带上，TLS 版本取默认 tlsv1.1–1.3、不开 OCSP（域名原先没开 HTTPS，这些本来就是待定的新配置）。
+     */
+    async apply(ctx, creds, target, input) {
+      const [record] = target.records;
+      const { serviceId, region } = record!.extra as { serviceId: string; region: string };
+      if (target.mode === "update") {
+        const certId = await input.certId();
+        await write(ctx, creds, region, "UpdateImageBatchDomainCert", { cert_id: certId, domain: record!.domain });
+        return { certId };
+      }
+      const cfg = await callVolc<DomainConfig>(ctx, creds, {
+        host: REGIONS[region]!,
+        service: "ImageX",
+        region,
+        version: "2018-08-01",
+        action: "GetDomainConfig",
+        method: "GET",
+        params: { ServiceId: serviceId, DomainName: record!.domain },
+      });
+      const certId = await input.certId();
+      const https = cfg.https_config ?? {};
+      await write(
+        ctx,
+        creds,
+        region,
+        "UpdateHttps",
+        {
+          domain: record!.domain,
+          https: {
+            enable_https: true,
+            cert_id: certId,
+            // 读不到时按控制台开启 HTTPS 的默认行为（同时开启 HTTP/2）
+            enable_http2: https.enable_http2 ?? true,
+            enable_ocsp: false,
+            tls_versions: DEFAULT_TLS_VERSIONS,
+            ...(https.force_https && { enable_force_redirect: true, force_redirect_type: "http2https", force_redirect_code: "301" }),
+          },
+        },
+        { ServiceId: serviceId },
+      );
+      return { certId, note: "已开启 HTTPS；TLS 版本按默认 tlsv1.1–1.3、未开 OCSP，如需调整请到 veImageX 控制台" };
+    },
   },
 };

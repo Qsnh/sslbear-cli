@@ -5,9 +5,9 @@ import { mapLimit } from "../../lib/pool.js";
 import { toIso } from "../../lib/time.js";
 import type { CertInfo, DomainRecord } from "../../types.js";
 import type { DomainService, Warn } from "../registry.js";
-import { completeCerts } from "./certs.js";
+import { completeCerts, fillDualAlgorithms } from "./certs.js";
 import { callVolc } from "./client.js";
-import { earliest } from "./common.js";
+import { AMBIGUOUS_DUAL, ambiguousDual, certsToKeep, earliest, pemAlgorithm } from "./common.js";
 
 /** 点播按地域部署，空间与域名要到空间所在地域的 endpoint 查；柔佛仅对企业用户开放 */
 const REGIONS: Record<string, string> = {
@@ -46,14 +46,21 @@ interface VodCert {
   CertId?: string;
   /** 与 CDN 的 CertInfo 一致，是证书的 CN（实测为证书通用名），不是证书中心里的备注名 */
   CertName?: string;
-  /** Unix 秒（实测有返回；缺了从证书中心补）。实测还带完整证书链 Certificate.Certificate（PEM，不含私钥），未使用 */
+  /** Unix 秒（实测有返回；缺了从证书中心补） */
   EffectiveTime?: number;
   ExpireTime?: number;
+  /** inter_cert（RSA / ECC）/ sm_cert（国密） */
+  EncryType?: string;
+  /** 实测带完整证书链（PEM，不含私钥），用来识别 RSA / ECC */
+  Certificate?: { Certificate?: string | null } | null;
 }
+
+/** HTTPS 模块：读出来的整块配置（更新时原样写回，只换证书） */
+type VodHttps = { Switch?: boolean; CertInfo?: VodCert | null; CertInfoList?: VodCert[] | null } & Record<string, unknown>;
 
 interface DomainConfig {
   DomainInfo?: {
-    DomainConfig?: { HTTPS?: { Switch?: boolean; CertInfo?: VodCert | null; CertInfoList?: VodCert[] | null } | null } | null;
+    DomainConfig?: { HTTPS?: VodHttps | null } | null;
   } | null;
   /** CertificateName 同样是证书 CN */
   VodInfo?: { Certificate?: { CertificateId?: string; CertificateName?: string } | null } | null;
@@ -66,6 +73,20 @@ const DOMAIN_PAGE = 100;
 type Call = <T>(region: string, version: string, action: string, method: "GET" | "POST", params: Record<string, unknown>) => Promise<T>;
 
 const seconds = (n?: number) => (n ? toIso(n) : undefined);
+
+const algorithmOf = (c: VodCert) => (c.EncryType === "sm_cert" ? ("SM2" as const) : pemAlgorithm(c.Certificate?.Certificate));
+
+/**
+ * 读出的配置写回前的整理：去掉 null；证书对象（含 CertId 的）只留 CertId，
+ * 不把读接口返回的证书内容、名称、有效期等回传（回传 Certificate 会被当作要上传的新证书）。
+ */
+function writable(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(writable);
+  if (!v || typeof v !== "object") return v;
+  const o = v as Record<string, unknown>;
+  if (typeof o.CertId === "string") return { CertId: o.CertId };
+  return Object.fromEntries(Object.entries(o).flatMap(([k, x]) => (x === null || x === undefined ? [] : [[k, writable(x)]])));
+}
 
 async function listSpaces(call: Call, region: string): Promise<Space[]> {
   // 只有 Offset / Limit、没有 Total：按名称去重，不足一页或没有新空间即结束
@@ -157,25 +178,59 @@ export const vod: DomainService<AccessKeyCredentials> = {
       const list = https?.CertInfoList?.length ? https.CertInfoList : https?.CertInfo ? [https.CertInfo] : [];
       const certs: CertInfo[] = list
         .filter((c) => c.CertId)
-        .map((c) => compact({ id: c.CertId, commonName: c.CertName, notBefore: seconds(c.EffectiveTime), notAfter: seconds(c.ExpireTime) }));
+        .map((c) =>
+          compact({ id: c.CertId, commonName: c.CertName, notBefore: seconds(c.EffectiveTime), notAfter: seconds(c.ExpireTime), algorithm: algorithmOf(c) }),
+        );
       const fallback = configs[i]?.VodInfo?.Certificate;
       if (certs.length === 0 && fallback?.CertificateId) certs.push(compact({ id: fallback.CertificateId, commonName: fallback.CertificateName }));
       return { on, certs };
     });
     const filled = await completeCerts(ctx, creds, warn, candidates.flatMap((c) => c.certs));
     let next = 0;
+    const grouped = await fillDualAlgorithms(
+      ctx,
+      creds,
+      warn,
+      candidates.map((c) => filled.slice(next, (next += c.certs.length))),
+    );
     return domains.map((d, i) => {
-      const { on, certs } = candidates[i]!;
-      const resolved = filled.slice(next, (next += certs.length));
+      const certs = grouped[i]!;
       return compact({
         provider: "volcengine" as const,
         service: "vod",
         domain: d.domain,
         status: d.cdn?.Status,
-        https: on,
-        cert: on ? earliest(resolved) : undefined,
+        https: candidates[i]!.on,
+        cert: earliest(certs),
+        certs: certs.length > 1 ? certs : undefined,
         extra: compact({ space: d.space.SpaceName, region: d.space.Region, type: d.type, serviceRegion: d.cdn?.ServiceRegion }),
       });
     });
+  },
+  deployer: {
+    unsupported(record) {
+      const { space, region, type } = record.extra ?? {};
+      if (!space || !region || !REGIONS[region] || !type) return "缺少点播空间、地域或域名类型，无法读取域名配置";
+      return ambiguousDual(record) ? AMBIGUOUS_DUAL : undefined;
+    },
+    /**
+     * UpdateVodDomainConfig 按模块整块覆盖：先用 DescribeVodDomainConfig 读出 HTTPS 模块，只换证书（部署时同时打开开关）再写回，
+     * HTTP/2、TLS 版本、强制跳转、HSTS、OCSP 等原样带回。双证书时用 CertInfoList 保留另一张。
+     */
+    async apply(ctx, creds, target, input) {
+      const [record] = target.records;
+      const { space, region, type } = record!.extra as { space: string; region: string; type: string };
+      const call = <T>(action: string, params: Record<string, unknown>) =>
+        callVolc<T>(ctx, creds, { host: REGIONS[region]!, service: "vod", region, version: "2026-01-01", action, method: "POST", params });
+      const keep = target.mode === "update" ? certsToKeep(record!, input.cert.algorithm) : [];
+      if (keep.length > 1) throw new CloudApiError("volcengine", "TooManyCerts", `域名上有 ${keep.length + 1} 张证书，最多支持双证书，未做修改`);
+      const cfg = await call<DomainConfig>("DescribeVodDomainConfig", { SpaceName: space, DomainType: type, DescribeCdnDomainParam: { Domain: record!.domain } });
+      const certId = await input.certId();
+      const ids = [certId, ...keep.map((c) => c.id!)];
+      const { CertInfo: _single, CertInfoList: _dual, ...rest } = writable(cfg.DomainInfo?.DomainConfig?.HTTPS ?? {}) as VodHttps;
+      const HTTPS = { ...rest, Switch: true, ...(ids.length > 1 ? { CertInfoList: ids.map((id) => ({ CertId: id })) } : { CertInfo: { CertId: certId } }) };
+      await call("UpdateVodDomainConfig", { SpaceName: space, DomainType: type, UpdateCdnConfigParam: { Domain: record!.domain, HTTPS } });
+      return { certId };
+    },
   },
 };

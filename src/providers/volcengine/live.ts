@@ -1,12 +1,15 @@
+import type { LocalCert } from "../../deploy/cert.js";
+import { SAME_CERT_TOLERANCE_MS } from "../../deploy/plan.js";
 import type { AccessKeyCredentials } from "../../lib/env.js";
-import type { QueryContext } from "../../lib/http.js";
+import { CloudApiError, type QueryContext } from "../../lib/http.js";
 import { compact } from "../../lib/compact.js";
-import { paginate } from "../../lib/paginate.js";
+import { memo, paginate } from "../../lib/paginate.js";
 import { mapLimit } from "../../lib/pool.js";
 import { toIso } from "../../lib/time.js";
 import type { CertInfo, DomainRecord } from "../../types.js";
 import type { DomainService, Warn } from "../registry.js";
 import { callVolc } from "./client.js";
+import { certName, pemFingerprints } from "./common.js";
 
 interface LiveDomain {
   Domain: string;
@@ -31,6 +34,7 @@ interface LiveCert {
   NotAfter?: string;
   /** OK / Expire / 30days / 15days / 7days / 1days */
   Status?: string;
+  ProjectName?: string;
 }
 
 const PAGE = 1000;
@@ -44,7 +48,7 @@ const STATUS: Record<number, string> = {
   6: "icp-blocked",
 };
 
-const call = <T>(ctx: QueryContext, creds: AccessKeyCredentials, action: string, params: Record<string, number | string>) =>
+const call = <T>(ctx: QueryContext, creds: AccessKeyCredentials, action: string, params: Record<string, unknown>) =>
   callVolc<T>(ctx, creds, { host: "live.volcengineapi.com", service: "live", region: "cn-north-1", version: "2023-01-01", action, method: "POST", params });
 
 const toCert = (c: LiveCert): CertInfo =>
@@ -56,6 +60,38 @@ const toCert = (c: LiveCert): CertInfo =>
     notAfter: toIso(c.NotAfter),
     status: c.Status,
   });
+
+// 控制台标注的证书名称上限
+const CERT_NAME_MAX = 40;
+
+const uploads = memo<QueryContext, string>();
+
+/**
+ * 直播证书管理里与本地证书同一张的证书链 ID；没有就 CreateCert 上传（PEM 在 JSON 请求体里）。
+ * ListCertV2 不给指纹：先按项目与到期时间（48 小时内）筛候选，再逐个用 DescribeCertDetailSecretV2 取证书链比对叶子指纹，
+ * 避免把同域名、同到期时间的另一算法证书当成同一张。证书须与域名所在域名空间同属一个项目。同一次运行内每个项目只处理一次。
+ */
+function liveChainId(ctx: QueryContext, creds: AccessKeyCredentials, cert: LocalCert, project: string): Promise<string> {
+  return uploads(ctx, `${creds.accessKeyId}/${project}/${cert.fingerprint}`, async () => {
+    const list = (await call<{ CertList?: LiveCert[] | null }>(ctx, creds, "ListCertV2", {})).CertList ?? [];
+    const newMs = Date.parse(cert.notAfter);
+    const candidates = list.filter(
+      (c) => c.ChainID && (!c.ProjectName || c.ProjectName === project) && Math.abs(Date.parse(toIso(c.NotAfter) ?? "") - newMs) <= SAME_CERT_TOLERANCE_MS,
+    );
+    for (const c of candidates) {
+      const detail = await call<{ SSL?: { Chain?: string[] | null } | null }>(ctx, creds, "DescribeCertDetailSecretV2", { ChainID: c.ChainID });
+      if (pemFingerprints((detail.SSL?.Chain ?? []).join("\n")).includes(cert.fingerprint)) return c.ChainID!;
+    }
+    const created = await call<{ ChainID?: string }>(ctx, creds, "CreateCert", {
+      CertName: certName(cert, CERT_NAME_MAX),
+      UseWay: "https",
+      ProjectName: project,
+      Rsa: { Pubkey: cert.certPem, Prikey: cert.keyPem },
+    });
+    if (!created.ChainID) throw new CloudApiError("volcengine", "InvalidResponse", "上传证书后视频直播没有返回证书链 ID");
+    return created.ChainID;
+  });
+}
 
 /**
  * 视频直播：ListDomainDetail 列域名（带绑定证书的 ChainID）+ ListCertV2 证书列表按 ChainID 关联。
@@ -101,5 +137,23 @@ export const live: DomainService<AccessKeyCredentials> = {
         extra: compact({ type: d.Type, region: d.Region, vhost: d.Vhost, project: d.ProjectName }),
       });
     });
+  },
+  deployer: {
+    /**
+     * BindCert 的 HTTP/2（默认关）与 TLS 版本范围（默认最低 TLSv1.2）不传即恢复默认，而直播没有能读出这两项当前值的接口，
+     * 所以已开 HTTPS 的拉流域名不能安全地只换证书。推流域名不支持这两项设置，可以更新；没开 HTTPS 的域名点名部署时按默认开启。
+     */
+    unsupported: (record, mode) =>
+      mode === "update" && record.extra?.type !== "push"
+        ? "视频直播换证书的接口会把拉流域名的 HTTP/2 与 TLS 版本恢复默认，且读不到当前设置，无法只替换证书；请在直播控制台的 HTTPS 设置里更换"
+        : undefined,
+    /** 视频直播只能用自己的证书管理（不能直接用证书中心的证书），先上传到直播证书管理再 BindCert 绑定并开启 HTTPS（推流域名即 RTMPS / HTTPS 推流） */
+    async apply(ctx, creds, target, input) {
+      const [record] = target.records;
+      const chainId = await liveChainId(ctx, creds, input.cert, record!.extra?.project || "default");
+      await call(ctx, creds, "BindCert", { Domain: record!.domain, ChainID: chainId, HTTPS: true });
+      if (record!.extra?.type === "push") return { certId: chainId };
+      return { certId: chainId, note: "已开启 HTTPS；HTTP/2 与 TLS 版本为直播默认值（HTTP/2 关闭、最低 TLSv1.2），如需调整请到直播控制台" };
+    },
   },
 };

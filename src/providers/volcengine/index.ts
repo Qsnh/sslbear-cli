@@ -1,7 +1,7 @@
 import { ENV_FAMILIES, readAccessKey, type AccessKeyCredentials } from "../../lib/env.js";
 import { defineProvider } from "../registry.js";
 import { cdn } from "./cdn.js";
-import { listCertCenter } from "./certs.js";
+import { listCertCenter, uploadToCertCenter } from "./certs.js";
 import { dcdn } from "./dcdn.js";
 import { imagex } from "./imagex.js";
 import { live } from "./live.js";
@@ -25,6 +25,8 @@ export const volcengine = defineProvider<AccessKeyCredentials>({
   readCredentials: readAccessKey(ENV_FAMILIES.volcengine),
   services: [cdn, dcdn, tos, vod, live, imagex],
   listCertificates: listCertCenter,
+  // 上传到证书中心；视频直播只能用自己的证书管理，由 live 的 deployer 自行上传
+  uploadCertificate: uploadToCertCenter,
   // CDN / DCDN 未开通的错误码文档未给出，按文案兜底
   isInactive: (code, message) =>
     INACTIVE_CODES.has(code) || /EC 0003-00000003|未开通|subscription not found|not (been )?(opened|activated)/i.test(message),

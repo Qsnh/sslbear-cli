@@ -12,6 +12,8 @@ export interface VolcRequest {
   /** GET 的参数放 query（只能是标量）；POST 的参数为 JSON body，可嵌套 */
   method: "GET" | "POST";
   params?: Record<string, unknown>;
+  /** POST 时额外放在 query 上的参数（如 veImageX 写接口的 ServiceId） */
+  query?: Record<string, string>;
 }
 
 interface VolcEnvelope {
@@ -35,7 +37,7 @@ const TRANSIENT_CODES = new Set(["InternalServiceTimeout"]);
 export async function callVolc<T>(ctx: QueryContext, creds: AccessKeyCredentials, req: VolcRequest): Promise<T> {
   return withRetry(ctx, async () => {
     const params = Object.fromEntries(Object.entries(req.params ?? {}).filter(([, v]) => v !== undefined && v !== ""));
-    const query: Record<string, string> = { Action: req.action, Version: req.version };
+    const query: Record<string, string> = { Action: req.action, Version: req.version, ...req.query };
     let body = "";
     if (req.method === "GET") {
       for (const [k, v] of Object.entries(params)) query[k] = String(v);
