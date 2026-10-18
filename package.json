@@ -1,6 +1,6 @@
 {
   "name": "sslbear-cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "证书熊 CLI：查询并部署 / 更新阿里云、腾讯云、火山引擎、华为云、百度智能云、七牛云云服务上的域名 SSL 证书",
   "type": "module",
   "bin": {
