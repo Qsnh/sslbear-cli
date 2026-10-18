@@ -113,6 +113,21 @@ export async function enrichFromSsl(
   return records;
 }
 
+/**
+ * 实测（2026-10）腾讯云 CDN、COS、点播不接受没有通用名（CN）的证书（如 Let's Encrypt 短期证书，subject 为空、只有 SAN），
+ * 报错却不直说：CDN 报 FailedOperation.CdnConfigError「Https证书内容非法」，COS 报 InvalidDomainCertificate，
+ * 点播只报 FailedOperation。证书没有 CN 且报的是这几种错误时在报错里补上原因（错误码、RequestId 不变）。直播照常接受。
+ */
+export async function explainMissingCn<T>(cert: LocalCert, product: string, codes: readonly string[], fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (e) {
+    if (cert.commonName || !(e instanceof CloudApiError) || !codes.includes(e.code)) throw e;
+    const hint = `该证书没有通用名 CN，实测腾讯云${product}不接受这类证书（如 Let's Encrypt 短期证书），请改用带 CN 的证书`;
+    throw new CloudApiError(e.provider, e.code, `${e.message}（${hint}）`, e.requestId, e.httpStatus);
+  }
+}
+
 /** 上传后在 SSL 证书列表里的备注名：sslbear-<CN，* 换成 _>-<到期日 YYYYMMDD（UTC）> */
 export function certAlias(cert: LocalCert): string {
   const name = (cert.commonName ?? cert.sans[0] ?? "cert").replace(/\*/g, "_");

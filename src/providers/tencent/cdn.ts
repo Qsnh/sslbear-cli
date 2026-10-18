@@ -7,6 +7,7 @@ import type { DomainRecord } from "../../types.js";
 import type { Deployer, DomainService } from "../registry.js";
 import { callTencent } from "./client.js";
 import { asPlatformDomain, isPlatformDomain } from "./platform.js";
+import { explainMissingCn } from "./ssl.js";
 
 interface CdnHttps {
   Switch?: string;
@@ -71,6 +72,9 @@ function httpsWith(current: CdnHttps | null | undefined, certId: string): Record
   });
 }
 
+/** 证书没有 CN 时 CDN 的报错（见 explainMissingCn） */
+const NO_CN_CODES = ["FailedOperation.CdnConfigError"];
+
 const HTTPS_BILLING_OFF =
   "已开启 HTTPS，但该域名的 HTTPS 服务（HttpsBilling）处于关闭状态，HTTPS 请求会被拦截；如需对外提供 HTTPS，请在 CDN 控制台开启 HTTPS 服务（按 HTTPS 请求数计费）";
 
@@ -83,9 +87,11 @@ const HTTPS_BILLING_OFF =
 const deployer: Deployer<TencentCredentials> = {
   async apply(ctx, creds, target, input) {
     const domain = target.records[0]!.domain;
+    const write = (action: string, payload: Record<string, unknown>) =>
+      explainMissingCn(input.cert, " CDN ", NO_CN_CODES, () => call(ctx, creds, action, payload));
     if (target.mode === "update") {
       const certId = await input.certId();
-      await call(ctx, creds, "ModifyDomainConfig", { Domain: domain, Route: "Https.CertInfo.CertId", Value: JSON.stringify({ update: certId }) });
+      await write("ModifyDomainConfig", { Domain: domain, Route: "Https.CertInfo.CertId", Value: JSON.stringify({ update: certId }) });
       return { certId };
     }
     const current = await describeDomain(ctx, creds, domain);
@@ -93,7 +99,7 @@ const deployer: Deployer<TencentCredentials> = {
       throw new CloudApiError("tencent", "HttpsAlreadyEnabled", "该域名的 HTTPS 已开启（与查询时不同），未做修改；请重新执行，按更新规则判断");
     }
     const certId = await input.certId();
-    await call(ctx, creds, "UpdateDomainConfig", { Domain: domain, Https: httpsWith(current.Https, certId) });
+    await write("UpdateDomainConfig", { Domain: domain, Https: httpsWith(current.Https, certId) });
     // HTTPS 服务是计费开关，不替用户打开，只提示
     return { certId, ...(current.HttpsBilling?.Switch === "off" && { note: HTTPS_BILLING_OFF }) };
   },

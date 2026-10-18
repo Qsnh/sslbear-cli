@@ -450,6 +450,60 @@ describe("tencent vod 部署", () => {
   });
 });
 
+describe("tencent 没有通用名（CN）的证书被 CDN / COS / 点播拒绝时说明原因", () => {
+  // 实测（2026-10）Let's Encrypt 短期证书（subject 为空、只有 SAN）：CDN 报「Https证书内容非法」，
+  // COS 报 InvalidDomainCertificate，点播只报 FailedOperation；直播照常接受
+  const NO_CN: LocalCert = { ...ECC, commonName: undefined };
+  const COS_EXTRA = { bucket: "static-1250000000", region: "ap-shanghai", type: "REST" };
+  const COS_ERR =
+    "<Error><Code>InvalidDomainCertificate</Code><Message>The certificate you provided could not parse common name, please check the certificate content</Message><RequestId>req-1</RequestId></Error>";
+  const cdnUpdate = (cert: LocalCert, reply: FakeReply) =>
+    apply("cdn", (req) => (req.action === "ModifyDomainConfig" ? reply : undefined), { mode: "update", records: [rec("cdn", "www.example.com")] }, inputOf(cert));
+
+  it("cdn update：FailedOperation.CdnConfigError 时补上原因，错误码与 RequestId 不变", async () => {
+    const { result } = cdnUpdate(NO_CN, tcError("FailedOperation.CdnConfigError", "Https证书内容非法"));
+    const err = await result.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CloudApiError);
+    expect(err).toMatchObject({ provider: "tencent", code: "FailedOperation.CdnConfigError", requestId: "rid-err" });
+    expect((err as Error).message).toMatch(/^Https证书内容非法（.*通用名.*CN.*CDN.*）$/);
+  });
+
+  it("cdn deploy：UpdateDomainConfig 被拒时同样补上原因", async () => {
+    const { result } = apply(
+      "cdn",
+      (req) => {
+        if (req.action === "DescribeDomainsConfig") return ok({ TotalNumber: 1, Domains: [{ Domain: "www.example.com", Https: { Switch: "off" } }] });
+        return req.action === "UpdateDomainConfig" ? tcError("FailedOperation.CdnConfigError", "Https证书内容非法") : undefined;
+      },
+      { mode: "deploy", records: [rec("cdn", "www.example.com", { https: false })] },
+      inputOf(NO_CN),
+    );
+    await expect(result).rejects.toMatchObject({ code: "FailedOperation.CdnConfigError", message: expect.stringContaining("通用名") });
+  });
+
+  it("cos：InvalidDomainCertificate 时补上原因", async () => {
+    const { result } = apply("cos", () => ({ status: 400, body: COS_ERR }), { mode: "update", records: [rec("cos", "img.example.com", { extra: COS_EXTRA })] }, inputOf(NO_CN));
+    await expect(result).rejects.toMatchObject({ code: "InvalidDomainCertificate", requestId: "req-1", httpStatus: 400, message: expect.stringContaining("通用名") });
+  });
+
+  it("vod：FailedOperation 时补上原因", async () => {
+    const { result } = apply(
+      "vod",
+      (req) => (req.action === "SetVodDomainCertificate" ? tcError("FailedOperation", "failed operation") : undefined),
+      { mode: "deploy", records: [rec("vod", "v.example.com", { https: false, extra: { type: "VOD", subAppId: "1500000002" } })] },
+      inputOf(NO_CN),
+    );
+    await expect(result).rejects.toMatchObject({ code: "FailedOperation", message: expect.stringMatching(/^failed operation（.*通用名.*点播.*）$/) });
+  });
+
+  it("证书有 CN、或是其他错误码时原样抛出", async () => {
+    const withCn = await cdnUpdate(ECC, tcError("FailedOperation.CdnConfigError", "Https证书内容非法")).result.catch((e: unknown) => e);
+    expect(withCn).toMatchObject({ code: "FailedOperation.CdnConfigError", message: "Https证书内容非法" });
+    const other = await cdnUpdate(NO_CN, tcError("UnauthorizedOperation.CdnCamUnauthorized", "no permission")).result.catch((e: unknown) => e);
+    expect(other).toMatchObject({ code: "UnauthorizedOperation.CdnCamUnauthorized", message: "no permission" });
+  });
+});
+
 describe("tencent 经编排层部署（planDeploy + executeDeploy）", () => {
   const WRITES = new Set(["UploadCertificate", "ModifyDomainConfig", "UpdateDomainConfig", "ModifyLiveDomainCertBindings"]);
   const route = (req: FakeRequest): FakeReply => {

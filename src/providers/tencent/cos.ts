@@ -8,7 +8,7 @@ import { xmlBlocks, xmlText } from "../../lib/xml.js";
 import type { DomainRecord } from "../../types.js";
 import type { Deployer, DomainService, Warn } from "../registry.js";
 import { cosAuthorization, cosEncode } from "./sign.js";
-import { enrichFromSsl } from "./ssl.js";
+import { enrichFromSsl, explainMissingCn } from "./ssl.js";
 
 /** GET Service 发到这个 host 返回账号下所有地域的 bucket */
 const SERVICE_HOST = "service.cos.myqcloud.com";
@@ -169,7 +169,9 @@ const deployer: Deployer<TencentCredentials> = {
     const body =
       `<DomainCertificate><CertificateInfo><CertType>CustomCert</CertType><CustomCert><CertId>${xmlEscape(certId)}</CertId></CustomCert></CertificateInfo>` +
       `<DomainList><DomainName>${xmlEscape(record.domain)}</DomainName></DomainList></DomainCertificate>`;
-    await cosRequest(ctx, creds, "PUT", bucketHost({ name: bucket, region }), { domaincertificate: "" }, body);
+    await explainMissingCn(input.cert, " COS ", ["InvalidDomainCertificate"], () =>
+      cosRequest(ctx, creds, "PUT", bucketHost({ name: bucket, region }), { domaincertificate: "" }, body),
+    );
     return { certId };
   },
 };
