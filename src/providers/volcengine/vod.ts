@@ -7,7 +7,7 @@ import type { CertInfo, DomainRecord } from "../../types.js";
 import type { DomainService, Warn } from "../registry.js";
 import { completeCerts, fillDualAlgorithms } from "./certs.js";
 import { callVolc } from "./client.js";
-import { AMBIGUOUS_DUAL, HTTPS_UNKNOWN, ambiguousCerts, ambiguousDual, certsToKeep, earliest, httpsAlreadyEnabled, pemAlgorithm } from "./common.js";
+import { AMBIGUOUS_DUAL, HTTPS_UNKNOWN, ambiguousCerts, ambiguousDual, certsToKeep, earliest, explainNoCommonName, httpsAlreadyEnabled, pemAlgorithm } from "./common.js";
 
 /** 点播按地域部署，空间与域名要到空间所在地域的 endpoint 查；柔佛仅对企业用户开放 */
 const REGIONS: Record<string, string> = {
@@ -239,7 +239,9 @@ export const vod: DomainService<AccessKeyCredentials> = {
       const ids = [certId, ...keep.map((c) => c.id!)];
       const { CertInfo: _single, CertInfoList: _dual, ...rest } = writable(cfg.DomainInfo?.DomainConfig?.HTTPS ?? {}) as VodHttps;
       const HTTPS = { ...rest, Switch: true, ...(ids.length > 1 ? { CertInfoList: ids.map((id) => ({ CertId: id })) } : { CertInfo: { CertId: certId } }) };
-      await call("UpdateVodDomainConfig", { SpaceName: space, DomainType: type, UpdateCdnConfigParam: { Domain: record!.domain, HTTPS } });
+      await call("UpdateVodDomainConfig", { SpaceName: space, DomainType: type, UpdateCdnConfigParam: { Domain: record!.domain, HTTPS } }).catch((e) => {
+        throw explainNoCommonName(e, input.cert, "视频点播", ["InternalError.CdnDomainSystemError"]);
+      });
       return { certId };
     },
   },

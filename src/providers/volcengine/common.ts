@@ -87,3 +87,19 @@ export function httpsAlreadyEnabled(): CloudApiError {
 
 /** 查询失败（已记 issue）导致无法判断域名是否开着 HTTPS / 绑着哪张证书时，在 extra 里打的标记；编排层据此不做任何写操作 */
 export const HTTPS_UNKNOWN = { httpsUnknown: "true" } as const;
+
+/**
+ * 实测 CDN、点播、视频直播不接受没有通用名（subject CN）的证书（如 Let's Encrypt 短期证书、tlsserver 配置文件的证书），
+ * 报的是笼统的参数 / 系统错误（CDN「参数校验错误」、点播 CdnDomainSystemError、直播 CreateCert「db error」）；
+ * 全站加速、TOS 接受。证书没有 CN 且错误码是这几种时，在错误信息里说明原因，错误码、RequestId 不变。
+ */
+export function explainNoCommonName(e: unknown, cert: LocalCert, product: string, codes: readonly string[]): unknown {
+  if (cert.commonName || !(e instanceof CloudApiError) || !codes.includes(e.code)) return e;
+  return new CloudApiError(
+    e.provider,
+    e.code,
+    `火山引擎${product}不接受没有通用名（CN）的证书（如 Let's Encrypt 的短期证书），请改用带通用名的证书；原始信息：${e.message}`,
+    e.requestId,
+    e.httpStatus,
+  );
+}
