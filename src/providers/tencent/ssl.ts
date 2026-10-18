@@ -120,16 +120,21 @@ export function certAlias(cert: LocalCert): string {
 }
 
 /**
- * 上传证书到 SSL 证书服务。Repeatable=false 时服务端按指纹查重：已有同一张证书则不新建，
- * 在 RepeatCertId 里返回已有证书的 ID（CertificateId 为空），所以不必先拉证书列表比对。
- * 查重以指纹为准，只会复用确定的同一张证书；callTencent 超时 / 限流后原样重发也不会重复建证书
- * （首次其实已建成时，重发命中 RepeatCertId，reused 报为 true）。
+ * 上传证书到 SSL 证书服务。Repeatable=false 时服务端按指纹查重：已有同一张证书则不新建，直接返回已有证书的 ID，
+ * 查重以指纹为准，只会复用确定的同一张证书；callTencent 超时 / 限流后原样重发也不会重复建证书。
+ * 文档说重复时 ID 放在 RepeatCertId，实测（2026-10）RepeatCertId 为空、CertificateId 直接就是已有证书的 ID，
+ * 所以是否复用按上传前的证书列表判断（查询阶段补全证书信息时多半已拉过，同一次命令内只拉一次）；
+ * 列表拉取失败（如没有 SSL 只读权限）时无法判断，按新上传报告。
  */
 export async function uploadSslCertificate(
   ctx: QueryContext,
   creds: TencentCredentials,
   cert: LocalCert,
 ): Promise<{ id: string; reused: boolean }> {
+  const existing = await listSslCertificates(ctx, creds).then(
+    (certs) => new Set(certs.map((c) => c.id)),
+    () => undefined,
+  );
   const res = await callTencent<{ CertificateId?: string | null; RepeatCertId?: string | null; RequestId?: string }>(ctx, creds, {
     service: "ssl",
     version: "2019-12-05",
@@ -143,6 +148,6 @@ export async function uploadSslCertificate(
     },
   });
   if (res.RepeatCertId) return { id: res.RepeatCertId, reused: true };
-  if (res.CertificateId) return { id: res.CertificateId, reused: false };
+  if (res.CertificateId) return { id: res.CertificateId, reused: existing?.has(res.CertificateId) ?? false };
   throw new CloudApiError("tencent", "InvalidResponse", "上传证书的响应里没有证书 ID", res.RequestId);
 }
