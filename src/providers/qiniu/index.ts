@@ -1,7 +1,7 @@
 import { ENV_FAMILIES, readAccessKey, type AccessKeyCredentials } from "../../lib/env.js";
 import { defineProvider } from "../registry.js";
 import { cdn } from "./cdn.js";
-import { listSslCertificates } from "./ssl.js";
+import { listSslCertificates, uploadSslCertificate } from "./ssl.js";
 
 export const qiniu = defineProvider<AccessKeyCredentials>({
   provider: "qiniu",
@@ -9,6 +9,7 @@ export const qiniu = defineProvider<AccessKeyCredentials>({
   readCredentials: readAccessKey(ENV_FAMILIES.qiniu),
   services: [cdn],
   listCertificates: listSslCertificates,
+  uploadCertificate: uploadSslCertificate,
   // 七牛 CDN 无需单独开通（没有对应错误码），账号下没有域名时列表为空
   isInactive: () => false,
 });

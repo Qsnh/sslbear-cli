@@ -48,34 +48,61 @@ function toError(status: number, body: QiniuError | undefined, text: string): Cl
   return new CloudApiError("qiniu", raw ?? `HTTP${status}`, message, undefined, status);
 }
 
+export interface QiniuRequest {
+  method?: "GET" | "POST" | "PUT";
+  /** 按 JSON 发送的请求体（私钥、证书等只放在请求体里，不上 URL） */
+  body?: unknown;
+  /** 默认对限流、超时等自动重试；非幂等的写接口（上传证书）传 false，由调用方查重后自行重试 */
+  retry?: boolean;
+}
+
 /**
- * 以 GET 调用七牛管理接口：api.qiniu.com 用 Qiniu 鉴权（签 X-Qiniu-Date 防重放），
- * fusion.qiniuapi.com 用 QBox 鉴权。pathWithQuery 需已编码，签名与实际请求用同一个串。
+ * 调用七牛管理接口：api.qiniu.com 用 Qiniu 鉴权（签 X-Qiniu-Date 防重放，JSON 请求体参与签名），
+ * fusion.qiniuapi.com 用 QBox 鉴权（只签路径 + query，JSON 请求体不参与）。
+ * pathWithQuery 需已编码，签名与实际请求用同一个串。
  */
-export async function qiniuGet<T>(ctx: QueryContext, creds: AccessKeyCredentials, host: string, pathWithQuery: string): Promise<T> {
-  return withRetry(ctx, async () => {
+export async function qiniuRequest<T>(
+  ctx: QueryContext,
+  creds: AccessKeyCredentials,
+  host: string,
+  pathWithQuery: string,
+  req: QiniuRequest = {},
+): Promise<T> {
+  const method = req.method ?? "GET";
+  const body = req.body === undefined ? undefined : JSON.stringify(req.body);
+  const once = async () => {
     await pace(ctx);
     const keys = { accessKey: creds.accessKeyId, secretKey: creds.secretAccessKey };
-    let headers: Record<string, string>;
+    const headers: Record<string, string> = {};
     if (host === FUSION_HOST) {
-      headers = { Authorization: qboxAuthorization({ ...keys, pathWithQuery }) };
+      if (body !== undefined) headers["Content-Type"] = "application/json";
+      headers.Authorization = qboxAuthorization({ ...keys, pathWithQuery });
     } else {
       // 与官方 SDK 一致：GET 也显式带上表单 Content-Type 并参与签名
-      headers = { "Content-Type": "application/x-www-form-urlencoded", "X-Qiniu-Date": qiniuDate(new Date()) };
-      headers.Authorization = qiniuAuthorization({ ...keys, method: "GET", host, pathWithQuery, contentType: headers["Content-Type"]!, headers });
+      const contentType = body === undefined ? "application/x-www-form-urlencoded" : "application/json";
+      Object.assign(headers, { "Content-Type": contentType, "X-Qiniu-Date": qiniuDate(new Date()) });
+      headers.Authorization = qiniuAuthorization({ ...keys, method, host, pathWithQuery, contentType, headers, ...(body !== undefined && { body }) });
     }
-    const raw = await send(ctx, "qiniu", `https://${host}${pathWithQuery}`, { method: "GET", headers });
-    let body: (QiniuError & T) | undefined;
+    const raw = await send(ctx, "qiniu", `https://${host}${pathWithQuery}`, { method, headers, ...(body !== undefined && { body }) });
+    // 写接口成功时可能不带响应体（查询接口仍按非法响应处理，免得把异常当成空列表）
+    if (method !== "GET" && raw.status < 400 && raw.text.trim() === "") return {} as T;
+    let parsed: (QiniuError & T) | undefined;
     try {
-      body = JSON.parse(raw.text);
+      parsed = JSON.parse(raw.text);
     } catch {
       // 路径不存在等网关错误返回纯文本
       if (raw.status >= 400) throw toError(raw.status, undefined, raw.text);
       throw new CloudApiError("qiniu", "InvalidResponse", `响应不是合法 JSON（HTTP ${raw.status}）：${raw.text.slice(0, 200)}`, undefined, raw.status);
     }
-    if (raw.status >= 400 || !isSuccessCode(body?.code)) throw toError(raw.status, body, raw.text);
-    return body as T;
-  });
+    if (raw.status >= 400 || !isSuccessCode(parsed?.code)) throw toError(raw.status, parsed, raw.text);
+    return parsed as T;
+  };
+  return req.retry === false ? once() : withRetry(ctx, once);
+}
+
+/** 以 GET 调用七牛管理接口，见 qiniuRequest */
+export function qiniuGet<T>(ctx: QueryContext, creds: AccessKeyCredentials, host: string, pathWithQuery: string): Promise<T> {
+  return qiniuRequest<T>(ctx, creds, host, pathWithQuery);
 }
 
 const MAX_PAGES = 1000;
