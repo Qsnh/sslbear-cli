@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { loadLocalCert, type LocalCert } from "../src/deploy/cert.js";
 import { executeDeploy, planDeploy } from "../src/deploy/run.js";
-import { CloudApiError, type QueryContext } from "../src/lib/http.js";
+import { CloudApiError, isRetryable, type QueryContext } from "../src/lib/http.js";
 import { certName, keyAlgorithm, pemAlgorithm } from "../src/providers/volcengine/common.js";
 import { volcengine } from "../src/providers/volcengine/index.js";
 import type { DeployInput, DeployTarget } from "../src/providers/registry.js";
@@ -107,6 +107,36 @@ describe("volcengine uploadCertificate（证书中心）", () => {
   it("响应里既没有 InstanceId 也没有 RepeatId 时报错", async () => {
     const { ctx } = setup(() => ok({}));
     await expect(volcengine.uploadCertificate!(ctx, CREDS, RSA)).rejects.toMatchObject({ code: "InvalidResponse" });
+  });
+});
+
+describe("volcengine 繁忙类错误可重试", () => {
+  it("证书中心 SystemBusy 自动重试（ImportCertificate 不允许重复上传，服务端按指纹查重，重发安全）", async () => {
+    let n = 0;
+    const { fetch, ctx } = setup((req) =>
+      req.action === "ImportCertificate" ? (n++ === 0 ? volcError("SystemBusy", "system is busy, please try again later", 500) : ok({ InstanceId: "cert-up" })) : undefined,
+    );
+    expect(await volcengine.uploadCertificate!(ctx, CREDS, RSA)).toEqual({ id: "cert-up", reused: false });
+    expect(fetch.calls).toHaveLength(2);
+  });
+
+  it("DCDN DomainIsBusy 自动重试，一直繁忙时结果标为可重试", async () => {
+    let n = 0;
+    const once = setup((req) => (req.action === "CreateCertBind" ? (n++ === 0 ? volcError("DomainIsBusy", "domain is busy", 400) : ok({})) : undefined));
+    await deployer("dcdn").apply(once.ctx, CREDS, target(rec("dcdn", "a.example.com", { cert: { id: "cert-old" } })), input());
+    expect(once.fetch.calls).toHaveLength(2);
+
+    const { ctx } = setup((req) => {
+      if (req.action === "ListDomainConfig") {
+        return ok({ Total: 1, DomainList: [{ Domain: "a.example.com", Https: { EnableHttps: true, CertBind: { CertId: "cert-old", Expire: "2026-10-25T00:00:00Z" } } }] });
+      }
+      if (req.action === "ImportCertificate") return ok({ InstanceId: "cert-new" });
+      if (req.action === "CreateCertBind") return volcError("DomainIsBusy", "domain is busy", 400);
+      return undefined;
+    });
+    const plan = await planDeploy(ctx, RSA, { providers: ["volcengine"], services: ["dcdn"], force: false, dryRun: false });
+    const report = await executeDeploy(ctx, RSA, plan);
+    expect(report.results).toEqual([expect.objectContaining({ domain: "a.example.com", action: "failed", code: expect.stringContaining("DomainIsBusy"), retryable: true })]);
   });
 });
 
@@ -229,16 +259,123 @@ describe("volcengine cdn 部署", () => {
 });
 
 describe("volcengine dcdn 部署", () => {
-  it("更新 / 部署都用 CreateCertBind 绑定证书中心证书（绑定即开启 HTTPS）", async () => {
-    const { fetch, ctx } = setup((req) => (req.action === "CreateCertBind" ? ok({}) : undefined));
+  /**
+   * 有状态的假 DCDN：bindWorks / enableWorks 控制 CreateCertBind 是否真的换了证书、UpdateDomainConfig 是否真的开了 HTTPS，
+   * DescribeDomainDetail 读回当前状态
+   */
+  function dcdnState(https: Record<string, unknown>, o: { bindWorks?: boolean; enableWorks?: boolean } = {}) {
+    const state = { https: structuredClone(https) };
+    const route = (req: FakeRequest): FakeReply => {
+      if (req.url.host !== "open.volcengineapi.com") return undefined;
+      if (req.action === "CreateCertBind") {
+        if (o.bindWorks ?? true) state.https.CertBind = { ...(state.https.CertBind as object), CertId: req.json?.CertId, DeployStatus: "Deploying" };
+        return ok({});
+      }
+      if (req.action === "DescribeDomainDetail") return ok({ Domain: req.json?.Domain, Status: "Started", Https: state.https });
+      if (req.action === "UpdateDomainConfig") {
+        if (o.enableWorks ?? true) state.https = structuredClone(req.json?.Https as Record<string, unknown>);
+        return { body: { ResponseMetadata: { RequestId: "rid" } } };
+      }
+      return undefined;
+    };
+    return { state, route };
+  }
+
+  it("更新：只用 CreateCertBind 换证书，不读回", async () => {
+    const { fetch, ctx } = setup(dcdnState({ EnableHttps: true, CertBind: { CertSource: "volc", CertId: "cert-old" } }).route);
     const out = await deployer("dcdn").apply(ctx, CREDS, target(rec("dcdn", "a.example.com", { cert: { id: "cert-old" } })), input());
     expect(out).toEqual({ certId: "cert-new" });
-    await deployer("dcdn").apply(ctx, CREDS, target(rec("dcdn", "b.example.com", { https: false })), input());
-    const [update, deploy] = fetch.calls;
-    expect(update!.url.href).toBe("https://open.volcengineapi.com/?Action=CreateCertBind&Version=2021-04-01");
-    expect(update!.headers.authorization).toMatch(/\/cn-north-1\/dcdn\/request, /);
-    expect(update!.json).toEqual({ CertSource: "volc", CertId: "cert-new", DomainNames: ["a.example.com"] });
-    expect(deploy!.json).toEqual({ CertSource: "volc", CertId: "cert-new", DomainNames: ["b.example.com"] });
+    expect(fetch.calls).toHaveLength(1);
+    const [bind] = fetch.calls;
+    expect(bind!.url.href).toBe("https://open.volcengineapi.com/?Action=CreateCertBind&Version=2021-04-01");
+    expect(bind!.headers.authorization).toMatch(/\/cn-north-1\/dcdn\/request, /);
+    expect(bind!.json).toEqual({ CertSource: "volc", CertId: "cert-new", DomainNames: ["a.example.com"] });
+  });
+
+  it("部署：CreateCertBind 后用 DescribeDomainDetail 读回，HTTPS 已开启且绑的是新证书即成功", async () => {
+    const { fetch, ctx } = setup(dcdnState({ EnableHttps: true, Http2: false }).route);
+    const out = await deployer("dcdn").apply(ctx, CREDS, target(rec("dcdn", "b.example.com", { https: false })), input());
+    expect(out).toEqual({ certId: "cert-new" });
+    expect(fetch.calls.map((c) => c.action)).toEqual(["CreateCertBind", "DescribeDomainDetail"]);
+    const read = fetch.calls[1]!;
+    expect(read.url.href).toBe("https://open.volcengineapi.com/?Action=DescribeDomainDetail&Version=2021-04-01");
+    expect(read.json).toEqual({ Domain: "b.example.com" });
+  });
+
+  it("部署：bound-off 域名绑定后 HTTPS 仍关闭时，UpdateDomainConfig 带回整个 Https 模块、只把 EnableHttps 改为 true，再读回确认", async () => {
+    const https = {
+      EnableHttps: false,
+      Http2: true,
+      Hsts: { Enable: false, MaxAge: 0, IncludeSubDomain: false },
+      TlsVersions: { Enable: true, TlsVersion: ["TLSv1.2", "TLSv1.3"] },
+      CertBind: { CertSource: "volc", CertId: "cert-new", CertName: "sslbear", DomainName: "c.example.com", DomainId: "accdomain-1", Expire: "2027-01-01T00:00:00Z", DeployStatus: "Deployed" },
+      ForceRedirect: { Enable: true, RedirectType: "https", RedirectCode: 302 },
+      QUICSwitch: false,
+      OCSPStapling: true,
+      HTTPSClientCert: null,
+    };
+    const { fetch, ctx } = setup(dcdnState(https).route);
+    const out = await deployer("dcdn").apply(ctx, CREDS, target(rec("dcdn", "c.example.com", { https: false })), input());
+    expect(out).toEqual({ certId: "cert-new" });
+    expect(fetch.calls.map((c) => c.action)).toEqual(["CreateCertBind", "DescribeDomainDetail", "UpdateDomainConfig", "DescribeDomainDetail"]);
+    const update = fetch.calls[2]!;
+    expect(update.url.href).toBe("https://open.volcengineapi.com/?Action=UpdateDomainConfig&Version=2023-01-01");
+    expect(update.headers.authorization).toMatch(/\/cn-north-1\/dcdn\/request, /);
+    // 只改 EnableHttps；其他字段原样带回（null 不回传，证书的部署状态是只读字段不回传）
+    expect(update.json).toEqual({
+      Domain: "c.example.com",
+      Https: {
+        EnableHttps: true,
+        Http2: true,
+        Hsts: { Enable: false, MaxAge: 0, IncludeSubDomain: false },
+        TlsVersions: { Enable: true, TlsVersion: ["TLSv1.2", "TLSv1.3"] },
+        CertBind: { CertSource: "volc", CertId: "cert-new", CertName: "sslbear", DomainName: "c.example.com", DomainId: "accdomain-1", Expire: "2027-01-01T00:00:00Z" },
+        ForceRedirect: { Enable: true, RedirectType: "https", RedirectCode: 302 },
+        QUICSwitch: false,
+        OCSPStapling: true,
+      },
+    });
+  });
+
+  it("部署：读回没有 EnableHttps 字段时同样视为未确认，开启后再核对", async () => {
+    const { fetch, ctx } = setup(dcdnState({ CertBind: { CertSource: "volc", CertId: "cert-x" } }).route);
+    await deployer("dcdn").apply(ctx, CREDS, target(rec("dcdn", "d.example.com", { https: false })), input());
+    expect(fetch.calls.map((c) => c.action)).toEqual(["CreateCertBind", "DescribeDomainDetail", "UpdateDomainConfig", "DescribeDomainDetail"]);
+    expect((fetch.calls[2]!.json as any).Https).toEqual({ EnableHttps: true, CertBind: { CertSource: "volc", CertId: "cert-new" } });
+  });
+
+  it("部署：开启后读回仍未开启时报错，不算部署成功", async () => {
+    const { ctx } = setup(dcdnState({ EnableHttps: false, CertBind: { CertSource: "volc", CertId: "cert-new" } }, { enableWorks: false }).route);
+    await expect(deployer("dcdn").apply(ctx, CREDS, target(rec("dcdn", "c.example.com", { https: false })), input())).rejects.toMatchObject({
+      code: "HttpsNotEnabled",
+      message: expect.stringMatching(/HTTPS/),
+    });
+  });
+
+  it("部署：读回绑定的不是新证书时报错，不去改开关", async () => {
+    const { fetch, ctx } = setup(dcdnState({ EnableHttps: false, CertBind: { CertSource: "volc", CertId: "cert-old" } }, { bindWorks: false }).route);
+    await expect(deployer("dcdn").apply(ctx, CREDS, target(rec("dcdn", "c.example.com", { https: false })), input())).rejects.toMatchObject({
+      code: "CertBindUnconfirmed",
+      message: expect.stringContaining("cert-old"),
+    });
+    expect(fetch.calls.some((c) => c.action === "UpdateDomainConfig")).toBe(false);
+  });
+
+  it("planDeploy + executeDeploy：点名的 bound-off 域名开不了 HTTPS 时记为失败，不报 deployed", async () => {
+    const dcdn = dcdnState({ EnableHttps: false, CertBind: { CertSource: "volc", CertId: "cert-new" } }, { enableWorks: false });
+    const { fetch, ctx } = setup((req) => {
+      if (req.action === "ListDomainConfig") {
+        return ok({ Total: 1, DomainList: [{ Domain: "off.example.com", Status: "Started", Https: { EnableHttps: false, CertBind: { CertId: "cert-new", Expire: "2027-01-01T00:00:00Z" } } }] });
+      }
+      if (req.action === "ImportCertificate") return ok({ InstanceId: "", RepeatId: "cert-new" });
+      return dcdn.route(req);
+    });
+    const opts = { providers: ["volcengine" as const], services: ["dcdn"], domains: ["off.example.com"], force: false, dryRun: false };
+    const plan = await planDeploy(ctx, RSA, opts);
+    expect(plan.report.results).toEqual([expect.objectContaining({ domain: "off.example.com", action: "would_deploy" })]);
+    const report = await executeDeploy(ctx, RSA, plan);
+    expect(report.results).toEqual([expect.objectContaining({ domain: "off.example.com", action: "failed", code: "HttpsNotEnabled" })]);
+    expect(fetch.calls.filter((c) => c.action === "UpdateDomainConfig")).toHaveLength(1);
   });
 
   it("返回 Success=false 时报错", async () => {
@@ -281,6 +418,23 @@ describe("volcengine tos 部署", () => {
     const { fetch, ctx } = setup(route);
     await deployer("tos").apply(ctx, CREDS, target(rec("tos", "http.example.com", { https: false, extra })), input());
     expect(fetch.calls[1]!.json).toEqual({ CustomDomainRule: { Domain: "http.example.com", CertId: "cert-new", Protocol: "tos" } });
+  });
+
+  it("部署时读到该域名其实已绑定可用的证书（HTTPS 已开启）：不写入、不上传", async () => {
+    const { fetch, ctx } = setup(route);
+    const inp = input();
+    await expect(deployer("tos").apply(ctx, CREDS, target(rec("tos", "www.example.com", { https: false, extra }), "deploy"), inp)).rejects.toMatchObject({
+      code: "HttpsAlreadyEnabled",
+    });
+    expect(fetch.calls.filter((c) => c.method === "PUT")).toHaveLength(0);
+    expect(inp.uploads()).toBe(0);
+  });
+
+  it("部署时绑的证书已不可用（CertNotExist）照常视为未开启，换绑新证书", async () => {
+    const gone = [{ Domain: "gone.example.com", Forbidden: false, CertId: "cert-gone", Protocol: "tos", CertStatus: "CertNotExist" }];
+    const { fetch, ctx } = setup((req) => (req.method === "GET" && req.url.host === "b1.tos-cn-shanghai.volces.com" ? { body: { CustomDomainRules: gone } } : route(req)));
+    await deployer("tos").apply(ctx, CREDS, target(rec("tos", "gone.example.com", { https: false, extra }), "deploy"), input());
+    expect(fetch.calls.find((c) => c.method === "PUT")!.json).toEqual({ CustomDomainRule: { Domain: "gone.example.com", CertId: "cert-new", Protocol: "tos" } });
   });
 
   it("桶上已没有该域名时报错，不新建域名", async () => {
@@ -378,6 +532,16 @@ describe("volcengine vod 部署", () => {
     });
   });
 
+  it("部署时读到 HTTPS 开关其实已打开：不写入、不上传", async () => {
+    const { fetch, ctx } = setup(routes({ Switch: true, CertInfo: { CertId: "cert-other" } }));
+    const inp = input();
+    await expect(deployer("vod").apply(ctx, CREDS, target(rec("vod", "v.example.com", { https: false, extra })), inp)).rejects.toMatchObject({
+      code: "HttpsAlreadyEnabled",
+    });
+    expect(fetch.calls.map((c) => c.action)).toEqual(["DescribeVodDomainConfig"]);
+    expect(inp.uploads()).toBe(0);
+  });
+
   it("双证书只换同算法那张，用 CertInfoList 保留另一张", async () => {
     const { fetch, ctx } = setup(
       routes({ Switch: true, CertInfo: null, CertInfoList: [{ CertId: "cert-rsa", EncryType: "inter_cert" }, { CertId: "cert-ecc", EncryType: "inter_cert" }], HTTP2: true }),
@@ -461,6 +625,60 @@ describe("volcengine live 部署", () => {
     expect(fetch.calls.find((c) => c.action === "BindCert")!.json).toEqual({ Domain: "pull.example.com", ChainID: "chain-rsa", HTTPS: true });
   });
 
+  describe("CreateCert 不幂等：只发一次，可重试的错误后重新拉列表查重", () => {
+    const pull = rec("live", "pull.example.com", { https: false, extra: { type: "pull-flv", project: "default" } });
+    const timeout = () => volcError("InternalServiceTimeout", "Internal Service is timeout");
+
+    it("上一次其实已传成功：重新拉 ListCertV2（不用缓存）按指纹找到后复用，不再上传", async () => {
+      const list: unknown[] = [];
+      const base = routes(list, { "chain-created": RSA });
+      const { fetch, ctx } = setup((req) => {
+        if (req.action === "CreateCert") {
+          // 服务端已建好证书，但响应超时
+          list.push({ ChainID: "chain-created", NotAfter: RSA.notAfter, ProjectName: "default" });
+          return timeout();
+        }
+        return base(req);
+      });
+      const out = await deployer("live").apply(ctx, CREDS, target(pull), input(RSA));
+      expect(out.certId).toBe("chain-created");
+      expect(fetch.calls.filter((c) => c.action === "CreateCert")).toHaveLength(1);
+      expect(fetch.calls.filter((c) => c.action === "ListCertV2")).toHaveLength(2);
+      expect(fetch.calls.find((c) => c.action === "BindCert")!.json).toEqual({ Domain: "pull.example.com", ChainID: "chain-created", HTTPS: true });
+    });
+
+    it("查重没找到才再传一次", async () => {
+      let n = 0;
+      const base = routes();
+      const { fetch, ctx } = setup((req) => (req.action === "CreateCert" && n++ === 0 ? timeout() : base(req)));
+      expect((await deployer("live").apply(ctx, CREDS, target(pull), input(RSA))).certId).toBe("chain-new");
+      expect(fetch.calls.filter((c) => c.action).map((c) => c.action)).toEqual(["ListCertV2", "CreateCert", "ListCertV2", "CreateCert", "BindCert"]);
+    });
+
+    it("一直失败时最多 3 轮，错误仍标为可重试", async () => {
+      const base = routes();
+      const { fetch, ctx } = setup((req) => (req.action === "CreateCert" ? timeout() : base(req)));
+      const e = await deployer("live").apply(ctx, CREDS, target(pull), input(RSA)).catch((x) => x);
+      expect(isRetryable(e)).toBe(true);
+      expect(fetch.calls.filter((c) => c.action === "CreateCert")).toHaveLength(3);
+      expect(fetch.calls.filter((c) => c.action === "ListCertV2")).toHaveLength(3);
+      expect(fetch.calls.some((c) => c.action === "BindCert")).toBe(false);
+    });
+
+    it("不可重试的错误只发一次", async () => {
+      const base = routes();
+      const { fetch, ctx } = setup((req) => (req.action === "CreateCert" ? volcError("InvalidParameter", "bad cert", 400) : base(req)));
+      await expect(deployer("live").apply(ctx, CREDS, target(pull), input(RSA))).rejects.toMatchObject({ code: "InvalidParameter" });
+      expect(fetch.calls.filter((c) => c.action === "CreateCert")).toHaveLength(1);
+    });
+
+    it("候选证书的详情查不到（拿不到指纹）时按不是同一张处理，照常上传", async () => {
+      const { fetch, ctx } = setup(routes([{ ChainID: "chain-gone", NotAfter: RSA.notAfter, ProjectName: "default" }]));
+      expect((await deployer("live").apply(ctx, CREDS, target(pull), input(RSA))).certId).toBe("chain-new");
+      expect(fetch.calls.filter((c) => c.action === "CreateCert")).toHaveLength(1);
+    });
+  });
+
   it("同一次运行内同一项目只上传一次", async () => {
     const { fetch, ctx } = setup(routes());
     const a = rec("live", "a.example.com", { https: false, extra: { type: "pull-flv", project: "default" } });
@@ -542,6 +760,20 @@ describe("volcengine imagex 部署", () => {
     });
   });
 
+  it("部署时读到 HTTPS 其实已开启：不写入、不上传", async () => {
+    const { fetch, ctx } = setup((req) => {
+      if (req.action === "GetDomainConfig") return ok({ https_config: { enable_https: true, cert_id: "cert-other" } });
+      if (req.action === "UpdateHttps") return ok({});
+      return undefined;
+    });
+    const inp = input();
+    await expect(deployer("imagex").apply(ctx, CREDS, target(rec("imagex", "img.example.com", { https: false, extra })), inp)).rejects.toMatchObject({
+      code: "HttpsAlreadyEnabled",
+    });
+    expect(fetch.calls.map((c) => c.action)).toEqual(["GetDomainConfig"]);
+    expect(inp.uploads()).toBe(0);
+  });
+
   it("部署时原先开着强制跳转 HTTPS 的照样带上", async () => {
     const { fetch, ctx } = setup((req) => {
       if (req.action === "GetDomainConfig") return ok({ https_config: { enable_https: false, enable_http2: false, force_https: true } });
@@ -588,5 +820,117 @@ describe("volcengine 查询层为双证书补全算法", () => {
       expect.objectContaining({ id: "cert-rsa", algorithm: "RSA", notAfter: "2026-10-25T00:00:00.000Z" }),
       expect.objectContaining({ id: "cert-ecc", algorithm: "ECC", notAfter: "2027-03-01T00:00:00.000Z" }),
     ]);
+  });
+});
+
+describe("volcengine 查询失败导致 HTTPS 状态 / 证书不明时标记 httpsUnknown", () => {
+  const T = (iso: string) => Math.floor(Date.parse(iso) / 1000);
+  const list = async (key: string, route: (req: FakeRequest) => FakeReply) => {
+    const { ctx } = setup(route);
+    const warned: string[] = [];
+    const records = await volcengine.services.find((s) => s.key === key)!.list(ctx, CREDS, (_e, t) => void warned.push(t));
+    return { byDomain: Object.fromEntries(records.map((r) => [r.domain, r])), warned };
+  };
+  const denied = () => volcError("AccessDenied", "User is not authorized", 403);
+
+  it("点播：读域名配置失败时，开关取列表里的值但标记 httpsUnknown（不在 CDN 列表里的域名不再当成未开启）", async () => {
+    const { byDomain, warned } = await list("vod", (req) => {
+      if (req.action === "ListSpace" && req.url.host === "vod.volcengineapi.com") return ok([{ SpaceName: "s1" }]);
+      if (req.action === "ListSpace") return ok(null);
+      if (req.action === "ListVodDomains") {
+        return ok({
+          VodInfo: {
+            Total: 3,
+            Domains: [
+              { Domain: "on.example.com", DomainType: "vod_play" },
+              { Domain: "nocdn.example.com", DomainType: "vod_play" },
+              { Domain: "off.example.com", DomainType: "vod_play" },
+            ],
+          },
+          DomainInfo: { Total: 2, Data: [{ Domain: "on.example.com", HTTPS: true }, { Domain: "off.example.com", HTTPS: false }] },
+        });
+      }
+      if (req.action === "DescribeVodDomainConfig") return denied();
+      return undefined;
+    });
+    expect(warned.sort()).toEqual(["域名 nocdn.example.com", "域名 on.example.com"]);
+    expect(byDomain["on.example.com"]).toMatchObject({ https: true, extra: { httpsUnknown: "true" } });
+    expect(byDomain["on.example.com"]!.cert).toBeUndefined();
+    expect(byDomain["nocdn.example.com"]).toMatchObject({ https: false, extra: { httpsUnknown: "true" } });
+    expect(byDomain["off.example.com"]!.extra?.httpsUnknown).toBeUndefined();
+  });
+
+  it("veImageX：读域名配置失败时标记 httpsUnknown；证书列表失败且配置里没有证书 ID 时同样标记", async () => {
+    const { byDomain, warned } = await list("imagex", (req) => {
+      const q = (k: string) => req.url.searchParams.get(k);
+      if (req.url.host === "imagex.ap-southeast-1.volcengineapi.com") return ok({ Services: [] });
+      if (req.action === "GetAllImageServices") return ok({ Services: [{ ServiceId: "svc1", ServiceName: "pics" }] });
+      if (req.action === "GetServiceDomains") return ok([{ domain: "fail.example.com" }, { domain: "noid.example.com" }, { domain: "id.example.com" }]);
+      if (req.action === "GetDomainConfig") {
+        if (q("DomainName") === "fail.example.com") return denied();
+        if (q("DomainName") === "noid.example.com") return ok({ https_config: { enable_https: true } });
+        return ok({ https_config: { enable_https: true, cert_id: "cert-id" } });
+      }
+      if (req.action === "GetImageAllDomainCert") return denied();
+      if (req.action === "CertificateGetInstanceList") {
+        return ok({ TotalCount: 1, Instances: [{ InstanceId: "cert-id", NotAfter: "2026-12-01 08:00:00", Status: "Issued" }] });
+      }
+      return undefined;
+    });
+    expect(warned).toContain("域名 fail.example.com");
+    expect(byDomain["fail.example.com"]).toMatchObject({ https: false, extra: { httpsUnknown: "true" } });
+    expect(byDomain["noid.example.com"]).toMatchObject({ https: true, extra: { httpsUnknown: "true" } });
+    // 证书 ID 已知、到期时间从证书中心补上，不算不明
+    expect(byDomain["id.example.com"]).toMatchObject({ https: true, cert: { id: "cert-id", notAfter: "2026-12-01T00:00:00.000Z" } });
+    expect(byDomain["id.example.com"]!.extra?.httpsUnknown).toBeUndefined();
+  });
+
+  it("CDN：双证书的算法因证书中心查询失败而不明时标记 httpsUnknown（单证书不受影响）", async () => {
+    const { byDomain, warned } = await list("cdn", (req) => {
+      if (req.action === "ListCdnDomains") return ok({ Total: 2, Data: [{ Domain: "dual.example.com", HTTPS: true }, { Domain: "single.example.com", HTTPS: true }] });
+      if (req.action === "ListCdnCertInfo" && req.json?.EncryType === "sm_cert") return ok({ Total: 0, CertInfo: [] });
+      if (req.action === "ListCdnCertInfo") {
+        return ok({
+          Total: 2,
+          CertInfo: [
+            { CertId: "cert-a", ExpireTime: T("2026-10-25T00:00:00Z"), ConfiguredDomain: "dual.example.com,single.example.com" },
+            { CertId: "cert-b", ExpireTime: T("2027-03-01T00:00:00Z"), ConfiguredDomain: "dual.example.com" },
+          ],
+        });
+      }
+      if (req.action === "CertificateGetInstanceList") return denied();
+      return undefined;
+    });
+    expect(warned).toHaveLength(1);
+    expect(byDomain["dual.example.com"]).toMatchObject({ https: true, extra: { httpsUnknown: "true" } });
+    expect(byDomain["single.example.com"]!.extra?.httpsUnknown).toBeUndefined();
+  });
+
+  it("点播：双证书没有 PEM 可识别算法、证书中心又查询失败时标记 httpsUnknown", async () => {
+    const { byDomain } = await list("vod", (req) => {
+      if (req.action === "ListSpace" && req.url.host === "vod.volcengineapi.com") return ok([{ SpaceName: "s1" }]);
+      if (req.action === "ListSpace") return ok(null);
+      if (req.action === "ListVodDomains") {
+        return ok({ VodInfo: { Total: 1, Domains: [{ Domain: "v.example.com", DomainType: "vod_play" }] }, DomainInfo: { Total: 1, Data: [{ Domain: "v.example.com", HTTPS: true }] } });
+      }
+      if (req.action === "DescribeVodDomainConfig") {
+        return ok({
+          DomainInfo: {
+            DomainConfig: {
+              HTTPS: {
+                Switch: true,
+                CertInfoList: [
+                  { CertId: "cert-a", ExpireTime: T("2026-10-25T00:00:00Z"), EncryType: "inter_cert" },
+                  { CertId: "cert-b", ExpireTime: T("2027-03-01T00:00:00Z"), EncryType: "inter_cert" },
+                ],
+              },
+            },
+          },
+        });
+      }
+      if (req.action === "CertificateGetInstanceList") return denied();
+      return undefined;
+    });
+    expect(byDomain["v.example.com"]).toMatchObject({ https: true, extra: { httpsUnknown: "true" } });
   });
 });

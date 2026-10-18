@@ -1,14 +1,14 @@
 import type { LocalCert } from "../../deploy/cert.js";
 import { SAME_CERT_TOLERANCE_MS } from "../../deploy/plan.js";
 import type { AccessKeyCredentials } from "../../lib/env.js";
-import { CloudApiError, type QueryContext } from "../../lib/http.js";
+import { CloudApiError, isRetryable, withRetry, type QueryContext } from "../../lib/http.js";
 import { compact } from "../../lib/compact.js";
 import { memo, paginate } from "../../lib/paginate.js";
 import { mapLimit } from "../../lib/pool.js";
 import { toIso } from "../../lib/time.js";
 import type { CertInfo, DomainRecord } from "../../types.js";
 import type { DomainService, Warn } from "../registry.js";
-import { callVolc } from "./client.js";
+import { callVolc, callVolcOnce, type VolcRequest } from "./client.js";
 import { certName, pemFingerprints } from "./common.js";
 
 interface LiveDomain {
@@ -48,8 +48,18 @@ const STATUS: Record<number, string> = {
   6: "icp-blocked",
 };
 
+const request = (action: string, params: Record<string, unknown>): VolcRequest => ({
+  host: "live.volcengineapi.com",
+  service: "live",
+  region: "cn-north-1",
+  version: "2023-01-01",
+  action,
+  method: "POST",
+  params,
+});
+
 const call = <T>(ctx: QueryContext, creds: AccessKeyCredentials, action: string, params: Record<string, unknown>) =>
-  callVolc<T>(ctx, creds, { host: "live.volcengineapi.com", service: "live", region: "cn-north-1", version: "2023-01-01", action, method: "POST", params });
+  callVolc<T>(ctx, creds, request(action, params));
 
 const toCert = (c: LiveCert): CertInfo =>
   compact({
@@ -67,30 +77,55 @@ const CERT_NAME_MAX = 40;
 const uploads = memo<QueryContext, string>();
 
 /**
- * 直播证书管理里与本地证书同一张的证书链 ID；没有就 CreateCert 上传（PEM 在 JSON 请求体里）。
- * ListCertV2 不给指纹：先按项目与到期时间（48 小时内）筛候选，再逐个用 DescribeCertDetailSecretV2 取证书链比对叶子指纹，
- * 避免把同域名、同到期时间的另一算法证书当成同一张。证书须与域名所在域名空间同属一个项目。同一次运行内每个项目只处理一次。
+ * 直播证书管理里与本地证书同一张的证书链 ID（每次都重新拉 ListCertV2，不用缓存）。ListCertV2 不给指纹：
+ * 先按项目与到期时间（48 小时内）筛候选，再逐个用 DescribeCertDetailSecretV2 取证书链比对叶子指纹，
+ * 避免把同域名、同到期时间的另一算法证书当成同一张；取不到某张候选的证书链（拿不到指纹）时按不是同一张处理。
+ */
+async function findLiveCert(ctx: QueryContext, creds: AccessKeyCredentials, cert: LocalCert, project: string): Promise<string | undefined> {
+  const list = (await call<{ CertList?: LiveCert[] | null }>(ctx, creds, "ListCertV2", {})).CertList ?? [];
+  const newMs = Date.parse(cert.notAfter);
+  const candidates = list.filter(
+    (c) => c.ChainID && (!c.ProjectName || c.ProjectName === project) && Math.abs(Date.parse(toIso(c.NotAfter) ?? "") - newMs) <= SAME_CERT_TOLERANCE_MS,
+  );
+  for (const c of candidates) {
+    let chain: string[];
+    try {
+      const detail = await call<{ SSL?: { Chain?: string[] | null } | null }>(ctx, creds, "DescribeCertDetailSecretV2", { ChainID: c.ChainID });
+      chain = detail.SSL?.Chain ?? [];
+    } catch (e) {
+      // 限流、超时等交给外层整轮重来；其余错误（如证书已删除）视为拿不到指纹
+      if (isRetryable(e)) throw e;
+      continue;
+    }
+    if (pemFingerprints(chain.join("\n")).includes(cert.fingerprint)) return c.ChainID!;
+  }
+  return undefined;
+}
+
+/**
+ * 直播证书管理里与本地证书同一张的证书链 ID；没有就 CreateCert 上传（PEM 在 JSON 请求体里）。证书须与域名所在域名空间同属一个项目。
+ * CreateCert 不幂等，只发一次、不自动重试：遇到超时、限流等可重试的错误时整轮重来（最多 3 轮），先重新查重
+ * （上一次其实已传成功时直接复用），查不到再传，不会在直播证书管理里传出两份。同一次运行内每个项目只处理一次。
  */
 function liveChainId(ctx: QueryContext, creds: AccessKeyCredentials, cert: LocalCert, project: string): Promise<string> {
-  return uploads(ctx, `${creds.accessKeyId}/${project}/${cert.fingerprint}`, async () => {
-    const list = (await call<{ CertList?: LiveCert[] | null }>(ctx, creds, "ListCertV2", {})).CertList ?? [];
-    const newMs = Date.parse(cert.notAfter);
-    const candidates = list.filter(
-      (c) => c.ChainID && (!c.ProjectName || c.ProjectName === project) && Math.abs(Date.parse(toIso(c.NotAfter) ?? "") - newMs) <= SAME_CERT_TOLERANCE_MS,
-    );
-    for (const c of candidates) {
-      const detail = await call<{ SSL?: { Chain?: string[] | null } | null }>(ctx, creds, "DescribeCertDetailSecretV2", { ChainID: c.ChainID });
-      if (pemFingerprints((detail.SSL?.Chain ?? []).join("\n")).includes(cert.fingerprint)) return c.ChainID!;
-    }
-    const created = await call<{ ChainID?: string }>(ctx, creds, "CreateCert", {
-      CertName: certName(cert, CERT_NAME_MAX),
-      UseWay: "https",
-      ProjectName: project,
-      Rsa: { Pubkey: cert.certPem, Prikey: cert.keyPem },
-    });
-    if (!created.ChainID) throw new CloudApiError("volcengine", "InvalidResponse", "上传证书后视频直播没有返回证书链 ID");
-    return created.ChainID;
-  });
+  return uploads(ctx, `${creds.accessKeyId}/${project}/${cert.fingerprint}`, () =>
+    withRetry(ctx, async () => {
+      const existing = await findLiveCert(ctx, creds, cert, project);
+      if (existing) return existing;
+      const created = await callVolcOnce<{ ChainID?: string }>(
+        ctx,
+        creds,
+        request("CreateCert", {
+          CertName: certName(cert, CERT_NAME_MAX),
+          UseWay: "https",
+          ProjectName: project,
+          Rsa: { Pubkey: cert.certPem, Prikey: cert.keyPem },
+        }),
+      );
+      if (!created.ChainID) throw new CloudApiError("volcengine", "InvalidResponse", "上传证书后视频直播没有返回证书链 ID");
+      return created.ChainID;
+    }),
+  );
 }
 
 /**

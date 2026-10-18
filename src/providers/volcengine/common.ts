@@ -1,6 +1,7 @@
 import { X509Certificate } from "node:crypto";
 import type { LocalCert } from "../../deploy/cert.js";
 import { pickOldCert } from "../../deploy/plan.js";
+import { CloudApiError } from "../../lib/http.js";
 import type { CertInfo, DomainRecord } from "../../types.js";
 
 /** 逗号分隔的域名列表（接口里常带空格） */
@@ -61,10 +62,12 @@ export function certName(cert: LocalCert, max = Number.POSITIVE_INFINITY): strin
 const allCerts = (record: DomainRecord): CertInfo[] => (record.certs?.length ? record.certs : record.cert ? [record.cert] : []);
 
 /** 双证书（两张以上国际证书）里有查不到算法的，无法确定该替换哪一张 */
-export function ambiguousDual(record: DomainRecord): boolean {
-  const intl = allCerts(record).filter((c) => c.algorithm !== "SM2");
+export function ambiguousCerts(certs: readonly CertInfo[]): boolean {
+  const intl = certs.filter((c) => c.algorithm !== "SM2");
   return intl.length > 1 && intl.some((c) => !c.algorithm);
 }
+
+export const ambiguousDual = (record: DomainRecord): boolean => ambiguousCerts(allCerts(record));
 
 export const AMBIGUOUS_DUAL = "该域名绑了两张证书但查不到各自的算法（RSA / ECC），无法确定替换哪一张";
 
@@ -73,3 +76,14 @@ export function certsToKeep(record: DomainRecord, algorithm: LocalCert["algorith
   const old = pickOldCert(record, algorithm);
   return allCerts(record).filter((c) => c.id && c.id !== old?.id);
 }
+
+/**
+ * 部署（编排层认为域名没开 HTTPS）前读到的配置显示 HTTPS 其实已开启：不写入，让用户重新执行按更新规则判断。
+ * 只用于写之前本来就要读配置的服务，不为此新增读请求。
+ */
+export function httpsAlreadyEnabled(): CloudApiError {
+  return new CloudApiError("volcengine", "HttpsAlreadyEnabled", "该域名的 HTTPS 已开启（与查询时不同），未做修改；请重新执行，按更新规则判断");
+}
+
+/** 查询失败（已记 issue）导致无法判断域名是否开着 HTTPS / 绑着哪张证书时，在 extra 里打的标记；编排层据此不做任何写操作 */
+export const HTTPS_UNKNOWN = { httpsUnknown: "true" } as const;

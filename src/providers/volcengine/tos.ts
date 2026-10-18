@@ -6,6 +6,7 @@ import { mapLimit } from "../../lib/pool.js";
 import type { DomainRecord } from "../../types.js";
 import type { DomainService, Warn } from "../registry.js";
 import { enrichFromCertCenter } from "./certs.js";
+import { httpsAlreadyEnabled } from "./common.js";
 import { canonicalQuery, sha256Hex, tosAuthorization, volcDate } from "./sign.js";
 
 /** ListBuckets 返回账号下所有地域的桶，任一地域的 endpoint 都可以 */
@@ -110,6 +111,11 @@ interface CustomDomainRule {
  */
 const CERT_UNAVAILABLE = new Set(["CertNotExist", "RoleNotExist"]);
 
+const certUnavailable = (rule: CustomDomainRule) => !!rule.CertId && CERT_UNAVAILABLE.has(rule.CertStatus ?? "");
+
+/** 绑了证书（且不是未绑定 / 不可用状态）即视为开启 HTTPS */
+const ruleHttps = (rule: CustomDomainRule) => !!rule.CertId && rule.CertStatus !== "CertUnbound" && !certUnavailable(rule);
+
 const bucketHost = (bucket: string, region: string) => `${bucket}.tos-${region}.volces.com`;
 
 /**
@@ -138,8 +144,8 @@ export const tos: DomainService<AccessKeyCredentials> = {
       }
     });
     const records = perBucket.flat().map(({ rule, bucket }) => {
-      const unavailable = !!rule.CertId && CERT_UNAVAILABLE.has(rule.CertStatus ?? "");
-      const https = !!rule.CertId && rule.CertStatus !== "CertUnbound" && !unavailable;
+      const unavailable = certUnavailable(rule);
+      const https = ruleHttps(rule);
       return compact({
         provider: "volcengine" as const,
         service: "tos",
@@ -168,7 +174,7 @@ export const tos: DomainService<AccessKeyCredentials> = {
           : undefined,
     /**
      * PutBucketCustomDomain 按域名整条覆盖规则（不传 Protocol 会变回 tos），所以先读出该域名的规则，只换 CertId 再写回。
-     * TOS 没有 HTTPS 开关，绑定证书即可 HTTPS 访问，部署与更新是同一个操作。
+     * TOS 没有 HTTPS 开关，绑定证书即可 HTTPS 访问，部署与更新是同一个操作；部署时读到的规则已绑着可用的证书（HTTPS 其实已开启）则不写入。
      */
     async apply(ctx, creds, target, input) {
       const [record] = target.records;
@@ -177,6 +183,7 @@ export const tos: DomainService<AccessKeyCredentials> = {
       const res = await tosCall<{ CustomDomainRules: CustomDomainRule[] | null }>(ctx, creds, req);
       const rule = (res.CustomDomainRules ?? []).find((r) => r.Domain.toLowerCase() === record!.domain.toLowerCase());
       if (!rule) throw new CloudApiError("volcengine", "DomainNotFound", `桶 ${bucket} 上已没有自定义域名 ${record!.domain}`);
+      if (target.mode === "deploy" && ruleHttps(rule)) throw httpsAlreadyEnabled();
       const certId = await input.certId();
       const body = JSON.stringify({ CustomDomainRule: compact({ Domain: rule.Domain, CertId: certId, Protocol: rule.Protocol }) });
       await tosCall(ctx, creds, { ...req, method: "PUT", body });
