@@ -805,6 +805,23 @@ describe("volcengine imagex 部署", () => {
     });
   });
 
+  it("没有通用名（CN）的证书不处理：实测接口照收、边缘却一直下发旧证书，不读配置、不上传、不写入", async () => {
+    const { fetch, ctx } = setup((req) => {
+      if (req.action === "GetDomainConfig") return ok({ https_config: liveCfg });
+      if (req.action === "UpdateHttps") return ok("ok");
+      return undefined;
+    });
+    for (const record of [rec("imagex", "img.example.com", { extra, cert: { id: "cert-old" } }), rec("imagex", "img.example.com", { https: false, extra })]) {
+      const inp = input(NO_CN);
+      const err = await deployer("imagex").apply(ctx, CREDS, target(record), inp).catch((e) => e);
+      expect(err).toBeInstanceOf(CloudApiError);
+      expect(err).toMatchObject({ code: "CertWithoutCommonName", message: expect.stringMatching(/通用名（CN）.*边缘/) });
+      expect(isRetryable(err)).toBe(false);
+      expect(inp.uploads()).toBe(0);
+    }
+    expect(fetch.calls).toHaveLength(0);
+  });
+
   it("更新时读到 HTTPS 已关闭（与查询时不同）：不写入、不上传", async () => {
     const { fetch, ctx } = setup((req) => {
       if (req.action === "GetDomainConfig") return ok({ https_config: { ...liveCfg, enable_https: false } });

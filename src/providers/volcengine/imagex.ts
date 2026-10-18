@@ -226,8 +226,17 @@ export const imagex: DomainService<AccessKeyCredentials> = {
      * HTTP/2、QUIC、OCSP、TLS 版本、强制跳转、HSTS 原样带上。
      * 文档里的 UpdateImageBatchDomainCert（只关联证书）实测无论参数怎么传都返回 InvalidParameter（CodeN 600003），不用。
      * 读到的开关与查询时不同（部署时已开启、更新时已关闭）不写入，先核对再取证书 ID，核对不过不会上传证书。
+     * 没有通用名（CN）的证书实测 UpdateHttps 照收、域名配置也显示新证书，但边缘节点一直下发旧证书（带 CN 的证书 2 分钟内生效），
+     * 所以直接不处理（不读、不传、不写），以免报「已更新」而实际没有生效。
      */
     async apply(ctx, creds, target, input) {
+      if (!input.cert.commonName) {
+        throw new CloudApiError(
+          "volcengine",
+          "CertWithoutCommonName",
+          "veImageX 实测会接受没有通用名（CN）的证书（如 Let's Encrypt 的短期证书），但边缘节点不会生效、仍下发原来的证书；未做修改，请改用带通用名的证书",
+        );
+      }
       const [record] = target.records;
       const { serviceId, region } = record!.extra as { serviceId: string; region: string };
       const cfg = await callVolc<DomainConfig>(ctx, creds, {
