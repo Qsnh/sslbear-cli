@@ -305,8 +305,7 @@ describe("deploy 表格输出", () => {
 });
 
 describe("deploy 使用真实的云厂商定义", () => {
-  // 各云 deployer 合入后改成真实执行路径：阿里云 CDN 的域名应被更新，并断言写接口的请求
-  it("服务还没有 deployer 时记为 unsupported，exit 0，只发查询请求", async () => {
+  it("阿里云 CDN：上传到数字证书管理服务后绑定到域名，私钥只在请求体里", async () => {
     const fetch = fakeFetch((req) => {
       if (req.action === "DescribeUserDomains") {
         return { body: { TotalCount: 1, Domains: { PageData: [{ DomainName: "www.example.com", SslProtocol: "on", DomainStatus: "online" }] } } };
@@ -314,13 +313,20 @@ describe("deploy 使用真实的云厂商定义", () => {
       if (req.action === "DescribeCdnHttpsDomainList") {
         return { body: { TotalCount: 1, CertInfos: { CertInfo: [{ DomainName: "www.example.com", CertName: "old", CertExpireTime: "2026-10-25 08:00:00" }] } } };
       }
+      if (req.action === "ListUserCertificateOrder") return { body: { TotalCount: 0, CertificateOrderList: [] } };
+      if (req.action === "UploadUserCertificate") return { body: { CertId: 9001, RequestId: "r1" } };
+      if (req.action === "SetCdnDomainSSLCertificate") return { body: { RequestId: "r2" } };
       return undefined;
     });
     const r = await deploy(["-p", "aliyun", "-s", "cdn", "--json"], { env: ALIYUN_ENV, fetch });
     expect(r.code).toBe(0);
     expect(r.json.data.results).toEqual([
-      expect.objectContaining({ provider: "aliyun", service: "cdn", domain: "www.example.com", action: "skipped", reason: "unsupported" }),
+      expect.objectContaining({ provider: "aliyun", service: "cdn", domain: "www.example.com", action: "updated", after: { id: "9001", notAfter: "2027-01-01T00:00:00.000Z" } }),
     ]);
-    expect(new Set(fetch.calls.map((c) => c.action))).toEqual(new Set(["DescribeUserDomains", "DescribeCdnHttpsDomainList"]));
+    expect(r.json.data.uploads).toEqual([{ provider: "aliyun", certId: "9001", reused: false }]);
+    const set = fetch.calls.find((c) => c.action === "SetCdnDomainSSLCertificate")!;
+    expect(Object.fromEntries(new URLSearchParams(set.body))).toMatchObject({ DomainName: "www.example.com", SSLProtocol: "on", CertType: "cas", CertId: "9001" });
+    for (const c of fetch.calls) for (const line of KEY_LINES) expect(c.url.toString()).not.toContain(encodeURIComponent(line));
+    expectNoKey(r);
   });
 });
