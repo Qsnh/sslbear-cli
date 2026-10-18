@@ -63,6 +63,14 @@ function viaScm(id = "scs-new"): DeployInput & { certId: ReturnType<typeof vi.fn
   return { cert: CERT, certId: vi.fn(async () => id) };
 }
 
+/** CCM 导入没有 CN、只有 SAN 的证书（如 Let's Encrypt 短期证书）时的真实报错：HTTP 400 SCM.0009 */
+const scmNoDomain = () => new CloudApiError("huawei", "SCM.0009", "No domain name is bonded with the certificate. Failed to upload the certificate.", undefined, 400);
+
+/** 上传到 CCM 失败 */
+function scmRejects(error: Error = scmNoDomain()): DeployInput & { certId: ReturnType<typeof vi.fn> } {
+  return { cert: CERT, certId: vi.fn(async () => Promise.reject(error)) };
+}
+
 const apigError = (status: number, code: string, msg: string) => ({ status, body: { error_code: code, error_msg: msg, request_id: `rid-${code}` } });
 const noWarn: Warn = (e) => {
   throw e;
@@ -563,6 +571,33 @@ describe("huawei live deployer", () => {
     expect(u(liveRecord(), "update")).toBeUndefined();
   });
 
+  it("CCM 不接受没有 CN 的证书（SCM.0009）：改为直接传 PEM（tls_certificate.source = user），结果带说明；国密证书照常带回", async () => {
+    const { ctx, fetch } = ctxOf(
+      liveRoute({ certificate_format: "PEM", force_redirect: true, gm_certificate: { source: "scm", cert_id: "scs-gm", cert_name: "gm" }, tls_certificate: { certificate: OLD_ECC_PEM } }),
+    );
+    const input = scmRejects();
+    const outcome = await live.deployer!.apply(ctx, CREDS, { records: [liveRecord()], mode: "update" }, input);
+    expect(outcome.certId).toBeUndefined();
+    expect(outcome.note).toMatch(/SCM\.0009/);
+    expect(outcome.note).toContain("certs");
+    const put = fetch.calls.find((c) => c.method === "PUT")!;
+    expect(put.json).toEqual({
+      certificate_format: "PEM",
+      force_redirect: true,
+      tls_certificate: { source: "user", certificate: CERT.certPem, certificate_key: CERT.keyPem },
+      gm_certificate: { source: "scm", cert_id: "scs-gm", cert_name: "gm" },
+    });
+    expectApigSigned(put, { "X-Project-Id": "p-bj4" });
+    expectNoKeyInUrl(fetch.calls);
+  });
+
+  it("上传到 CCM 的其他失败照常报错，不改为直接传 PEM、不写入", async () => {
+    const { ctx, fetch } = ctxOf(liveRoute({ force_redirect: false, tls_certificate: { certificate: OLD_ECC_PEM } }));
+    const input = scmRejects(new CloudApiError("huawei", "SCM.0016", "Access denied", "rid-scm", 403));
+    await expect(live.deployer!.apply(ctx, CREDS, { records: [liveRecord()], mode: "update" }, input)).rejects.toMatchObject({ code: "SCM.0016" });
+    expect(fetch.calls.map((c) => c.method)).toEqual(["GET"]);
+  });
+
   it("写接口失败抛 CloudApiError", async () => {
     const { ctx } = ctxOf((req) => (req.method === "PUT" ? apigError(400, "LIVE.100011001", "Request Illegal") : liveRoute({ force_redirect: false })(req)));
     await expect(live.deployer!.apply(ctx, CREDS, { records: [liveRecord()], mode: "update" }, viaScm())).rejects.toMatchObject({
@@ -647,6 +682,18 @@ describe("huawei live 查询与部署全流程", () => {
     });
     expectNoKeyInUrl(fetch.calls);
   });
+
+  it("planDeploy + executeDeploy：CCM 拒收没有 CN 的证书（SCM.0009）时直接传 PEM 完成更新，没有上传记录，结果说明原因", async () => {
+    const { ctx, fetch } = ctxOf(route(() => apigError(400, "SCM.0009", "No domain name is bonded with the certificate. Failed to upload the certificate.")));
+    const plan = await planDeploy(ctx, CERT, { providers: ["huawei"], services: ["live"], force: false, dryRun: false });
+    const report = await executeDeploy(ctx, CERT, plan);
+    expect(report.results[0]).toEqual(
+      expect.objectContaining({ domain: "play.example.com", action: "updated", after: { notAfter: CERT.notAfter }, message: expect.stringContaining("SCM.0009") }),
+    );
+    expect(report.uploads).toEqual([]);
+    expect(fetch.calls.filter((c) => c.method === "POST")).toHaveLength(1);
+    expect(fetch.calls.find((c) => c.method === "PUT")!.json).toMatchObject({ tls_certificate: { source: "user", certificate: CERT.certPem, certificate_key: CERT.keyPem } });
+  });
 });
 
 const obsRecord = (r: Partial<DomainRecord> = {}): DomainRecord => ({
@@ -699,6 +746,27 @@ describe("huawei obs deployer", () => {
     const { ctx, fetch } = ctxOf((req) => (req.url.host === BUCKET_HOST && req.method === "PUT" ? { body: "" } : undefined));
     await obs.deployer!.apply(ctx, CREDS, { records: [obsRecord({ https: false, cert: undefined, extra: { bucket: "static-prod", region: "cn-east-3" } })], mode: "deploy" }, viaScm());
     expect(xmlText(fetch.calls[0]!.body, "CertificateType")).toBe("server");
+  });
+
+  it("CCM 不接受没有 CN 的证书（SCM.0009）：不带 CertificateId、直接传 PEM（OBS 自动生成证书 ID），结果带说明", async () => {
+    const { ctx, fetch } = ctxOf((req) => (req.url.host === BUCKET_HOST && req.method === "PUT" ? { body: "" } : undefined));
+    const outcome = await obs.deployer!.apply(ctx, CREDS, { records: [obsRecord()], mode: "update" }, scmRejects());
+    expect(outcome.certId).toBeUndefined();
+    expect(outcome.note).toMatch(/SCM\.0009/);
+    const put = fetch.calls[0]!;
+    expect(put.body).not.toContain("CertificateId");
+    expect(xmlText(put.body, "Name")).toBe(NAME);
+    expect(xmlText(put.body, "Certificate")).toBe(CERT.certPem.trim());
+    expect(xmlText(put.body, "PrivateKey")).toBe(CERT.keyPem.trim());
+    expect(xmlText(put.body, "CertificateType")).toBe("server");
+    expectNoKeyInUrl(fetch.calls);
+  });
+
+  it("上传到 CCM 的其他失败照常报错，不写入", async () => {
+    const { ctx, fetch } = ctxOf((req) => (req.url.host === BUCKET_HOST && req.method === "PUT" ? { body: "" } : undefined));
+    const input = scmRejects(new CloudApiError("huawei", "SCM.0016", "Access denied", "rid-scm", 403));
+    await expect(obs.deployer!.apply(ctx, CREDS, { records: [obsRecord()], mode: "update" }, input)).rejects.toMatchObject({ code: "SCM.0016" });
+    expect(fetch.calls).toHaveLength(0);
   });
 
   it("失败抛 CloudApiError（XML 错误体）；extra 缺 bucket / region 时报错且不上传", async () => {

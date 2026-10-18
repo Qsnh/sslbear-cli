@@ -7,7 +7,18 @@ import { toIso } from "../../lib/time.js";
 import type { CertInfo, DomainRecord } from "../../types.js";
 import type { DeployInput, DeployOutcome, DeployTarget, DomainService, Warn } from "../registry.js";
 import { callHuawei, listProjects } from "./client.js";
-import { earliest, HTTPS_ALREADY_ENABLED, markHttpsUnknown, orderCerts, parsePem, SM_CERT_LOCKED, smCertLocked, withoutSource } from "./common.js";
+import {
+  earliest,
+  HTTPS_ALREADY_ENABLED,
+  markHttpsUnknown,
+  orderCerts,
+  parsePem,
+  PEM_FALLBACK_NOTE,
+  scmCertIdOrPem,
+  SM_CERT_LOCKED,
+  smCertLocked,
+  withoutSource,
+} from "./common.js";
 import { enrichFromScm } from "./scm.js";
 
 /**
@@ -135,12 +146,14 @@ function hasCert(cfg: HttpsCertConfig): boolean {
 
 /**
  * 修改播放域名的 HTTPS 证书（UpdateDomainHttpsCert）是整体覆盖：先读出当前配置（ShowDomainHttpsCert），
- * 强制跳转原样带回；国际证书用 CCM 证书 ID 绑定；国密证书只能按 CCM 证书 ID 带回，自有上传的读不到私钥，无法保留。
+ * 强制跳转原样带回；国际证书用 CCM 证书 ID 绑定（CCM 拒收没有 CN 的证书时改为直接传 PEM，source = user）；
+ * 国密证书只能按 CCM 证书 ID 带回，自有上传的读不到私钥，无法保留。
  * 直播没有单独的 HTTPS 开关，配置证书即开启，deploy 与 update 的请求相同；
  * deploy（查询时没有证书）读到已配置了证书时说明 HTTPS 其实已开启，不写入，交给重新执行按更新规则判断。
  */
 async function applyLive(ctx: QueryContext, creds: AccessKeyCredentials, target: DeployTarget, input: DeployInput): Promise<DeployOutcome> {
   let certId: string | undefined;
+  let uploaded = false;
   for (const record of target.records) {
     const region = record.extra?.region;
     const projectId = record.extra?.projectId ?? (region ? (await listProjects(ctx, creds)).get(region) : undefined);
@@ -153,19 +166,24 @@ async function applyLive(ctx: QueryContext, creds: AccessKeyCredentials, target:
     const gm = current.gm_certificate;
     const hasGm = !!(gm?.cert_id || gm?.sign_certificate || gm?.enc_certificate);
     if (hasGm && !(gm?.source === "scm" && gm.cert_id)) throw new CloudApiError("huawei", "SmCertNotPreservable", SM_CERT_LOCKED);
-    certId ??= await input.certId();
+    if (!uploaded) {
+      certId = await scmCertIdOrPem(input);
+      uploaded = true;
+    }
     await callHuawei(ctx, creds, {
       ...req,
       method: "PUT",
       body: {
         certificate_format: "PEM",
         ...(typeof current.force_redirect === "boolean" && { force_redirect: current.force_redirect }),
-        tls_certificate: { source: "scm", cert_id: certId },
+        tls_certificate: certId
+          ? { source: "scm", cert_id: certId }
+          : { source: "user", certificate: input.cert.certPem, certificate_key: input.cert.keyPem },
         ...(hasGm && { gm_certificate: compact({ source: "scm", cert_id: gm?.cert_id, cert_name: gm?.cert_name }) }),
       },
     });
   }
-  return compact({ certId });
+  return compact({ certId, note: uploaded && !certId ? PEM_FALLBACK_NOTE : undefined });
 }
 
 /**
