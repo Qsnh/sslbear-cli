@@ -28,7 +28,7 @@ interface HttpsDomain {
   certStopTime?: string;
   /** 1 服务端证书，2 客户端证书（双向认证） */
   certType?: number;
-  /** 1 使用中，2 已过期 */
+  /** 1 使用中，2 已过期；实测 6 天后到期的证书为 3（推测是即将过期），原样输出 */
   status?: number;
 }
 
