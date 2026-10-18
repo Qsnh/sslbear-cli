@@ -26,7 +26,10 @@ interface CertDetail {
   /** UNUSED / IN_USE */
   status?: string;
   expired?: boolean;
-  /** 证书指纹，格式文档未写明；文档只在 GET /v1/certificate/{certId} 里列出，官方 Go SDK 的列表详情也声明了该字段 */
+  /**
+   * 证书指纹，文档未写明格式。实测：GET /v1/certificate/{certId} 返回叶子证书 DER 的 SHA-1（40 位小写 hex、无冒号），
+   * /v1/certificate/detail 列表里没有该字段（官方 Go SDK 的列表详情声明了它，仍兼容列表自带的情况）
+   */
   certFingerprint?: unknown;
 }
 
@@ -198,6 +201,7 @@ const NAME_ATTEMPTS = 3;
  * 上传不幂等，POST 本身只发一次、不自动重试：遇到超时、限流等可重试的错误时整轮重来，先重新拉证书列表（不走缓存）查重，
  * 上一次其实已传成功、且凭指纹认得出时直接复用，认不出就再传一份；总共最多 3 轮。
  * 列表里已有同名证书、或上传时报重名（ResourceNameDuplicated）时，换带指纹后缀的名字。
+ * 证书管理解析不了没有通用名的证书（实测 400 CertificateParameterInvalid「Index 0 out of bounds」），这时在错误信息里说明原因。
  */
 export async function uploadBaiduCertificate(ctx: QueryContext, creds: AccessKeyCredentials, cert: LocalCert): Promise<{ id: string; reused: boolean }> {
   const [leaf, ...chain] = cert.certPem.match(PEM_CERT) ?? [];
@@ -226,6 +230,15 @@ export async function uploadBaiduCertificate(ctx: QueryContext, creds: AccessKey
           retry: false,
         });
       } catch (e) {
+        if (e instanceof CloudApiError && e.code === "CertificateParameterInvalid" && !cert.commonName) {
+          throw new CloudApiError(
+            "baidu",
+            e.code,
+            `百度智能云证书管理不接受没有通用名（CN）的证书（如 Let's Encrypt 的短期证书），请改用带通用名的证书；原始信息：${e.message}`,
+            e.requestId,
+            e.httpStatus,
+          );
+        }
         if (!(e instanceof CloudApiError && e.code === "ResourceNameDuplicated") || attempt >= NAME_ATTEMPTS) throw e;
         taken.add(certName);
         continue;

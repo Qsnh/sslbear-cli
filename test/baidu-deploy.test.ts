@@ -221,6 +221,25 @@ describe("baidu uploadCertificate", () => {
     expect(posts(fetch)).toEqual([]);
   });
 
+  it("实测格式：列表详情不带指纹，单张证书信息的 certFingerprint 是叶子 DER 的 SHA-1（40 位小写、无冒号）；RSA / ECC 同名同到期互不复用", async () => {
+    const sha1 = (pem: string) => new X509Certificate(pem).fingerprint.replace(/:/g, "").toLowerCase();
+    const ECC_LEAF = ECC.certPem.match(PEM_CERT)![0]!;
+    // 与真实响应一致：两张都在 /v1/certificate/detail 里，同 CN、同 SAN、到期只差十几秒，都没有 certFingerprint
+    const certs = [
+      detail("cert-ecc", { certName: "test-ec", certStopTime: "2026-12-31T23:59:45Z", certStartTime: "2025-12-31T23:59:46Z" }),
+      detail("cert-rsa", { certName: "test-rsa" }),
+    ];
+    const meta = {
+      "cert-ecc": { certId: "cert-ecc", certName: "test-ec", certCommonName: "example.com", certType: 1, certFingerprint: sha1(ECC_LEAF) },
+      "cert-rsa": { certId: "cert-rsa", certName: "test-rsa", certCommonName: "example.com", certType: 1, certFingerprint: sha1(LEAF!) },
+    };
+    const rsa = upload({ certs, meta }, CERT);
+    await expect(rsa.result).resolves.toEqual({ id: "cert-rsa", reused: true });
+    const ecc = upload({ certs, meta }, ECC);
+    await expect(ecc.result).resolves.toEqual({ id: "cert-ecc", reused: true });
+    expect([...posts(rsa.fetch), ...posts(ecc.fetch)]).toEqual([]);
+  });
+
   it("候选证书的指纹都不一致时上传新证书", async () => {
     const { fetch, result } = upload({ certs: [detail("cert-ecc")], meta: { "cert-ecc": { certFingerprint: OTHER_SHA256 } } });
     await expect(result).resolves.toEqual({ id: NEW_ID, reused: false });
@@ -355,6 +374,26 @@ describe("baidu uploadCertificate", () => {
     expect(err).toMatchObject({ provider: "baidu", code: "PrivateKeyParameterInvalid", requestId: "rid-err" });
     expect(err.message).not.toContain(KEY_LINE);
     expect(posts(fetch)).toHaveLength(1);
+  });
+
+  it("证书管理拒收没有通用名的证书（如 Let's Encrypt 短期证书）时说明原因，保留错误码与 RequestId，不重试", async () => {
+    const SAN_ONLY = load("san-only-fullchain.pem", "san-only-key.pem");
+    expect(SAN_ONLY.commonName).toBeUndefined();
+    // 实测：仅叶子、带证书链、RSA / ECC 都一样，HTTP 400
+    const rejected = bceError(400, "CertificateParameterInvalid", "Parsing certificate failed. Index 0 out of bounds for length 0");
+    const { fetch, result } = upload({ upload: rejected }, SAN_ONLY);
+    const err = await result.catch((e) => e);
+    expect(err).toBeInstanceOf(CloudApiError);
+    expect(err).toMatchObject({ provider: "baidu", code: "CertificateParameterInvalid", requestId: "rid-err", httpStatus: 400 });
+    expect(err.message).toContain("通用名");
+    expect(err.message).toContain("Parsing certificate failed");
+    expect(isRetryable(err)).toBe(false);
+    expect(posts(fetch)).toHaveLength(1);
+
+    // 带通用名的证书报同样的错时原样抛出，不套这个说明
+    const other = upload({ upload: rejected });
+    const err2 = await other.result.catch((e) => e);
+    expect(err2).toMatchObject({ code: "CertificateParameterInvalid", message: "Parsing certificate failed. Index 0 out of bounds for length 0" });
   });
 
   it("上传成功但响应里没有 certId 时报错", async () => {
