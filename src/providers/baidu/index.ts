@@ -1,7 +1,7 @@
 import { ENV_FAMILIES, readAccessKey, type AccessKeyCredentials } from "../../lib/env.js";
 import { defineProvider } from "../registry.js";
 import { cdn } from "./cdn.js";
-import { listBaiduCertificates } from "./cert.js";
+import { listBaiduCertificates, uploadBaiduCertificate } from "./cert.js";
 
 /**
  * 「未开通服务」：OptInRequired 是百度智能云公共错误码（403，没有开通对应的服务，如 BOS 未开通）；
@@ -16,5 +16,6 @@ export const baidu = defineProvider<AccessKeyCredentials>({
   readCredentials: readAccessKey(ENV_FAMILIES.baidu),
   services: [cdn],
   listCertificates: listBaiduCertificates,
+  uploadCertificate: uploadBaiduCertificate,
   isInactive: (code, message) => code === "OptInRequired" || code === "CDNNotActivated" || (code === "AccessDenied" && NOT_OPENED.test(message)),
 });
