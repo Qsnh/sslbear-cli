@@ -3,8 +3,8 @@ import type { QueryContext } from "../../lib/http.js";
 import { compact } from "../../lib/compact.js";
 import { mapLimit } from "../../lib/pool.js";
 import type { DomainRecord } from "../../types.js";
-import type { DomainService, Warn } from "../registry.js";
-import { API_HOST, listByMarker, qiniuGet } from "./client.js";
+import type { Deployer, DomainService, Warn } from "../registry.js";
+import { API_HOST, listByMarker, qiniuGet, qiniuRequest } from "./client.js";
 import { enrichFromSsl } from "./ssl.js";
 
 interface CdnDomain {
@@ -21,8 +21,16 @@ interface CdnDomain {
   operatingState?: string;
 }
 
+interface HttpsConf {
+  certId?: string;
+  forceHttps?: boolean;
+  http2Enable?: boolean;
+  /** 如 TLSv1.2/TLSv1.3；文档没写域名详情是否返回 */
+  tlsVersions?: string;
+}
+
 interface CdnDomainDetail extends CdnDomain {
-  https?: { certId?: string; forceHttps?: boolean; http2Enable?: boolean } | null;
+  https?: HttpsConf | null;
 }
 
 const DOMAIN_PAGE = 1000;
@@ -41,6 +49,47 @@ function toRecord(d: CdnDomainDetail): DomainRecord {
     extra: compact({ type: d.type, product: d.product, geoCover: d.geoCover }),
   });
 }
+
+/**
+ * sslize 必传 forceHttps / http2Enable：不强制跳转（控制台默认关闭，开启会改变 HTTP 访问行为）；
+ * HTTP/2 的默认值文档没写，按文档示例开启
+ */
+const SSLIZE_DEFAULTS = { forceHttps: false, http2Enable: true };
+
+/**
+ * 七牛单个域名只能绑一张证书，没有双证书。按证书 ID 绑定（先上传到 SSL 证书服务）：
+ * - deploy：PUT /domain/<域名>/sslize 开启 HTTPS；
+ * - update：PUT /domain/<域名>/httpsconf 换证书。该接口的 forceHttps / http2Enable 不传时是否保留原值没有保证，
+ *   所以先读域名详情，把当前的强制跳转、HTTP/2、TLS 版本原样带回，只换 certId。
+ * 域名处理中（上一次修改未生效）等情况七牛会拒绝修改（如 400030 正在处理中），错误原样上报，不等待。
+ */
+const deployer: Deployer<AccessKeyCredentials> = {
+  unsupported(record) {
+    if (record.extra?.type === "pan") return "泛子域名的 HTTPS 配置继承所属泛域名，不能单独部署证书；请对泛域名（.example.com 形式）部署";
+    return undefined;
+  },
+  async apply(ctx, creds, target, input) {
+    let certId: string | undefined;
+    let note: string | undefined;
+    for (const record of target.records) {
+      const path = `/domain/${encodeURIComponent(record.domain)}`;
+      if (target.mode === "deploy") {
+        certId = await input.certId();
+        await qiniuRequest(ctx, creds, API_HOST, `${path}/sslize`, { method: "PUT", body: { certId, ...SSLIZE_DEFAULTS } });
+        continue;
+      }
+      const current = (await qiniuGet<CdnDomainDetail>(ctx, creds, API_HOST, path)).https ?? {};
+      certId = await input.certId();
+      if (current.certId === certId) {
+        note = "域名已绑定该证书，未重复提交";
+        continue;
+      }
+      const keep = compact({ forceHttps: current.forceHttps, http2Enable: current.http2Enable, tlsVersions: current.tlsVersions });
+      await qiniuRequest(ctx, creds, API_HOST, `${path}/httpsconf`, { method: "PUT", body: { certId, ...keep } });
+    }
+    return compact({ certId, note });
+  },
+};
 
 /**
  * CDN 域名（含全站加速 dcdn 域名，二者共用域名管理接口）：列表只有 HTTPS 开关没有证书 ID，
@@ -68,4 +117,5 @@ export const cdn: DomainService<AccessKeyCredentials> = {
     });
     return enrichFromSsl(ctx, creds, warn, records);
   },
+  deployer,
 };
