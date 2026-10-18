@@ -110,7 +110,7 @@ export function resolveFamily(env: Env, families: readonly EnvFamily[]): Credent
   return { state: "ok", family, id, secret, ...(token && { token }) };
 }
 
-export type Credentials<T> = { state: "ok"; credentials: T } | Exclude<CredentialState, { state: "ok" }>;
+export type Credentials<T> = { state: "ok"; credentials: T } | { state: "missing" } | { state: "incomplete"; missing: string[] };
 
 export function readAliyun(env: Env): Credentials<AliyunCredentials> {
   const r = resolveFamily(env, ENV_FAMILIES.aliyun);

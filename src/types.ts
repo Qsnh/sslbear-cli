@@ -2,6 +2,37 @@ export type Provider = "aliyun" | "tencent" | "volcengine" | "huawei" | "baidu" 
 
 export const PROVIDERS: readonly Provider[] = ["aliyun", "tencent", "volcengine", "huawei", "baidu", "qiniu"];
 
+/** issue 命令可用来自动设置 DNS 验证记录的 DNS 服务商：前 5 家与云厂商同名，复用同一组凭证 */
+export type DnsVendor =
+  | "aliyun"
+  | "tencent"
+  | "volcengine"
+  | "huawei"
+  | "baidu"
+  | "cloudflare"
+  | "aws"
+  | "google"
+  | "azure"
+  | "digitalocean"
+  | "godaddy";
+
+export const DNS_VENDORS: readonly DnsVendor[] = [
+  "aliyun",
+  "tencent",
+  "volcengine",
+  "huawei",
+  "baidu",
+  "cloudflare",
+  "aws",
+  "google",
+  "azure",
+  "digitalocean",
+  "godaddy",
+];
+
+/** 调用了接口的一方：云厂商或 DNS 服务商（错误信息、限流重试用） */
+export type Vendor = Provider | DnsVendor;
+
 export const PROVIDER_LABEL: Record<Provider, string> = {
   aliyun: "阿里云",
   tencent: "腾讯云",

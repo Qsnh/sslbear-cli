@@ -1,4 +1,4 @@
-import type { Provider } from "../types.js";
+import type { Vendor } from "../types.js";
 import type { Env } from "./env.js";
 
 export type Fetch = typeof fetch;
@@ -14,7 +14,7 @@ export interface QueryContext {
 
 export class CloudApiError extends Error {
   constructor(
-    public provider: Provider,
+    public provider: Vendor,
     public code: string,
     message: string,
     public requestId?: string,
@@ -56,7 +56,7 @@ export async function withRetry<T>(ctx: QueryContext, fn: () => Promise<T>): Pro
   }
 }
 
-export async function send(ctx: QueryContext, provider: Provider, url: string, init: RequestInit): Promise<RawResponse> {
+export async function send(ctx: QueryContext, provider: Vendor, url: string, init: RequestInit): Promise<RawResponse> {
   // 读响应体也在超时与网络错误处理范围内：响应头到了但响应体卡住 / 连接中断同样要重试
   try {
     const res = await ctx.fetch(url, { ...init, signal: AbortSignal.timeout(ctx.timeoutMs) });
@@ -71,7 +71,7 @@ export async function send(ctx: QueryContext, provider: Provider, url: string, i
   }
 }
 
-export function parseJson(provider: Provider, raw: RawResponse): unknown {
+export function parseJson(provider: Vendor, raw: RawResponse): unknown {
   try {
     return JSON.parse(raw.text);
   } catch {

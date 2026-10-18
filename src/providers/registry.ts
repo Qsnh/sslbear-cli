@@ -85,7 +85,7 @@ export interface EnvKeyStatus {
 }
 
 /** 按实际生效的名族展示（都没设置时展示推荐名族） */
-export function envKeyStatus(def: ProviderDef<unknown>, env: Env, mask: (v: string) => string): EnvKeyStatus[] {
+export function envKeyStatus(def: Pick<ProviderDef<unknown>, "envFamilies">, env: Env, mask: (v: string) => string): EnvKeyStatus[] {
   const r = resolveFamily(env, def.envFamilies);
   const f = r.state === "missing" ? def.envFamilies[0]! : r.family;
   const get = (name: string) => env[name]?.trim() || undefined;
