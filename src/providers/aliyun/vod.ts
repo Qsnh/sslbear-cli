@@ -6,6 +6,7 @@ import { mapLimit } from "../../lib/pool.js";
 import { toIso } from "../../lib/time.js";
 import type { DomainRecord } from "../../types.js";
 import type { DomainService, Warn } from "../registry.js";
+import { CAS_REGION, casCertName } from "./cas.js";
 import { callRpc } from "./client.js";
 
 interface VodDomain {
@@ -31,7 +32,10 @@ const ENDPOINT = "vod.cn-shanghai.aliyuncs.com";
 const VERSION = "2017-03-21";
 const PAGE = 50;
 
-/** 点播没有批量的 HTTPS 证书列表接口：只对开启了 HTTPS 的域名逐个查证书（并发 5） */
+/**
+ * 点播没有批量的 HTTPS 证书列表接口：只对开启了 HTTPS 的域名逐个查证书（并发 5）。
+ * 部署用 SetVodDomainSSLCertificate 按证书服务里的证书设置证书并打开 HTTPS，与 CDN 一样不涉及其他 HTTPS 配置。
+ */
 export const vod: DomainService<AliyunCredentials> = {
   key: "vod",
   label: "视频点播",
@@ -78,5 +82,22 @@ export const vod: DomainService<AliyunCredentials> = {
         extra: c?.CertType ? { certType: c.CertType } : undefined,
       });
     });
+  },
+  deployer: {
+    async apply(ctx, creds, target, input) {
+      const certId = await input.certId();
+      // 证书 ID 与证书名一并传：测试环境里用真实账号调通的就是这组参数
+      const certName = await casCertName(ctx, creds, certId);
+      for (const r of target.records) {
+        await callRpc(ctx, creds, {
+          endpoint: ENDPOINT,
+          version: VERSION,
+          action: "SetVodDomainSSLCertificate",
+          method: "POST",
+          params: { DomainName: r.domain, SSLProtocol: "on", CertType: "cas", CertId: certId, CertName: certName, CertRegion: CAS_REGION },
+        });
+      }
+      return { certId };
+    },
   },
 };

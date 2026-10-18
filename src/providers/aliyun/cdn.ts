@@ -4,7 +4,8 @@ import { compact } from "../../lib/compact.js";
 import { paginate } from "../../lib/paginate.js";
 import { toIso } from "../../lib/time.js";
 import type { DomainRecord } from "../../types.js";
-import type { DomainService, Warn } from "../registry.js";
+import type { Deployer, DomainService, Warn } from "../registry.js";
+import { CAS_REGION, casCertName } from "./cas.js";
 import { callRpc } from "./client.js";
 
 interface UserDomain {
@@ -15,6 +16,8 @@ interface UserDomain {
   /** CDN / 点播为 SslProtocol，DCDN 为 SSLProtocol */
   SslProtocol?: string;
   SSLProtocol?: string;
+  /** 直播的域名类型：liveVideo 播流域名，liveEdge 边缘推流域名 */
+  LiveDomainType?: string;
 }
 
 interface HttpsCertInfo {
@@ -36,6 +39,7 @@ interface Product {
   listPageSize: number;
   httpsAction: string;
   httpsPageSize: number;
+  deployer: Deployer<AliyunCredentials>;
 }
 
 /** 域名列表里的 HTTPS 开关：CDN 为 SslProtocol，DCDN 为 SSLProtocol，直播没有该字段 */
@@ -99,12 +103,54 @@ function cdnLike(p: Product): DomainService<AliyunCredentials> {
                 status: c.CertStatus,
               })
             : undefined,
-          extra: c?.CertType ? { certType: c.CertType } : undefined,
+          extra: compact({ certType: c?.CertType, liveDomainType: d.LiveDomainType }),
         });
       });
     },
+    deployer: p.deployer,
   };
 }
+
+/**
+ * CDN / DCDN：Set*DomainSSLCertificate 按证书服务里的证书 ID 设置证书并打开 HTTPS 开关。
+ * HTTP/2、强制跳转、TLS 版本、HSTS 等是各自独立的域名配置，不经过这个接口，换证书时保持原样，不需要先读后改。
+ */
+function sslCertDeployer(endpoint: string, version: string, action: string): Deployer<AliyunCredentials> {
+  return {
+    async apply(ctx, creds, target, input) {
+      const certId = await input.certId();
+      for (const r of target.records) {
+        await callRpc(ctx, creds, {
+          endpoint,
+          version,
+          action,
+          method: "POST",
+          params: { DomainName: r.domain, SSLProtocol: "on", CertType: "cas", CertId: certId, CertRegion: CAS_REGION },
+        });
+      }
+      return { certId };
+    },
+  };
+}
+
+/** 直播：SetLiveDomainCertificate 没有证书 ID 参数，按证书名引用证书服务里的证书；推流域名不能配 HTTPS */
+const liveDeployer: Deployer<AliyunCredentials> = {
+  unsupported: (r) => (r.extra?.liveDomainType === "liveEdge" ? "直播推流域名不能配置 HTTPS 证书" : undefined),
+  async apply(ctx, creds, target, input) {
+    const certId = await input.certId();
+    const certName = await casCertName(ctx, creds, certId);
+    for (const r of target.records) {
+      await callRpc(ctx, creds, {
+        endpoint: "live.aliyuncs.com",
+        version: "2016-11-01",
+        action: "SetLiveDomainCertificate",
+        method: "POST",
+        params: { DomainName: r.domain, SSLProtocol: "on", CertType: "cas", CertName: certName },
+      });
+    }
+    return { certId };
+  },
+};
 
 // HTTPS 列表接口的 PageSize 上限：DCDN 文档为 500，CDN / 直播未注明上限，用文档默认值 20 以免超限报错
 export const cdn = cdnLike({
@@ -116,6 +162,7 @@ export const cdn = cdnLike({
   listPageSize: 500,
   httpsAction: "DescribeCdnHttpsDomainList",
   httpsPageSize: 20,
+  deployer: sslCertDeployer("cdn.aliyuncs.com", "2018-05-10", "SetCdnDomainSSLCertificate"),
 });
 
 export const dcdn = cdnLike({
@@ -127,6 +174,7 @@ export const dcdn = cdnLike({
   listPageSize: 500,
   httpsAction: "DescribeDcdnHttpsDomainList",
   httpsPageSize: 500,
+  deployer: sslCertDeployer("dcdn.aliyuncs.com", "2018-01-15", "SetDcdnDomainSSLCertificate"),
 });
 
 export const live = cdnLike({
@@ -138,4 +186,5 @@ export const live = cdnLike({
   listPageSize: 50,
   httpsAction: "DescribeLiveHttpsDomainList",
   httpsPageSize: 20,
+  deployer: liveDeployer,
 });

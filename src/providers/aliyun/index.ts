@@ -1,6 +1,6 @@
 import { ENV_FAMILIES, readAliyun, type AliyunCredentials } from "../../lib/env.js";
 import { defineProvider } from "../registry.js";
-import { listCasCertificates } from "./cas.js";
+import { listCasCertificates, uploadCasCertificate } from "./cas.js";
 import { cdn, dcdn, live } from "./cdn.js";
 import { esa } from "./esa.js";
 import { oss } from "./oss.js";
@@ -21,6 +21,7 @@ export const aliyun = defineProvider<AliyunCredentials>({
   readCredentials: readAliyun,
   services: [cdn, dcdn, esa, oss, live, vod],
   listCertificates: listCasCertificates,
+  uploadCertificate: uploadCasCertificate,
   isInactive: (code, message) =>
     INACTIVE_CODES.has(code) ||
     (code === "UserNotFound" && /not opened/i.test(message)) ||
