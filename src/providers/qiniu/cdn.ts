@@ -89,6 +89,14 @@ async function writeHttps(
 }
 
 /**
+ * 2026-10 实测：没有 CN 的证书（Let's Encrypt tlsserver 配置文件签发的 45 天证书）七牛能上传、sslize / httpsconf 也返回成功，
+ * 但域名一直停在 processing（观察超过 1 小时），证书始终没下发到边缘，之后对该域名的修改（包括换回原证书、关闭 HTTPS）
+ * 也不再生效；同一时间带 CN 的新证书（同一中间证书、同样经 fusion 上传）1–2 分钟即下发完成。所以不上传、不写配置，直接报错。
+ */
+const NO_CN_MESSAGE =
+  "七牛 CDN 无法正常下发没有通用名（CN）的证书（如 Let's Encrypt tlsserver / shortlived 配置文件签发的证书）：实测部署后域名会一直处于处理中、证书不下发，之后的修改也不再生效。未做修改；请改用带 CN 的证书（如 Let's Encrypt classic 配置文件）";
+
+/**
  * 七牛单个域名只能绑一张证书，没有双证书。按证书 ID 绑定（先上传到 SSL 证书服务）：
  * - deploy：PUT /domain/<域名>/sslize 开启 HTTPS；
  * - update：PUT /domain/<域名>/httpsconf 换证书。实测该接口不传 forceHttps 会被重置为 false、不传 tlsVersions
@@ -103,6 +111,9 @@ const deployer: Deployer<AccessKeyCredentials> = {
     return undefined;
   },
   async apply(ctx, creds, target, input) {
+    if (!input.cert.commonName) {
+      throw new CloudApiError("qiniu", "CertWithoutCommonName", NO_CN_MESSAGE);
+    }
     let certId: string | undefined;
     let note: string | undefined;
     for (const record of target.records) {

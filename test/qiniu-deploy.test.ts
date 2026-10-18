@@ -350,6 +350,23 @@ describe("qiniu cdn deployer", () => {
     expectSigned(put);
   });
 
+  it("证书没有 CN（如 Let's Encrypt tlsserver / shortlived 配置文件签发的）时不上传、不改配置，直接报错", async () => {
+    const fetch = fakeFetch(() => ({ body: { code: 200 } }));
+    const noCn: LocalCert = { ...RSA, commonName: undefined };
+    for (const [r, mode] of [
+      [record("www.example.com"), "update"],
+      [record("img.example.com", { https: false, cert: undefined }), "deploy"],
+    ] as const) {
+      const i = { ...input(), cert: noCn };
+      const err = await deployer.apply(ctxOf(fetch), CREDS, { records: [r], mode }, i).catch((e) => e);
+      expect(err).toBeInstanceOf(CloudApiError);
+      expect(err).toMatchObject({ provider: "qiniu", code: "CertWithoutCommonName" });
+      expect(isRetryable(err)).toBe(false);
+      expect(i.uploads).toBe(0);
+    }
+    expect(fetch.calls).toHaveLength(0);
+  });
+
   it("泛域名（七牛写作 .example.com）原样放进路径", async () => {
     const fetch = fakeFetch((req) => {
       if (req.method === "GET") return { body: { name: ".example.com", type: "wildcard", protocol: "https", https: { certId: "cert-old", forceHttps: false, http2Enable: false } } };
