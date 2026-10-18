@@ -118,7 +118,7 @@ const FILLER = Array.from({ length: 100 }, (_, i) => ({ domain: `old${i}.example
 
 // 实测 HTTPS 域名列表的 certCommonName 装的是证书名，CLI 不用它
 const HTTPS_ROWS = [
-  // 同一域名 RSA + 国密两张服务端证书，取先到期的
+  // 同一域名 RSA + 国密两张服务端证书，cert 取先到期的；HTTPS 配置里绑定的是 RSA，另一张标为国密
   { domain: "www.example.com", certId: "cert-rsa", certName: "rsa", certCommonName: "rsa", certStartTime: "2026-01-01T00:00:00Z", certStopTime: "2027-01-01T00:00:00Z", certType: 1, status: 1 },
   { domain: "www.example.com", certId: "cert-sm2", certName: "sm2", certCommonName: "sm2", certStartTime: "2026-01-01T00:00:00Z", certStopTime: "2026-12-01T00:00:00Z", certType: 1, status: 1 },
   // 双向认证的客户端证书不算
@@ -150,11 +150,14 @@ function cdnRoute(req: FakeRequest) {
     const count = String(FILLER.length + HTTPS_ROWS.length);
     return { body: { count, rows: page === "1" ? FILLER : page === "2" ? HTTPS_ROWS : [] } };
   }
+  if (req.url.pathname === "/v2/domain/www.example.com/config" && req.url.search === "?https") {
+    return { body: { https: { enabled: true, certId: "cert-rsa", httpRedirect: false, httpsRedirect: false, http2Enabled: true, verifyClient: false } } };
+  }
   return undefined;
 }
 
 describe("baidu domains", () => {
-  it("CDN：域名列表与 HTTPS 域名列表合并，多证书取最早到期，缺到期时间的从证书管理补", async () => {
+  it("CDN：域名列表与 HTTPS 域名列表合并，多证书取最早到期并区分国密，缺到期时间的从证书管理补", async () => {
     const fetch = fakeFetch((req) => cdnRoute(req) ?? certRoute(req));
     const r = await runCli(["domains", "-p", "baidu", "-s", "cdn", "--json"], { env: BAIDU_ENV, fetch });
     expect(r.code).toBe(0);
@@ -172,9 +175,16 @@ describe("baidu domains", () => {
         notBefore: "2026-01-01T00:00:00.000Z",
         notAfter: "2026-12-01T00:00:00.000Z",
         status: "1",
+        algorithm: "SM2",
       },
+      certs: [
+        { id: "cert-rsa", name: "rsa", notBefore: "2026-01-01T00:00:00.000Z", notAfter: "2027-01-01T00:00:00.000Z", status: "1" },
+        { id: "cert-sm2", name: "sm2", notBefore: "2026-01-01T00:00:00.000Z", notAfter: "2026-12-01T00:00:00.000Z", status: "1", algorithm: "SM2" },
+      ],
       daysLeft: 47,
     });
+    // 只有多证书的域名才查 HTTPS 配置
+    expect(fetch.calls.filter((c) => c.url.pathname.endsWith("/config")).map((c) => c.url.pathname)).toEqual(["/v2/domain/www.example.com/config"]);
     expect(byDomain["img.example.com"]).toEqual({
       provider: "baidu",
       service: "cdn",

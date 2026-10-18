@@ -1,11 +1,11 @@
 import type { AccessKeyCredentials } from "../../lib/env.js";
-import type { QueryContext } from "../../lib/http.js";
+import { CloudApiError, type QueryContext } from "../../lib/http.js";
 import { compact } from "../../lib/compact.js";
 import { paginate } from "../../lib/paginate.js";
 import { mapLimit } from "../../lib/pool.js";
 import { toIso } from "../../lib/time.js";
 import type { CertInfo, DomainRecord } from "../../types.js";
-import type { DomainService, Warn } from "../registry.js";
+import type { DeployTarget, DomainService, Warn } from "../registry.js";
 import { enrichFromCertService } from "./cert.js";
 import { callBce } from "./client.js";
 
@@ -32,11 +32,15 @@ interface HttpsDomain {
   status?: number;
 }
 
-/** GET /v2/domain/{domain}/config?https 的 https 字段 */
+/**
+ * GET /v2/domain/{domain}/config?https 的 https 字段；PUT 用同一结构，其余字段为 httpRedirect、httpRedirectCode、
+ * httpsRedirect、httpsRedirectCode、noRedirectedUAs、http2Enabled、verifyClient、sslProtocols
+ */
 interface HttpsConfig {
   enabled?: boolean;
   /** 关闭 HTTPS 时证书可能仍保持绑定（只有显式传 certId="" 才解绑），此时不算 HTTPS */
   certId?: string;
+  [field: string]: unknown;
 }
 
 /** /v2/httpsDomains 的 pageSize 上限为 100 */
@@ -77,10 +81,37 @@ async function httpsDomainsBatch(ctx: QueryContext, creds: AccessKeyCredentials)
     // 客户端证书是双向认证用的 CA，不是网站对外提供的证书
     if (row.certType === 2) continue;
     const list = byDomain.get(row.domain) ?? [];
-    list.push(toCert(row));
+    if (!list.some((c) => c.id === row.certId)) list.push(toCert(row));
     byDomain.set(row.domain, list);
   }
   return byDomain;
+}
+
+const configPath = (domain: string) => `/v2/domain/${domain}/config`;
+
+function getHttpsConfig(ctx: QueryContext, creds: AccessKeyCredentials, domain: string): Promise<{ https?: HttpsConfig | null }> {
+  return callBce(ctx, creds, { host: HOST, path: configPath(domain), query: { https: "" } });
+}
+
+/**
+ * HTTPS 列表里同一域名有多张服务端证书时（国际证书 + 国密证书）：HTTPS 配置里绑定的是国际证书（每个域名只能绑一张 RSA / ECC），
+ * 其余标为国密（SM2），部署决策只按国际证书判断。查不到配置时记 issue，该域名不标算法，部署时按 unsupported 跳过。
+ */
+async function markSm2(ctx: QueryContext, creds: AccessKeyCredentials, warn: Warn, domains: UserDomain[], byDomain: Map<string, CertInfo[]>): Promise<void> {
+  const multi = domains.filter((d) => (byDomain.get(d.domain)?.length ?? 0) > 1);
+  await mapLimit(multi, 5, async (d) => {
+    try {
+      const intl = (await getHttpsConfig(ctx, creds, d.domain)).https?.certId;
+      const certs = byDomain.get(d.domain)!;
+      if (!intl || !certs.some((c) => c.id === intl)) return;
+      byDomain.set(
+        d.domain,
+        certs.map((c) => (c.id === intl ? c : { ...c, algorithm: "SM2" as const })),
+      );
+    } catch (e) {
+      warn(e, `domain ${d.domain} HTTPS 配置（用于区分国密证书）`);
+    }
+  });
 }
 
 /**
@@ -91,18 +122,38 @@ async function httpsPerDomain(ctx: QueryContext, creds: AccessKeyCredentials, wa
   const byDomain = new Map<string, CertInfo[]>();
   await mapLimit(domains, 5, async (d) => {
     try {
-      const res = await callBce<{ https?: HttpsConfig | null }>(ctx, creds, {
-        host: HOST,
-        path: `/v2/domain/${d.domain}/config`,
-        query: { https: "" },
-      });
-      const https = res.https;
+      const https = (await getHttpsConfig(ctx, creds, d.domain)).https;
       if (https?.enabled && https.certId) byDomain.set(d.domain, [{ id: https.certId }]);
     } catch (e) {
       warn(e, `domain ${d.domain} HTTPS 配置`);
     }
   });
   return byDomain;
+}
+
+/** 读回的配置原样写回，只去掉值为 null 的字段与空的 sslProtocols（文档：该参数不能为空列表） */
+function writable(cfg: HttpsConfig): HttpsConfig {
+  const out: HttpsConfig = {};
+  for (const [k, v] of Object.entries(cfg)) {
+    if (v === null || v === undefined) continue;
+    if (k === "sslProtocols" && Array.isArray(v) && v.length === 0) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+/**
+ * 设置 HTTPS（PUT /v2/domain/{domain}/config?https）是全量配置接口：先读出当前配置，只换 certId
+ * （部署时同时 enabled=true），跳转、HTTP/2、TLS 版本、双向认证等其余字段原样写回。
+ * HSTS、OCSP、QUIC 与国密 HTTPS 是独立的配置项，不受影响。
+ */
+async function bindCert(ctx: QueryContext, creds: AccessKeyCredentials, domain: string, certId: string, mode: DeployTarget["mode"]): Promise<void> {
+  const current = (await getHttpsConfig(ctx, creds, domain)).https ?? {};
+  if (mode === "update" && current.enabled !== true) {
+    throw new CloudApiError("baidu", "HttpsDisabled", `域名 ${domain} 的 HTTPS 已关闭，未替换证书；如需部署并开启 HTTPS 请用 --domain 点名后重新执行`);
+  }
+  const https: HttpsConfig = { ...writable(current), certId, ...(mode === "deploy" && { enabled: true }) };
+  await callBce(ctx, creds, { host: HOST, path: configPath(domain), query: { https: "" }, method: "PUT", body: { https } });
 }
 
 /**
@@ -125,6 +176,7 @@ export const cdn: DomainService<AccessKeyCredentials> = {
     } catch {
       certsByDomain = await httpsPerDomain(ctx, creds, warn, domains);
     }
+    await markSm2(ctx, creds, warn, domains, certsByDomain);
     const records = domains.map((d) => {
       const certs = certsByDomain.get(d.domain);
       return compact({
@@ -134,8 +186,23 @@ export const cdn: DomainService<AccessKeyCredentials> = {
         status: d.status,
         https: !!certs,
         cert: certs && earliest(certs),
+        certs: certs && certs.length > 1 ? certs : undefined,
       });
     });
     return enrichFromCertService(ctx, creds, warn, records);
+  },
+  deployer: {
+    unsupported(record) {
+      const certs = record.certs ?? [];
+      if (certs.length > 1 && !certs.some((c) => c.algorithm === "SM2")) {
+        return "该域名绑定了多张证书，但查不到 HTTPS 配置、无法区分国际证书与国密证书，为避免换错未处理；请稍后重试";
+      }
+      return undefined;
+    },
+    async apply(ctx, creds, target, input) {
+      const certId = await input.certId();
+      for (const r of target.records) await bindCert(ctx, creds, r.domain, certId, target.mode);
+      return { certId };
+    },
   },
 };

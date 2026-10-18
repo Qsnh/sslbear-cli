@@ -6,6 +6,10 @@ export interface BceRequest {
   host: string;
   path: string;
   query?: Record<string, string>;
+  /** 默认 GET */
+  method?: "GET" | "PUT" | "POST";
+  /** JSON 请求体（证书、私钥只能放在这里，不能放在 URL 上） */
+  body?: unknown;
 }
 
 interface BceErrorBody {
@@ -18,19 +22,24 @@ interface BceErrorBody {
 const THROTTLE = /RateLimit|TooManyRequests/i;
 
 /**
- * 调用百度智能云 REST API（GET + bce-auth-v1 签名），返回解析后的 JSON。
+ * 调用百度智能云 REST API（bce-auth-v1 签名），返回解析后的 JSON。
+ * 有请求体时以 JSON 发送，Content-Type 参与签名。
  * 错误以 HTTP 状态码表示，响应体为 {code, message, requestId}。
  */
 export async function callBce<T>(ctx: QueryContext, creds: AccessKeyCredentials, req: BceRequest): Promise<T> {
   return withRetry(ctx, async () => {
     const query = req.query ?? {};
+    const method = req.method ?? "GET";
     const timestamp = bceTimestamp(new Date());
     const headers: Record<string, string> = { "x-bce-date": timestamp };
     if (creds.securityToken) headers["x-bce-security-token"] = creds.securityToken;
+    const payload = req.body === undefined ? undefined : JSON.stringify(req.body);
+    // 与 sslbear-e2e 实测通过的写法一致
+    if (payload !== undefined) headers["Content-Type"] = "application/json;charset=utf-8";
     headers.Authorization = bceAuthorization({
       accessKeyId: creds.accessKeyId,
       secretAccessKey: creds.secretAccessKey,
-      method: "GET",
+      method,
       path: req.path,
       query,
       // Host 由 fetch 自动带上，只参与签名
@@ -41,7 +50,11 @@ export async function callBce<T>(ctx: QueryContext, creds: AccessKeyCredentials,
     const qs = Object.entries(query)
       .map(([k, v]) => (v === "" ? uriEncode(k) : `${uriEncode(k)}=${uriEncode(v)}`))
       .join("&");
-    const raw = await send(ctx, "baidu", `https://${req.host}${canonicalPath(req.path)}${qs ? `?${qs}` : ""}`, { method: "GET", headers });
+    const raw = await send(ctx, "baidu", `https://${req.host}${canonicalPath(req.path)}${qs ? `?${qs}` : ""}`, {
+      method,
+      headers,
+      ...(payload !== undefined && { body: payload }),
+    });
     let body: unknown;
     try {
       body = raw.text.trim() ? JSON.parse(raw.text) : {};
