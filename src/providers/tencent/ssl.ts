@@ -122,6 +122,8 @@ export function certAlias(cert: LocalCert): string {
 /**
  * 上传证书到 SSL 证书服务。Repeatable=false 时服务端按指纹查重：已有同一张证书则不新建，
  * 在 RepeatCertId 里返回已有证书的 ID（CertificateId 为空），所以不必先拉证书列表比对。
+ * 查重以指纹为准，只会复用确定的同一张证书；callTencent 超时 / 限流后原样重发也不会重复建证书
+ * （首次其实已建成时，重发命中 RepeatCertId，reused 报为 true）。
  */
 export async function uploadSslCertificate(
   ctx: QueryContext,
