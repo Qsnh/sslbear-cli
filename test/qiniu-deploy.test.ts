@@ -294,7 +294,8 @@ describe("qiniu cdn deployer：写接口只发一次，可重试的错误先重�
 describe("qiniu cdn deployer", () => {
   it("update：先读域名详情，PUT httpsconf 只换 certId，强制跳转 / HTTP/2 / TLS 版本原样带回", async () => {
     for (const https of [
-      { certId: "cert-old", forceHttps: true, http2Enable: false, tlsVersions: "TLSv1.2/TLSv1.3" },
+      // 详情的 tlsVersions 实测是数组；httpsconf 不传 forceHttps / tlsVersions 会被重置，必须原样带回
+      { certId: "cert-old", forceHttps: true, http2Enable: false, tlsVersions: ["TLSv1.2", "TLSv1.3"] },
       { certId: "cert-old", forceHttps: false, http2Enable: true },
     ]) {
       const fetch = fakeFetch((req) => {
@@ -319,7 +320,7 @@ describe("qiniu cdn deployer", () => {
     }
   });
 
-  it("update：详情里没有 forceHttps / http2Enable 时不传（七牛对未传项保留原值），不会按 false 覆盖", async () => {
+  it("update：详情里没有 forceHttps / http2Enable 时不传，不自行补默认值", async () => {
     const fetch = fakeFetch((req) => {
       if (req.method === "GET") return { body: { name: "www.example.com", protocol: "https", https: { certId: "cert-old" } } };
       if (req.method === "PUT") return { body: { code: 200 } };
