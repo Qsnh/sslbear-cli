@@ -116,6 +116,8 @@ export const cdn: DomainService<AccessKeyCredentials> = {
     });
   },
   deployer: {
+    // 实测 CDN 不接受没有 CN 的证书
+    requiresCommonName: true,
     unsupported: (record) => (ambiguousDual(record) ? AMBIGUOUS_DUAL : undefined),
     /**
      * BatchDeployCert 只关联证书（控制台文档：关联成功后自动对该域名启用 HTTPS），HTTP/2、TLS 版本等配置不动。

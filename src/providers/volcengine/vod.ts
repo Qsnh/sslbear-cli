@@ -216,6 +216,8 @@ export const vod: DomainService<AccessKeyCredentials> = {
     });
   },
   deployer: {
+    // 实测点播不接受没有 CN 的证书
+    requiresCommonName: true,
     unsupported(record) {
       const { space, region, type } = record.extra ?? {};
       if (!space || !region || !REGIONS[region] || !type) return "缺少点播空间、地域或域名类型，无法读取域名配置";

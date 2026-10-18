@@ -148,6 +148,8 @@ export const oss: DomainService<AliyunCredentials> = {
     return perBucket.flat();
   },
   deployer: {
+    // 实测 OSS 不接受没有 CN 的证书（MalformedCertificate）
+    requiresCommonName: true,
     async apply(ctx, creds, target, input) {
       const certId = `${await input.certId()}-${CAS_REGION}`;
       for (const r of target.records) {

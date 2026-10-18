@@ -160,6 +160,8 @@ const xmlEscape = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").
  * 统一走 SSL 证书服务便于复用）。该接口只管证书，不涉及自定义域名的其他配置，deploy / update 是同一个请求。
  */
 const deployer: Deployer<TencentCredentials> = {
+  // 实测 COS 不接受没有 CN 的证书
+  requiresCommonName: true,
   async apply(ctx, creds, target, input) {
     const record = target.records[0]!;
     const bucket = record.extra?.bucket;

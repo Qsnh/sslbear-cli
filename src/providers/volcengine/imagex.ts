@@ -219,6 +219,8 @@ export const imagex: DomainService<AccessKeyCredentials> = {
     return enrichFromCertCenter(ctx, creds, warn, records);
   },
   deployer: {
+    requiresCommonName:
+      "veImageX 实测会接受没有通用名（CN）的证书（如 Let's Encrypt 的短期证书），但边缘节点不会生效、仍下发原来的证书；未做修改，请改用带通用名的证书",
     unsupported: (record) =>
       !record.extra?.serviceId || !REGIONS[record.extra.region ?? ""] ? "缺少所属服务或地域信息" : undefined,
     /**

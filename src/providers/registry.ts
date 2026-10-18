@@ -45,6 +45,11 @@ export interface Deployer<C> {
    * 没开 HTTPS 的记录也会被询问：共享证书会让它开始提供 HTTPS 的，同样要返回键（它会挡住整组）
    */
   sharedScope?(record: DomainRecord): string | undefined;
+  /**
+   * 该服务不接受（或收下却不生效）没有通用名（CN）的证书：要部署 / 更新时编排层直接记为失败（CertWithoutCommonName），
+   * 不上传、不调用 apply。true 用通用说明，字符串为自定义说明
+   */
+  requiresCommonName?: boolean | string;
   /** 执行部署；失败直接抛错（CloudApiError 会带上错误码与 RequestId） */
   apply(ctx: QueryContext, creds: C, target: DeployTarget, input: DeployInput): Promise<DeployOutcome>;
 }

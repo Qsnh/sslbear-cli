@@ -2,7 +2,7 @@ import { CloudApiError, isRetryable, isRetryableCode, type QueryContext } from "
 import { mapLimit } from "../lib/pool.js";
 import { PROVIDER_DEFS, queryDomains, resolveTargets, type DomainQueryResult, type ProviderDefs, type QueryIssue } from "../query.js";
 import type { DeployTarget, DomainService, ProviderDef } from "../providers/registry.js";
-import type { CertInfo, DomainRecord, Provider } from "../types.js";
+import { PROVIDER_LABEL, type CertInfo, type DomainRecord, type Provider } from "../types.js";
 import { certCovers, normalizeDomain, type LocalCert } from "./cert.js";
 import { CONFIRM_HINT, decide, type Decision, type SkipReason } from "./plan.js";
 
@@ -54,6 +54,9 @@ export interface DeployPlan {
   report: DeployReport;
   pending: PendingItem[];
 }
+
+const NO_CN =
+  "不接受没有通用名（CN）的证书（如 Let's Encrypt shortlived / tlsserver 配置文件签发的证书），未做修改；请改用带 CN 的证书（如 Let's Encrypt classic 配置文件）";
 
 const UNSUPPORTED_SERVICE = "该服务暂不支持通过 CLI 部署证书";
 
@@ -212,6 +215,13 @@ export function buildPlan(ctx: QueryContext, cert: LocalCert, opts: DeployOption
     }
     const unsupported = unsupportedFor(record.https ? "update" : "deploy") ?? (neverDeployable ? unsupportedFor("update") : undefined);
     const decision = decide(record, cert, { named: isNamed, force: opts.force, now: ctx.now, ...(unsupported && { unsupported }) });
+    const needsCn = service.deployer?.requiresCommonName;
+    if (decision.kind !== "skip" && needsCn && !cert.commonName) {
+      // 云会拒收（或收下却不生效）没有 CN 的证书：出计划时就报失败，不上传、不写。这类服务不与 sharedScope 同用
+      const message = typeof needsCn === "string" ? needsCn : `${PROVIDER_LABEL[record.provider]} ${service.label} ${NO_CN}`;
+      if (inScope) results.push(failure(record, "CertWithoutCommonName", message));
+      continue;
+    }
     candidates.push({ record, service, decision, inScope, httpsUnknown: false });
   }
 

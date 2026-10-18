@@ -176,6 +176,8 @@ export const live: DomainService<AccessKeyCredentials> = {
     });
   },
   deployer: {
+    // 实测直播 CreateCert 不接受没有 CN 的证书
+    requiresCommonName: true,
     /**
      * BindCert 的 HTTP/2（默认关）与 TLS 版本范围（默认最低 TLSv1.2）不传即恢复默认，而直播没有能读出这两项当前值的接口，
      * 所以已开 HTTPS 的拉流域名不能安全地只换证书。推流域名不支持这两项设置，可以更新；没开 HTTPS 的域名点名部署时按默认开启。

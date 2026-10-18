@@ -6,7 +6,7 @@ import { loadLocalCert } from "../src/deploy/cert.js";
 import { executeDeploy, planDeploy, type DeployOptions } from "../src/deploy/run.js";
 import { ENV_FAMILIES } from "../src/lib/env.js";
 import { CloudApiError, isRetryable, isRetryableCode, type QueryContext } from "../src/lib/http.js";
-import type { ProviderDefs } from "../src/query.js";
+import { PROVIDER_DEFS, type ProviderDefs } from "../src/query.js";
 import type { Deployer, DomainService, ProviderDef } from "../src/providers/registry.js";
 import type { DomainRecord, Provider } from "../src/types.js";
 
@@ -193,6 +193,46 @@ describe("planDeploy / executeDeploy", () => {
       expect.objectContaining({ service: "live", action: "skipped", reason: "unsupported", message: "推流域名不能绑定证书" }),
       expect.objectContaining({ service: "vod", action: "skipped", reason: "platform_managed" }),
     ]);
+  });
+
+  it("服务不接受没有 CN 的证书时：要部署 / 更新的域名记 CertWithoutCommonName 失败，不上传、不写；本就跳过的照常跳过", async () => {
+    const noCn = loadLocalCert(readFileSync(join(FIX, "san-only-fullchain.pem"), "utf8"), readFileSync(join(FIX, "san-only-key.pem"), "utf8"), NOW);
+    const upload = vi.fn(async () => ({ id: "x", reused: false }));
+    const strict = { ...okDeployer(), requiresCommonName: true };
+    const custom = { ...okDeployer(), requiresCommonName: "七牛不行" };
+    const lenient = okDeployer();
+    const d = defs(
+      def(
+        "aliyun",
+        [
+          svc("cdn", [rec("cdn", "a.example.com"), rec("cdn", "b.example.com", { cert: { notAfter: LATER } })], strict),
+          svc("dcdn", [rec("dcdn", "a.example.com")], lenient),
+          svc("vod", [rec("vod", "a.example.com")], custom),
+        ],
+        upload,
+      ),
+    );
+    for (const dryRun of [true, false]) {
+      const plan = await planDeploy(ctx, noCn, { ...OPTS, dryRun }, d);
+      const r = dryRun ? plan.report : await executeDeploy(ctx, noCn, plan);
+      expect(r.results).toEqual([
+        expect.objectContaining({ service: "cdn", domain: "a.example.com", action: "failed", code: "CertWithoutCommonName", retryable: false, message: expect.stringContaining("没有通用名（CN）") }),
+        expect.objectContaining({ service: "cdn", domain: "b.example.com", action: "skipped", reason: "not_due" }),
+        expect.objectContaining({ service: "dcdn", action: dryRun ? "would_update" : "updated" }),
+        expect.objectContaining({ service: "vod", action: "failed", code: "CertWithoutCommonName", message: "七牛不行" }),
+      ]);
+    }
+    expect(strict.apply).not.toHaveBeenCalled();
+    expect(custom.apply).not.toHaveBeenCalled();
+    expect(lenient.apply).toHaveBeenCalledTimes(1);
+  });
+
+  it("实测不接受没有 CN 证书的服务都声明了 requiresCommonName，能接受的没有声明", () => {
+    const flag = (p: Provider, k: string) => PROVIDER_DEFS[p].services.find((x) => x.key === k)?.deployer?.requiresCommonName;
+    const strict: [Provider, string][] = [["aliyun", "oss"], ["tencent", "cdn"], ["tencent", "cos"], ["tencent", "vod"], ["volcengine", "cdn"], ["volcengine", "vod"], ["volcengine", "live"], ["volcengine", "imagex"], ["baidu", "cdn"], ["qiniu", "cdn"]];
+    const lenient: [Provider, string][] = [["aliyun", "cdn"], ["aliyun", "dcdn"], ["aliyun", "esa"], ["tencent", "live"], ["volcengine", "dcdn"], ["volcengine", "tos"], ["huawei", "cdn"], ["huawei", "live"], ["huawei", "obs"]];
+    for (const [p, k] of strict) expect(flag(p, k), `${p}/${k}`).toBeTruthy();
+    for (const [p, k] of lenient) expect(flag(p, k), `${p}/${k}`).toBeFalsy();
   });
 
   it("没有 deployer 的服务、deployer 声明不支持的记录：跳过 unsupported", async () => {

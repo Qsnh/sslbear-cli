@@ -60,6 +60,8 @@ async function listAppDomains(ctx: QueryContext, creds: TencentCredentials, app:
  * 2023-12-25 之后开通点播的账号必须带应用 ID（list 时已记在 extra.subAppId）。
  */
 const deployer: Deployer<TencentCredentials> = {
+  // 实测点播不接受没有 CN 的证书
+  requiresCommonName: true,
   unsupported(record) {
     if (record.extra?.type === "EdgeOne") return "该域名由 EdgeOne 分发，证书需在 EdgeOne 上配置";
     if (record.status === "Locked") return "域名处于锁定状态（Locked），暂时无法变更配置";

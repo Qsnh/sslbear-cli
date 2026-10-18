@@ -85,6 +85,8 @@ const HTTPS_BILLING_OFF =
  * 读到 HTTPS 其实已开启（查询之后被改过）时不写，交给重新执行时按更新规则判断。
  */
 const deployer: Deployer<TencentCredentials> = {
+  // 实测 CDN 不接受没有 CN 的证书（见 explainMissingCn）
+  requiresCommonName: true,
   async apply(ctx, creds, target, input) {
     const domain = target.records[0]!.domain;
     const write = (action: string, payload: Record<string, unknown>) =>

@@ -106,6 +106,7 @@ const NO_CN_MESSAGE =
  * 写请求不原样重发，见 writeHttps。
  */
 const deployer: Deployer<AccessKeyCredentials> = {
+  requiresCommonName: NO_CN_MESSAGE,
   unsupported(record) {
     if (record.extra?.type === "pan") return "泛子域名的 HTTPS 配置继承所属泛域名，不能单独部署证书；请对泛域名（.example.com 形式）部署";
     return undefined;

@@ -224,6 +224,8 @@ export const cdn: DomainService<AccessKeyCredentials> = {
     return enrichFromCertService(ctx, creds, warn, records);
   },
   deployer: {
+    // 实测证书管理不接受没有 CN 的证书（CertificateParameterInvalid）
+    requiresCommonName: true,
     unsupported(record) {
       const certs = record.certs ?? [];
       if (certs.length > 1 && !certs.some((c) => c.algorithm === "SM2")) {
