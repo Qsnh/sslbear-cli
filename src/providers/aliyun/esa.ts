@@ -1,4 +1,4 @@
-import type { LocalCert } from "../../deploy/cert.js";
+import { certCovers, type LocalCert } from "../../deploy/cert.js";
 import type { AliyunCredentials } from "../../lib/env.js";
 import { CloudApiError, withRetry, type QueryContext } from "../../lib/http.js";
 import { compact } from "../../lib/compact.js";
@@ -187,31 +187,58 @@ function httpsSwitch(configs: HttpsConfig[], host: string): HttpsSwitch {
 
 const hex = (s: string) => s.replace(/:/g, "").toLowerCase();
 
+/** 能按 Id 设置的站点证书类型（SetCertificate 的 Id 不支持 ESA 免费证书 free） */
+const settable = (c: SiteCert) => c.Type === "cas" || c.Type === "upload";
+
 /**
- * 往站点设置 CAS 证书，返回站点证书 ID。站点上已有同一张证书（同指纹，或没给指纹时同 CasId）时带它的 Id 原地更新
- * （如上次已添加、又被更晚配置的证书盖过，原地更新让它重新成为最晚配置的），否则新增一张。
+ * 往站点设置 CAS 证书，返回站点证书 ID。依次：
+ * 1. 站点上已有同一张证书（同指纹，或没给指纹时同 CasId）时带它的 Id 原地更新（如上次已添加、又被更晚配置的证书盖过，
+ *    原地更新让它重新成为最晚配置的）；
+ * 2. 有可替换的旧证书（replaceable）时带它的 Id 原地替换成新证书，不占站点证书配额；
+ * 3. 否则新增一张。
  * 新增不幂等：请求只发一次，遇到超时、限流等可重试错误时整体重来，先重新列出站点证书（不用缓存），
- * 上一轮的新增其实已成功时直接算成功，查不到再发，最多 3 轮。
+ * 上一轮的新增其实已成功时直接算成功，查不到再发，最多 3 轮。带 Id 的设置可以原样重发。
  */
-function setSiteCert(ctx: QueryContext, creds: AliyunCredentials, siteId: string, casId: string, cert: LocalCert): Promise<string> {
+function setSiteCert(
+  ctx: QueryContext,
+  creds: AliyunCredentials,
+  siteId: string,
+  casId: string,
+  cert: LocalCert,
+  replaceable: (c: SiteCert) => boolean,
+): Promise<string> {
   let added = false;
   return withRetry(ctx, async () => {
-    const same = (await listSiteCerts(ctx, creds, siteId)).find(
-      (c) =>
-        (c.Type === "cas" || c.Type === "upload") &&
-        (c.FingerprintSha256 ? hex(c.FingerprintSha256) === cert.fingerprint : String(c.CasId) === casId),
+    const siteCerts = await listSiteCerts(ctx, creds, siteId);
+    const same = siteCerts.find(
+      (c) => settable(c) && (c.FingerprintSha256 ? hex(c.FingerprintSha256) === cert.fingerprint : String(c.CasId) === casId),
     );
     if (same && added) return same.Id;
-    if (!same) added = true;
+    const into = same ?? siteCerts.find((c) => settable(c) && replaceable(c));
+    if (!into) added = true;
     const res = await callRpcOnce<{ Id?: string }>(ctx, creds, {
       endpoint: ENDPOINT,
       version: VERSION,
       action: "SetCertificate",
       method: "POST",
-      params: { SiteId: siteId, Type: "cas", CasId: casId, Region: CAS_REGION, Id: same?.Id },
+      params: { SiteId: siteId, Type: "cas", CasId: casId, Region: CAS_REGION, Id: into?.Id },
     });
-    return res.Id ?? same?.Id ?? casId;
+    return res.Id ?? into?.Id ?? casId;
   });
+}
+
+/**
+ * 可以原地替换成新证书的站点证书：是这组记录当前在用、与新证书同算法的那张（另一算法的保留），
+ * 且它的名字（CN 与 SAN）全部被新证书覆盖——替换后原来由它提供 HTTPS 的域名都改用新证书，不会有域名失去证书
+ */
+function replaceableBy(records: DomainRecord[], cert: LocalCert): (c: SiteCert) => boolean {
+  const inUse = new Set(
+    records.flatMap((r) => (r.certs ?? (r.cert ? [r.cert] : [])).filter((c) => c.algorithm === cert.algorithm && c.id).map((c) => c.id!)),
+  );
+  return (c) => {
+    const names = [c.CommonName ?? "", ...(c.SAN?.split(",") ?? [])].map((n) => n.trim()).filter(Boolean);
+    return inUse.has(c.Id) && algorithmOf(c.PubAlg) === cert.algorithm && names.length > 0 && names.every((n) => certCovers(cert.sans, n));
+  };
 }
 
 /** 往站点添加一种算法的证书不会替换另一算法的证书：支持该算法的客户端仍可能拿到它，提示用户 */
@@ -226,7 +253,7 @@ function keptNote(records: DomainRecord[], algorithm: LocalCert["algorithm"]): s
   const list = [...kept.values()]
     .map((c) => `${c.name ?? c.id}（${c.algorithm}${c.notAfter ? `，${c.notAfter.slice(0, 10)} 到期` : ""}）`)
     .join("、");
-  return `已在站点添加新证书；站点上另一算法的证书 ${list} 未被替换，支持该算法的客户端仍可能拿到它`;
+  return `站点上另一算法的证书 ${list} 未被替换，支持该算法的客户端仍可能拿到它`;
 }
 
 /**
@@ -382,11 +409,12 @@ export const esa: DomainService<AliyunCredentials> = {
         }
         return { certId: casId };
       }
-      // 站点证书：新增一张（ESA 按「有效期内、配置时间较晚」优先，新证书即对它覆盖的记录生效），旧证书不删除；
+      // 站点证书：能原地替换记录在用的同算法旧证书就替换（站点证书数受套餐配额限制，免费版只有 2 张），
+      // 否则新增一张（ESA 按「有效期内、配置时间较晚」优先，新证书即对它覆盖的记录生效），旧证书不删除；
       // 站点上已有同一张证书时原地更新它，不重复添加
       const siteId = first.extra?.siteId;
       if (!siteId) throw new Error(`${first.domain} 缺少 ESA 站点 ID`);
-      const certId = await setSiteCert(ctx, creds, siteId, casId, input.cert);
+      const certId = await setSiteCert(ctx, creds, siteId, casId, input.cert, replaceableBy(target.records, input.cert));
       const note = keptNote(target.records, input.cert.algorithm);
       return { certId, ...(note && { note }) };
     },
