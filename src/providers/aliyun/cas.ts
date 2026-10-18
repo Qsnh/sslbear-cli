@@ -1,6 +1,5 @@
-import { createPrivateKey, randomUUID } from "node:crypto";
+import { X509Certificate, createPrivateKey, randomUUID } from "node:crypto";
 import type { LocalCert } from "../../deploy/cert.js";
-import { SAME_CERT_TOLERANCE_MS } from "../../deploy/plan.js";
 import type { AliyunCredentials } from "../../lib/env.js";
 import { CloudApiError, withRetry, type QueryContext } from "../../lib/http.js";
 import { compact } from "../../lib/compact.js";
@@ -16,6 +15,7 @@ interface CertOrder {
   CommonName?: string;
   /** 逗号分隔 */
   Sans?: string;
+  /** 实测为签发者的组织名（如 Let's Encrypt） */
   Issuer?: string;
   /** YYYY-MM-DD，只有日期；实测为证书有效期的 UTC 日期 */
   StartDate?: string;
@@ -95,22 +95,36 @@ function uploadName(cert: LocalCert, suffix?: string): string {
 
 const hex = (s: string) => s.replace(/:/g, "").toLowerCase();
 const serial = (s: string) => hex(s).replace(/^0+/, "");
-const nameSet = (names: readonly string[]) => [...new Set(names.map((n) => n.trim().toLowerCase()).filter(Boolean))].sort().join(",");
+
+/** 叶子证书签发者 DN 里的 CN 与 O（小写）：证书服务的 Issuer 是组织名，本地证书的 issuer 只有 CN */
+function issuerNames(cert: LocalCert): string[] {
+  try {
+    return new X509Certificate(cert.certPem).issuer
+      .split("\n")
+      .map((l) => /^(?:CN|O)=(.+)$/.exec(l.trim())?.[1]?.trim().toLowerCase())
+      .filter((v): v is string => !!v);
+  } catch {
+    return [];
+  }
+}
+
+/** 精确的时间戳（毫秒）与本地证书的时间一致；只有日期的 StartDate / EndDate 无法确认，不算一致 */
+const sameTime = (ms: number | undefined, iso: string) => ms !== undefined && toIso(ms) === iso;
 
 /**
- * 证书服务里的这张是否就是要上传的证书：同 SHA-256 指纹；或同序列号且到期时间相同（序列号只在同一 CA 内唯一）；
- * 接口两者都没给时退而求其次，同 CN、同 SAN 且到期时间相差 48 小时内
+ * 证书服务里的这张是否就是要上传的证书，只认能确定的：给了 SHA-256 指纹就只看指纹；
+ * 没给指纹时同序列号、同签发者且起止时间一致（序列号只在同一 CA 内唯一）。都确认不了时按不是同一张处理，
+ * 宁可多传一份：同 CN、同 SAN、同到期的 RSA / ECC 两张证书不能互相复用
  */
 function sameCert(o: CertOrder, cert: LocalCert): boolean {
-  if (o.Sha2 && hex(o.Sha2) === cert.fingerprint) return true;
-  const end = Date.parse(notAfterOf(o) ?? "");
-  if (!Number.isFinite(end) || Math.abs(end - Date.parse(cert.notAfter)) > SAME_CERT_TOLERANCE_MS) return false;
-  if (o.SerialNo) return serial(o.SerialNo) === serial(cert.serialNumber);
-  if (o.Sha2) return false;
+  if (o.Sha2) return hex(o.Sha2) === cert.fingerprint;
+  if (!o.SerialNo || serial(o.SerialNo) !== serial(cert.serialNumber)) return false;
+  const issuer = o.Issuer?.trim().toLowerCase();
   return (
-    !!o.CommonName &&
-    o.CommonName.toLowerCase() === cert.commonName?.toLowerCase() &&
-    nameSet(o.Sans?.split(",") ?? []) === nameSet(cert.sans)
+    !!issuer &&
+    issuerNames(cert).includes(issuer) &&
+    sameTime(o.CertStartTime, cert.notBefore) &&
+    sameTime(o.CertEndTime, cert.notAfter)
   );
 }
 

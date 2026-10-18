@@ -1,6 +1,6 @@
 import type { LocalCert } from "../../deploy/cert.js";
 import type { AliyunCredentials } from "../../lib/env.js";
-import { CloudApiError, type QueryContext } from "../../lib/http.js";
+import { CloudApiError, withRetry, type QueryContext } from "../../lib/http.js";
 import { compact } from "../../lib/compact.js";
 import { paginate } from "../../lib/paginate.js";
 import { mapLimit } from "../../lib/pool.js";
@@ -8,7 +8,7 @@ import { toIso } from "../../lib/time.js";
 import type { CertInfo, DomainRecord } from "../../types.js";
 import type { DomainService, Warn } from "../registry.js";
 import { CAS_REGION } from "./cas.js";
-import { callRpc } from "./client.js";
+import { callRpc, callRpcOnce } from "./client.js";
 import { matchHost } from "./esa-rule.js";
 
 interface Site {
@@ -187,6 +187,33 @@ function httpsSwitch(configs: HttpsConfig[], host: string): HttpsSwitch {
 
 const hex = (s: string) => s.replace(/:/g, "").toLowerCase();
 
+/**
+ * 往站点设置 CAS 证书，返回站点证书 ID。站点上已有同一张证书（同指纹，或没给指纹时同 CasId）时带它的 Id 原地更新
+ * （如上次已添加、又被更晚配置的证书盖过，原地更新让它重新成为最晚配置的），否则新增一张。
+ * 新增不幂等：请求只发一次，遇到超时、限流等可重试错误时整体重来，先重新列出站点证书（不用缓存），
+ * 上一轮的新增其实已成功时直接算成功，查不到再发，最多 3 轮。
+ */
+function setSiteCert(ctx: QueryContext, creds: AliyunCredentials, siteId: string, casId: string, cert: LocalCert): Promise<string> {
+  let added = false;
+  return withRetry(ctx, async () => {
+    const same = (await listSiteCerts(ctx, creds, siteId)).find(
+      (c) =>
+        (c.Type === "cas" || c.Type === "upload") &&
+        (c.FingerprintSha256 ? hex(c.FingerprintSha256) === cert.fingerprint : String(c.CasId) === casId),
+    );
+    if (same && added) return same.Id;
+    if (!same) added = true;
+    const res = await callRpcOnce<{ Id?: string }>(ctx, creds, {
+      endpoint: ENDPOINT,
+      version: VERSION,
+      action: "SetCertificate",
+      method: "POST",
+      params: { SiteId: siteId, Type: "cas", CasId: casId, Region: CAS_REGION, Id: same?.Id },
+    });
+    return res.Id ?? same?.Id ?? casId;
+  });
+}
+
 /** 往站点添加一种算法的证书不会替换另一算法的证书：支持该算法的客户端仍可能拿到它，提示用户 */
 function keptNote(records: DomainRecord[], algorithm: LocalCert["algorithm"]): string | undefined {
   const kept = new Map<string, CertInfo>();
@@ -238,7 +265,8 @@ export const esa: DomainService<AliyunCredentials> = {
           });
           return { items: r.Configs ?? [], total: r.TotalCount };
         }).catch((e: unknown) => {
-          // 查不到 SSL/TLS 配置时不影响记录和证书的输出，HTTPS 只按证书判断，httpsSwitch 缺省
+          // 查不到 SSL/TLS 配置时不影响记录和证书的输出，HTTPS 只按证书判断，httpsSwitch 缺省；
+          // 有匹配证书的记录实际可能被开关关掉，标 httpsUnknown
           warn(e, `site ${site.SiteName} SSL/TLS 配置`);
           return undefined;
         }),
@@ -279,16 +307,24 @@ export const esa: DomainService<AliyunCredentials> = {
           // HTTPS 关闭时证书不会下发，不展示；只有申请中 / 申请失败的证书时也无法提供 HTTPS，但证书状态仍保留在 cert 里
           const eff = sw?.state === "off" ? [] : effective(certs.filter((x) => covers(x.names, r.RecordName)), ctx.now);
           const c = eff[0];
+          const https = !!c?.notAfter;
           return compact({
             provider: "aliyun" as const,
             service: "esa",
             domain: r.RecordName,
             status: site.Status,
-            https: !!c?.notAfter,
+            https,
             cert: c ? certInfo(c) : undefined,
             // RSA 与 ECC 两张同时生效时都列出，部署时只替换与新证书同算法的那张
             certs: eff.length > 1 ? eff.map(certInfo) : undefined,
-            extra: compact({ ...where, certType: c?.raw.Type, httpsSwitch: sw?.state, httpsRule: sw?.rule }),
+            extra: compact({
+              ...where,
+              certType: c?.raw.Type,
+              httpsSwitch: sw?.state,
+              httpsRule: sw?.rule,
+              // 没有已签发的匹配证书时开关怎样都不会提供 HTTPS；有证书时取决于查不到的开关
+              httpsUnknown: https && !httpsConfigs ? "true" : undefined,
+            }),
           });
         });
       const fromSaas = hostnames.map((h) => {
@@ -319,7 +355,12 @@ export const esa: DomainService<AliyunCredentials> = {
       mode === "update" || record.extra?.hostType === "saas"
         ? undefined
         : "ESA 普通记录的证书挂在站点上，开启 HTTPS 要改站点的 SSL/TLS 规则或站点证书，影响面超出单个域名，请在 ESA 控制台操作",
-    sharedScope: (record) => (record.extra?.hostType === "saas" ? undefined : record.extra?.siteId),
+    // 站点证书会作用到站点下被它覆盖的普通记录：开着 HTTPS 的会被换证书；没开 HTTPS 但 SSL/TLS 开关不是 off 的
+    // （开着 / partial / 查不到，只是还没有匹配的已签发证书）站点一加上证书就会开始提供 HTTPS；开关为 off 的不受影响
+    sharedScope: (record) => {
+      if (record.extra?.hostType === "saas") return undefined;
+      return record.https || record.extra?.httpsSwitch !== "off" ? record.extra?.siteId : undefined;
+    },
     async apply(ctx, creds, target, input) {
       const casId = await input.certId();
       const post = <T>(action: string, params: Record<string, string | undefined>) =>
@@ -341,18 +382,13 @@ export const esa: DomainService<AliyunCredentials> = {
         }
         return { certId: casId };
       }
-      // 站点证书：新增一张（ESA 按「有效期内、配置时间较晚」优先，新证书即对它覆盖的记录生效），旧证书不删除。
-      // 站点上已有同一张证书时（如上次已添加、又被更晚配置的证书盖过）原地更新它，不重复添加
+      // 站点证书：新增一张（ESA 按「有效期内、配置时间较晚」优先，新证书即对它覆盖的记录生效），旧证书不删除；
+      // 站点上已有同一张证书时原地更新它，不重复添加
       const siteId = first.extra?.siteId;
       if (!siteId) throw new Error(`${first.domain} 缺少 ESA 站点 ID`);
-      const same = (await listSiteCerts(ctx, creds, siteId)).find(
-        (c) =>
-          (c.Type === "cas" || c.Type === "upload") &&
-          (c.FingerprintSha256 ? hex(c.FingerprintSha256) === input.cert.fingerprint : String(c.CasId) === casId),
-      );
-      const res = await post<{ Id?: string }>("SetCertificate", { SiteId: siteId, Type: "cas", CasId: casId, Region: CAS_REGION, Id: same?.Id });
+      const certId = await setSiteCert(ctx, creds, siteId, casId, input.cert);
       const note = keptNote(target.records, input.cert.algorithm);
-      return { certId: res.Id ?? same?.Id ?? casId, ...(note && { note }) };
+      return { certId, ...(note && { note }) };
     },
   },
 };

@@ -49,7 +49,8 @@ const sslSwitch = (d: UserDomain) => d.SslProtocol ?? d.SSLProtocol;
  * CDN / DCDN / 直播的接口结构相同：域名列表 + HTTPS 证书列表两次分页查询后按域名合并，
  * 避免逐个域名查证书。HTTPS 列表的时间文档写的是北京时间 "YYYY-MM-DD HH:mm:ss"，实测 CDN / DCDN / 直播都返回 ISO 8601 UTC，toIso 两种都能解析。
  * 证书列表只用于补全证书信息：没有开启 HTTPS 的域名时不查；查询失败（如无权限）只记一条 issue，
- * 域名照常输出，HTTPS 以域名列表里的开关为准。
+ * 域名照常输出，HTTPS 以域名列表里的开关为准。没有开关字段的（直播）只能靠证书列表判断，
+ * 证书列表查询失败时 HTTPS 无法判断，记录标 httpsUnknown，https 仍按最佳猜测填 false。
  */
 function cdnLike(p: Product): DomainService<AliyunCredentials> {
   return {
@@ -68,6 +69,7 @@ function cdnLike(p: Product): DomainService<AliyunCredentials> {
       // 没有开关字段（直播）时只能靠证书列表判断 HTTPS，有域名就要查
       const needCerts = domains.some((d) => sslSwitch(d) !== "off");
       let certs: HttpsCertInfo[] = [];
+      let certsFailed = false;
       if (needCerts) {
         try {
           certs = await paginate(p.httpsPageSize, async (page) => {
@@ -79,7 +81,10 @@ function cdnLike(p: Product): DomainService<AliyunCredentials> {
           });
         } catch (e) {
           // 账号下没有任何 HTTPS 域名时接口报 NoHttpsDomain，等同空列表
-          if (!(e instanceof CloudApiError && e.code === "NoHttpsDomain")) warn(e, "HTTPS 证书列表（用于补全证书信息）");
+          if (!(e instanceof CloudApiError && e.code === "NoHttpsDomain")) {
+            warn(e, "HTTPS 证书列表（用于补全证书信息）");
+            certsFailed = true;
+          }
         }
       }
       const certByDomain = new Map(certs.map((c) => [c.DomainName, c]));
@@ -103,7 +108,11 @@ function cdnLike(p: Product): DomainService<AliyunCredentials> {
                 status: c.CertStatus,
               })
             : undefined,
-          extra: compact({ certType: c?.CertType, liveDomainType: d.LiveDomainType }),
+          extra: compact({
+            certType: c?.CertType,
+            liveDomainType: d.LiveDomainType,
+            httpsUnknown: ssl === undefined && certsFailed ? "true" : undefined,
+          }),
         });
       });
     },

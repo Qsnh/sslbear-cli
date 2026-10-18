@@ -106,13 +106,28 @@ describe("aliyun 上传证书到数字证书管理服务", () => {
     expect(list.get("Version")).toBe("2020-04-07");
   });
 
-  it("列表没给指纹时按序列号 + 到期时间复用（序列号前导零、大小写不同也算同一张）", async () => {
+  /** 与 CERT 序列号、签发者、起止时间都一致的证书服务记录（没给指纹） */
+  const sameSerial = (o: Record<string, unknown> = {}) =>
+    order({
+      SerialNo: "1a2b3c",
+      Issuer: "sslbear test CA",
+      CertStartTime: Date.parse("2026-01-01T00:00:00Z"),
+      CertEndTime: Date.parse("2027-01-01T00:00:00Z"),
+      ...o,
+    });
+
+  it("列表没给指纹时按序列号 + 签发者 + 起止时间复用（序列号前导零、大小写不同也算同一张）", async () => {
     const { ctx, fetch } = context(
       casRoutes([
         [
-          // 同序列号但到期时间差很多：别的 CA 签的另一张证书
-          order({ CertificateId: 111, SerialNo: "1a2b3c", EndDate: "2027-06-01", CertEndTime: Date.parse("2027-06-01T00:00:00Z") }),
-          order({ CertificateId: 222, SerialNo: "001a2b3c" }),
+          // 同序列号但起止时间不同、签发者不同：别的 CA 签的另一张证书
+          sameSerial({ CertificateId: 111, EndDate: "2027-06-01", CertEndTime: Date.parse("2027-06-01T00:00:00Z") }),
+          sameSerial({ CertificateId: 112, Issuer: "Other CA" }),
+          // 只有日期、没有精确起止时间：无法确认，不复用
+          sameSerial({ CertificateId: 113, CertStartTime: undefined, CertEndTime: undefined }),
+          // 给了指纹就只认指纹：指纹不同即使序列号等都相同也不是同一张
+          sameSerial({ CertificateId: 114, Sha2: "AA".repeat(32) }),
+          sameSerial({ CertificateId: 222, SerialNo: "001A2B3C" }),
         ],
       ]),
     );
@@ -120,17 +135,26 @@ describe("aliyun 上传证书到数字证书管理服务", () => {
     expect(calls(fetch, "UploadUserCertificate")).toHaveLength(0);
   });
 
-  it("没有指纹和序列号时按同 CN、到期相差 48 小时内、同 SAN 复用", async () => {
-    const { ctx } = context(
-      casRoutes([
-        [
-          order({ CertificateId: 111, CommonName: "example.com", Sans: "example.com" }),
-          // 只有日期的 EndDate 按北京时间当天结束计算，与证书到期时间相差不到 48 小时
-          order({ CertificateId: 222, CommonName: "EXAMPLE.com", Sans: "*.example.com, example.com", CertEndTime: undefined }),
-        ],
-      ]),
-    );
+  it("签发者按证书签发者 DN 的 CN 或 O 比对（证书服务返回的是组织名，如 Let's Encrypt）", async () => {
+    const { ctx } = context(casRoutes([[sameSerial({ CertificateId: 222, Issuer: "SSLBEAR TEST CA" })]]));
     expect(await aliyun.uploadCertificate!(ctx, CREDS, CERT)).toEqual({ id: "222", reused: true });
+  });
+
+  it("没有指纹和序列号时不复用：同 CN、同 SAN、同起止时间的另一张证书（如 RSA / ECC 两张）照常上传", async () => {
+    // ECC 与 RSA 测试证书 CN、SAN、起止时间完全相同，只有密钥和序列号不同
+    const rsaOrder = order({
+      CertificateId: 222,
+      Name: "rsa",
+      CommonName: "example.com",
+      Sans: CERT.sans.join(","),
+      CertStartTime: Date.parse(CERT.notBefore),
+      CertEndTime: Date.parse(CERT.notAfter),
+    });
+    for (const cert of [ECC, CERT]) {
+      const { ctx, fetch } = context(casRoutes([[rsaOrder]]));
+      expect(await aliyun.uploadCertificate!(ctx, CREDS, cert)).toEqual({ id: "9001", reused: false });
+      expect(calls(fetch, "UploadUserCertificate")).toHaveLength(1);
+    }
   });
 
   it("未命中：POST 表单上传，证书名带 CN 与到期日，PEM 和私钥不出现在 URL 上", async () => {
@@ -362,6 +386,21 @@ describe("aliyun ESA deployer", () => {
     expect(d.unsupported!({ ...custom, https: false }, "deploy")).toBeUndefined();
   });
 
+  it("sharedScope：站点证书会影响到的普通记录都归入站点——开着 HTTPS 的，以及没开 HTTPS 但 SSL/TLS 开关不是 off 的", () => {
+    const d = esa.deployer!;
+    const off = (httpsSwitch?: string) =>
+      rec("esa", "a.example.com", { https: false, cert: undefined, extra: { ...site, ...(httpsSwitch && { httpsSwitch }) } });
+    expect(d.sharedScope!(rec("esa", "a.example.com", { extra: { ...site, httpsSwitch: "on" } }))).toBe("1001");
+    // 开关开着 / partial / 查不到：只是还没有匹配的已签发证书，站点一加上覆盖它的证书就会开始提供 HTTPS
+    expect(d.sharedScope!(off("on"))).toBe("1001");
+    expect(d.sharedScope!(off("partial"))).toBe("1001");
+    expect(d.sharedScope!(off())).toBe("1001");
+    // 开关为 off：加证书也不会开启 HTTPS，不受影响
+    expect(d.sharedScope!(off("off"))).toBeUndefined();
+    // SaaS 域名的证书在域名自身上
+    expect(d.sharedScope!(rec("esa", "shop.customer.com", { https: false, cert: undefined, extra: { ...saas, httpsSwitch: "on" } }))).toBeUndefined();
+  });
+
   function esaWriteRoutes(siteCerts: unknown[]) {
     return (req: FakeRequest): FakeReply => {
       if (req.url.host !== ESA_HOST) return undefined;
@@ -388,6 +427,73 @@ describe("aliyun ESA deployer", () => {
     const { ctx, fetch } = context(esaWriteRoutes([{ Id: "same", Type: "upload", PubAlg: "RSA", FingerprintSha256: CERT.fingerprint.toUpperCase() }]));
     await esa.deployer!.apply(ctx, CREDS, target([rec("esa", "a.example.com", { extra: site })]), input());
     expect(form(calls(fetch, "SetCertificate")[0]!)).toEqual({ SiteId: "1001", Type: "cas", CasId: "9001", Region: "cn-hangzhou", Id: "same" });
+  });
+
+  /** 站点证书列表与 SetCertificate 的回复按调用次序依次返回（取完后重复最后一个） */
+  function esaSeqRoutes(lists: unknown[][], replies: FakeReply[]) {
+    let listed = 0;
+    let set = 0;
+    return (req: FakeRequest): FakeReply => {
+      if (req.url.host !== ESA_HOST) return undefined;
+      if (req.action === "ListCertificates") {
+        const list = lists[Math.min(listed++, lists.length - 1)]!;
+        return { body: { TotalCount: list.length, Result: list } };
+      }
+      if (req.action === "SetCertificate") return replies[Math.min(set++, replies.length - 1)];
+      return undefined;
+    };
+  }
+  const busy: FakeReply = { status: 503, body: { Code: "ServiceUnavailable", Message: "busy", RequestId: "r" } };
+  const added: FakeReply = { body: { Id: "esa-new", RequestId: "r" } };
+  /** 站点上的「同一张证书」：上一轮新增其实已成功时重新列出能看到它 */
+  const mine = (o: Record<string, unknown> = {}) => ({ Id: "esa-mine", Type: "cas", PubAlg: "RSA", FingerprintSha256: CERT.fingerprint.toUpperCase(), CasId: "9001", ...o });
+  const siteRecords = () => [rec("esa", "a.example.com", { extra: site })];
+  const setForms = (fetch: { calls: FakeRequest[] }) => calls(fetch, "SetCertificate").map(form);
+
+  it.each([
+    ["指纹", mine()],
+    ["CasId（站点证书没给指纹）", mine({ FingerprintSha256: undefined })],
+  ])("新增站点证书遇到可重试错误：不原样重发，先重新列出站点证书，按%s认出上一次已添加成功即算成功", async (_, found) => {
+    const { ctx, fetch } = context(esaSeqRoutes([[], [found]], [busy, added]));
+    expect(await esa.deployer!.apply(ctx, CREDS, target(siteRecords()), input())).toEqual({ certId: "esa-mine" });
+    expect(fetch.calls.map((c) => c.action)).toEqual(["ListCertificates", "SetCertificate", "ListCertificates"]);
+  });
+
+  it("新增遇到可重试错误、重新列出仍没有：再新增一次（仍不带 Id）", async () => {
+    const { ctx, fetch } = context(esaSeqRoutes([[]], [busy, added]));
+    expect(await esa.deployer!.apply(ctx, CREDS, target(siteRecords()), input())).toEqual({ certId: "esa-new" });
+    expect(fetch.calls.map((c) => c.action)).toEqual(["ListCertificates", "SetCertificate", "ListCertificates", "SetCertificate"]);
+    expect(setForms(fetch).every((f) => f.Id === undefined)).toBe(true);
+  });
+
+  it("另一张同 CN 的证书（指纹、CasId 都不同）不算同一张，重试时照常新增", async () => {
+    const other = mine({ Id: "esa-ecc", FingerprintSha256: ECC.fingerprint, CasId: "8000" });
+    const { ctx, fetch } = context(esaSeqRoutes([[other]], [busy, added]));
+    expect(await esa.deployer!.apply(ctx, CREDS, target(siteRecords()), input())).toEqual({ certId: "esa-new" });
+    expect(setForms(fetch)).toHaveLength(2);
+    expect(setForms(fetch).every((f) => f.Id === undefined)).toBe(true);
+  });
+
+  it("一直遇到可重试错误：最多 3 轮，每轮先重新列出，最后抛出可重试的错误", async () => {
+    const { ctx, fetch } = context(esaSeqRoutes([[]], [busy]));
+    const err = await esa.deployer!.apply(ctx, CREDS, target(siteRecords()), input()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CloudApiError);
+    expect(err).toMatchObject({ code: "ServiceUnavailable" });
+    expect(calls(fetch, "SetCertificate")).toHaveLength(3);
+    expect(calls(fetch, "ListCertificates")).toHaveLength(3);
+  });
+
+  it("新增遇到不可重试的错误：直接抛出，不重发", async () => {
+    const { ctx, fetch } = context(esaSeqRoutes([[]], [rpcError(400, "InvalidParameter", "bad")]));
+    await expect(esa.deployer!.apply(ctx, CREDS, target(siteRecords()), input())).rejects.toMatchObject({ code: "InvalidParameter" });
+    expect(calls(fetch, "SetCertificate")).toHaveLength(1);
+  });
+
+  it("站点上本来就有同一张证书：原地更新带它的 Id；遇到可重试错误重新列出后仍带 Id 原地更新", async () => {
+    const { ctx, fetch } = context(esaSeqRoutes([[mine({ Id: "same" })]], [busy, { body: { Id: "same", RequestId: "r" } }]));
+    expect(await esa.deployer!.apply(ctx, CREDS, target(siteRecords()), input())).toEqual({ certId: "same" });
+    expect(fetch.calls.map((c) => c.action)).toEqual(["ListCertificates", "SetCertificate", "ListCertificates", "SetCertificate"]);
+    expect(setForms(fetch).map((f) => f.Id)).toEqual(["same", "same"]);
   });
 
   it("SaaS 域名：UpdateCustomHostname 只改该域名的证书，记录绑定原样带回", async () => {
