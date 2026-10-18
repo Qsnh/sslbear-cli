@@ -1,12 +1,16 @@
 import type { AccessKeyCredentials } from "../../lib/env.js";
 import { CloudApiError, send, withRetry, type QueryContext } from "../../lib/http.js";
 import { memo } from "../../lib/paginate.js";
-import { apigAuthorization, canonicalQuery, sdkDate } from "./sign.js";
+import { apigAuthorization, canonicalQuery, hwEscape, sdkDate } from "./sign.js";
 
 export interface HuaweiRequest {
   host: string;
   path: string;
+  /** 缺省 GET */
+  method?: "GET" | "POST" | "PUT";
   query?: Record<string, string | number | undefined>;
+  /** JSON 请求体，参与签名；证书私钥等敏感内容只能放在这里，不能放在 query 上 */
+  body?: unknown;
   /** 区域级服务（如视频直播）用 AK/SK 认证时必须带 X-Project-Id */
   projectId?: string;
 }
@@ -49,7 +53,8 @@ function findError(body: unknown, status: number): { code: string; message: stri
 }
 
 /**
- * 调用华为云 API 网关下的 REST 接口（GET + SDK-HMAC-SHA256），返回解析后的 JSON。
+ * 调用华为云 API 网关下的 REST 接口（SDK-HMAC-SHA256，请求体参与签名），返回解析后的 JSON；
+ * 写接口成功时可能没有响应体（如 CDN 修改配置返回 204），此时返回空对象。
  * RequestId 只在 X-Request-Id 响应头里稳定出现，send() 拿不到响应头，这里取错误体中的 request_id（网关错误都带）。
  */
 export async function callHuawei<T>(ctx: QueryContext, creds: AccessKeyCredentials, req: HuaweiRequest): Promise<T> {
@@ -59,35 +64,41 @@ export async function callHuawei<T>(ctx: QueryContext, creds: AccessKeyCredentia
         .filter(([, v]) => v !== undefined && v !== "")
         .map(([k, v]) => [k, String(v)]),
     );
+    const method = req.method ?? "GET";
+    const body = req.body === undefined ? undefined : JSON.stringify(req.body);
     const signed: Record<string, string> = { "X-Sdk-Date": sdkDate(new Date()) };
     if (req.projectId) signed["X-Project-Id"] = req.projectId;
     if (creds.securityToken) signed["X-Security-Token"] = creds.securityToken;
     const authorization = apigAuthorization({
       accessKeyId: creds.accessKeyId,
       secretAccessKey: creds.secretAccessKey,
-      method: "GET",
+      method,
       path: req.path,
       query,
       // Host 由 fetch 自动带上，只参与签名
       headers: { ...signed, Host: req.host },
+      body,
     });
     // 与官方 SDK 一致：Content-Type 照常发送但不参与签名
     const headers = { ...signed, "Content-Type": "application/json", Authorization: authorization };
     const qs = canonicalQuery(query);
-    const raw = await send(ctx, "huawei", `https://${req.host}${req.path}${qs ? `?${qs}` : ""}`, { method: "GET", headers });
-    let body: unknown;
+    // 路径段与签名时一样逐段编码（如泛域名 *.example.com 里的 *），与官方 SDK 发出的 URL 一致
+    const path = req.path.split("/").map(hwEscape).join("/");
+    const raw = await send(ctx, "huawei", `https://${req.host}${path}${qs ? `?${qs}` : ""}`, { method, headers, ...(body !== undefined && { body }) });
+    if (method !== "GET" && raw.status < 400 && raw.text.trim() === "") return {} as T;
+    let parsed: unknown;
     try {
-      body = JSON.parse(raw.text);
+      parsed = JSON.parse(raw.text);
     } catch {
       const code = raw.status >= 400 ? `HTTP${raw.status}` : "InvalidResponse";
       throw new CloudApiError("huawei", code, `响应不是合法 JSON（HTTP ${raw.status}）：${raw.text.slice(0, 200)}`, undefined, raw.status);
     }
-    const err = findError(body, raw.status);
+    const err = findError(parsed, raw.status);
     if (err) {
       const code = THROTTLE_CODES.has(err.code) ? `Throttling.${err.code}` : err.code;
       throw new CloudApiError("huawei", code, err.message, err.requestId, raw.status);
     }
-    return body as T;
+    return parsed as T;
   });
 }
 
