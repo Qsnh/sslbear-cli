@@ -5,8 +5,10 @@ import type { LocalCert } from "./cert.js";
 /** 用户定的更新窗口：当前证书 30 天内到期才直接替换，超过需用户二次确认（--force） */
 export const RENEW_WITHIN_DAYS = 30;
 
-/** 两张证书到期时间相差在此范围内视为同一张：有的服务只精确到天，华为证书列表的时间还差 8 小时 */
+/** 两张证书到期（及签发）时间相差在此范围内视为同一张：有的服务只精确到天，华为证书列表的时间还差 8 小时 */
 export const SAME_CERT_TOLERANCE_MS = 48 * 3_600_000;
+
+const DAY_MS = 86_400_000;
 
 export type SkipReason =
   | "platform_managed"
@@ -16,10 +18,11 @@ export type SkipReason =
   | "unknown_expiry"
   | "newer_current"
   | "not_due"
+  | "same_expiry"
   | "shared_cert_blocked";
 
 /** 这几类跳过需要用户二次确认后加 --force 才执行 */
-export const NEEDS_CONFIRM: ReadonlySet<SkipReason> = new Set<SkipReason>(["unknown_expiry", "newer_current", "not_due"]);
+export const NEEDS_CONFIRM: ReadonlySet<SkipReason> = new Set<SkipReason>(["unknown_expiry", "newer_current", "not_due", "same_expiry"]);
 
 export const CONFIRM_HINT = "确需提前更换请向用户确认后加 --force 重新执行（可配合 -d 只针对这些域名）";
 
@@ -65,15 +68,23 @@ export function decide(record: DomainRecord, cert: LocalCert, o: DecideOptions):
   const base = { ...(oldCert && { oldCert }), ...(oldDaysLeft !== undefined && { oldDaysLeft }) };
   const oldMs = Date.parse(oldCert?.notAfter ?? "");
   const newMs = Date.parse(cert.notAfter);
-  if (Number.isFinite(oldMs) && Math.abs(oldMs - newMs) <= SAME_CERT_TOLERANCE_MS) {
-    return { ...skip("already_current", "已是该证书（到期时间相同）"), ...base };
-  }
+  const near = (a: number, b: number) => Math.abs(a - b) <= SAME_CERT_TOLERANCE_MS;
 
   let confirm: [SkipReason, string] | undefined;
-  if (!Number.isFinite(oldMs)) confirm = ["unknown_expiry", "查不到当前证书的到期时间"];
+  if (Number.isFinite(oldMs) && near(oldMs, newMs)) {
+    // 到期时间相同还要看签发时间：同一天到期的重签证书不是同一张；查不到旧证书签发时间时只能按到期时间判断
+    const oldStart = Date.parse(oldCert?.notBefore ?? "");
+    if (!Number.isFinite(oldStart) || near(oldStart, Date.parse(cert.notBefore))) {
+      return { ...skip("already_current", "已是该证书（到期时间相同）"), ...base };
+    }
+    confirm = ["same_expiry", "当前证书与新证书到期时间相同但签发时间不同（可能是重签的证书）"];
+  } else if (!Number.isFinite(oldMs)) confirm = ["unknown_expiry", "查不到当前证书的到期时间"];
   else if (oldMs - newMs > SAME_CERT_TOLERANCE_MS) {
     confirm = ["newer_current", `当前证书 ${day(oldCert!.notAfter!)} 到期，比新证书（${day(cert.notAfter)}）还晚`];
-  } else if (oldDaysLeft! > RENEW_WITHIN_DAYS) confirm = ["not_due", `当前证书还剩 ${oldDaysLeft} 天，未到更新时间`];
+  } else if (oldMs - o.now.getTime() > RENEW_WITHIN_DAYS * DAY_MS) {
+    // 按毫秒比较：剩 30 天 23 小时也算未到更新时间，展示的天数仍向下取整
+    confirm = ["not_due", `当前证书还剩 ${oldDaysLeft} 天，未到更新时间`];
+  }
 
   if (confirm && !o.force) {
     return { kind: "skip", reason: confirm[0], message: `${confirm[1]}；${CONFIRM_HINT}`, needsConfirm: true, ...base };

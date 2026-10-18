@@ -1,10 +1,10 @@
-import { CloudApiError, isRetryable, type QueryContext } from "../lib/http.js";
+import { CloudApiError, isRetryable, isRetryableCode, type QueryContext } from "../lib/http.js";
 import { mapLimit } from "../lib/pool.js";
 import { PROVIDER_DEFS, queryDomains, resolveTargets, type DomainQueryResult, type ProviderDefs, type QueryIssue } from "../query.js";
 import type { DeployTarget, DomainService, ProviderDef } from "../providers/registry.js";
 import type { CertInfo, DomainRecord, Provider } from "../types.js";
 import { certCovers, normalizeDomain, type LocalCert } from "./cert.js";
-import { decide, type Decision, type SkipReason } from "./plan.js";
+import { CONFIRM_HINT, decide, type Decision, type SkipReason } from "./plan.js";
 
 export interface DeployOptions {
   providers?: Provider[];
@@ -57,12 +57,16 @@ export interface DeployPlan {
 
 const UNSUPPORTED_SERVICE = "该服务暂不支持通过 CLI 部署证书";
 
+const HTTPS_UNKNOWN = "查询该域名的 HTTPS 配置失败（见 issues），无法判断现状，未做修改；可稍后重试";
+
 interface Candidate {
   record: DomainRecord;
   service: DomainService<unknown>;
   decision: Decision;
   /** 在本次处理范围内（未用 -d，或被 -d 点名） */
   inScope: boolean;
+  /** 查询失败导致不知道是否开着 HTTPS / 绑着什么证书（extra.httpsUnknown），不能做任何决定 */
+  httpsUnknown: boolean;
 }
 
 function before(d: Decision): DeployResult["before"] {
@@ -93,7 +97,7 @@ function planned(r: DomainRecord, d: Decision, cert: LocalCert): DeployResult {
   };
 }
 
-function failure(r: Partial<DomainRecord> & { domain: string }, code: string, message: string): DeployResult {
+function failure(r: Partial<DomainRecord> & { domain: string }, code: string, message: string, retryable = false): DeployResult {
   return {
     ...(r.provider && { provider: r.provider }),
     ...(r.service && { service: r.service }),
@@ -101,14 +105,59 @@ function failure(r: Partial<DomainRecord> & { domain: string }, code: string, me
     action: "failed",
     code,
     message,
-    retryable: false,
+    retryable,
   };
 }
 
-/** 共享作用域（如 ESA 站点）：组内被新证书覆盖、开着 HTTPS 的记录必须全都在范围内且都会被更新，才整组执行 */
-function resolveShared(group: Candidate[]): { blockedBy: Candidate[]; confirmable: boolean } {
-  const blockedBy = group.filter((c) => !c.inScope || (c.decision.kind !== "update" && c.decision.reason !== "already_current"));
-  return { blockedBy, confirmable: blockedBy.length > 0 && blockedBy.every((c) => c.inScope && c.decision.needsConfirm) };
+/**
+ * 共享作用域（如 ESA 站点）里挡住整组的记录：不在范围内、HTTPS 状态未知、没开 HTTPS（加上共享证书后它会开始用新证书），
+ * 或自身会被跳过（已是该证书的除外）。没有阻挡项才整组执行。
+ */
+function blocks(c: Candidate): boolean {
+  if (!c.inScope || c.httpsUnknown || !c.record.https) return true;
+  return c.decision.kind === "skip" && c.decision.reason !== "already_current";
+}
+
+/** 阻挡项都在范围内、且都是「需确认」的跳过时，--force 能放行整组 */
+function confirmable(blockers: Candidate[]): boolean {
+  return blockers.every((b) => b.inScope && !b.httpsUnknown && b.decision.needsConfirm);
+}
+
+function withoutConfirmHint(message: string | undefined): string | undefined {
+  const suffix = `；${CONFIRM_HINT}`;
+  return message?.endsWith(suffix) ? message.slice(0, -suffix.length) : message;
+}
+
+/** 阻挡项的原因，如「未用 -d 点名」「当前证书还剩 47 天」 */
+function blockerNote(c: Candidate): string {
+  const d = c.decision;
+  const notes: string[] = [];
+  if (!c.inScope) notes.push("未用 -d 点名");
+  if (c.httpsUnknown) notes.push("查询 HTTPS 配置失败，无法判断现状");
+  else if (!c.record.https) notes.push("未开启 HTTPS，站点加证书后会开始用新证书提供 HTTPS");
+  else if (d.kind === "skip" && d.reason !== "already_current") {
+    notes.push(d.reason === "not_due" ? `当前证书还剩 ${d.oldDaysLeft} 天` : (withoutConfirmHint(d.message) ?? d.reason ?? ""));
+  }
+  return notes.join("；");
+}
+
+/** 共享组被挡住时的说明：逐个列出阻挡项及原因，并说明怎样才能放行 */
+function sharedBlockedMessage(group: Candidate[], blockers: Candidate[], canConfirm: boolean): string {
+  const list = blockers.map((b) => `${b.record.domain}（${blockerNote(b)}）`).join("、");
+  const head = `证书挂在多条记录共享的配置上（如 ESA 站点），无法只更新其中一部分；挡住更新的记录：${list}`;
+  if (canConfirm) {
+    // 已是该证书的记录不带 needsConfirm，按提示用 -d 只点名需确认的域名时会漏掉它们，变成范围外的阻挡项
+    const current = group.filter((c) => c.decision.reason === "already_current").map((c) => c.record.domain);
+    const note = current.length ? `；用 -d 时须同时点名同组已是该证书的 ${current.join("、")}` : "";
+    return `${head}${note}；${CONFIRM_HINT}`;
+  }
+  const hints: string[] = [];
+  if (blockers.some((b) => !b.inScope)) hints.push("把未点名的记录一并用 -d 点名");
+  if (blockers.some((b) => b.decision.needsConfirm)) hints.push("需确认的记录向用户确认后加 --force");
+  if (blockers.some((b) => b.httpsUnknown)) hints.push("查询失败的记录稍后重试");
+  const stuck = (b: Candidate) => !b.httpsUnknown && (!b.record.https || (b.decision.kind === "skip" && !b.decision.needsConfirm && b.decision.reason !== "already_current"));
+  if (blockers.some(stuck)) hints.push("未开启 HTTPS 或无法处理的记录无法通过本命令放行，需先在云厂商控制台处理");
+  return `${head}；放行方法：${hints.join("；")}`;
 }
 
 /** 查询所选云厂商 / 服务上的现状；与 buildPlan 拆开，终端确认后可用同一份结果重新出计划，不再查一遍云接口 */
@@ -130,11 +179,14 @@ export function buildPlan(ctx: QueryContext, cert: LocalCert, opts: DeployOption
   // 点名的域名：查无此域名、证书不覆盖都明确记为失败
   if (named) {
     const queried = new Set(query.items.map((r) => normalizeDomain(r.domain)));
-    const failedServices = query.issues.filter((i) => i.kind === "error" && !i.target).map((i) => `${i.provider}/${i.service}`);
+    // 整个服务或其中某个子项（bucket、站点等）查询失败，域名都可能在里面；有可重试的失败时重试可能就找到了
+    const errors = query.issues.filter((i) => i.kind === "error");
+    const failedQueries = [...new Set(errors.map((i) => `${i.provider}/${i.service}${i.target ? ` ${i.target}` : ""}`))];
+    const retryable = errors.some((i) => isRetryableCode(i.code));
     for (const name of named) {
       if (queried.has(name)) continue;
-      const hint = failedServices.length ? `；以下服务查询失败，域名可能在其中：${failedServices.join("、")}` : "";
-      results.push(failure({ domain: name }, "DomainNotFound", `所选云厂商 / 服务上没有找到该域名${hint}`));
+      const hint = failedQueries.length ? `；以下查询失败，域名可能在其中：${failedQueries.join("、")}` : "";
+      results.push(failure({ domain: name }, "DomainNotFound", `所选云厂商 / 服务上没有找到该域名${hint}`, retryable));
     }
   }
 
@@ -147,16 +199,24 @@ export function buildPlan(ctx: QueryContext, cert: LocalCert, opts: DeployOption
     }
     const def = defs[record.provider];
     const service = def.services.find((s) => s.key === record.service)!;
+    const inScope = !named || isNamed;
+    if (record.extra?.httpsUnknown === "true") {
+      // 不能当成没开 HTTPS 跳过（它可能正是要更新的域名），也不能部署或更新：一律记为可重试的失败；
+      // 仍参与共享作用域分组，挡住同组的其他记录
+      if (inScope) results.push(failure(record, "HttpsStateUnknown", HTTPS_UNKNOWN, true));
+      candidates.push({ record, service, decision: { kind: "skip" }, inScope, httpsUnknown: true });
+      continue;
+    }
     const mode = record.https ? "update" : "deploy";
     const unsupported = service.deployer ? service.deployer.unsupported?.(record, mode) : UNSUPPORTED_SERVICE;
     const decision = decide(record, cert, { named: isNamed, force: opts.force, now: ctx.now, ...(unsupported && { unsupported }) });
-    candidates.push({ record, service, decision, inScope: !named || isNamed });
+    candidates.push({ record, service, decision, inScope, httpsUnknown: false });
   }
 
   const groups = new Map<string, Candidate[]>();
   for (const c of candidates) {
-    // 没开 HTTPS 的记录不受共享证书影响
-    const scope = c.record.https ? c.service.deployer?.sharedScope?.(c.record) : undefined;
+    // 不论是否开着 HTTPS 都问 deployer：没开 HTTPS 的记录也可能被共享证书波及（站点加证书后开始用新证书）
+    const scope = c.service.deployer?.sharedScope?.(c.record);
     if (scope === undefined) continue;
     const key = `${c.record.provider}/${c.record.service}/${scope}`;
     groups.set(key, [...(groups.get(key) ?? []), c]);
@@ -169,7 +229,7 @@ export function buildPlan(ctx: QueryContext, cert: LocalCert, opts: DeployOption
   };
 
   for (const c of candidates) {
-    if (!c.inScope || grouped.has(c)) continue;
+    if (!c.inScope || c.httpsUnknown || grouped.has(c)) continue;
     if (c.decision.kind === "skip") {
       results.push(skipped(c.record, c.decision));
       continue;
@@ -179,30 +239,37 @@ export function buildPlan(ctx: QueryContext, cert: LocalCert, opts: DeployOption
     push(c, [c.record], c.decision.kind, [item]);
   }
 
+  // 共享作用域：先算阻挡项，再给组内范围内的记录出结果（HTTPS 状态未知的已在上面记为失败）
   for (const group of groups.values()) {
-    const inScope = group.filter((c) => c.inScope);
-    const updates = inScope.filter((c) => c.decision.kind === "update");
-    const { blockedBy, confirmable } = resolveShared(group);
-    for (const c of inScope.filter((x) => x.decision.kind === "skip")) results.push(skipped(c.record, c.decision));
-    if (updates.length === 0) continue;
-    if (blockedBy.length > 0) {
-      const names = blockedBy.map((b) => b.record.domain).join("、");
-      const why = confirmable
-        ? `它们未到更新时间，确需提前更换请向用户确认后加 --force 重新执行`
-        : `请把它们一并用 --domain 点名，或等它们也满足更新条件后重新执行`;
-      for (const c of updates) {
-        results.push({
-          ...skipped(c.record, { kind: "skip", ...(c.decision.oldCert && { oldCert: c.decision.oldCert }), ...(c.decision.oldDaysLeft !== undefined && { oldDaysLeft: c.decision.oldDaysLeft }) }),
-          reason: "shared_cert_blocked",
-          message: `证书挂在共享的配置上，会同时换掉 ${names} 的证书；${why}`,
-          ...(confirmable && { needsConfirm: true as const }),
-        });
-      }
+    const inScope = group.filter((c) => c.inScope && !c.httpsUnknown);
+    const blockers = group.filter(blocks);
+    if (blockers.length === 0) {
+      // 此时组内全部在范围内、开着 HTTPS，且不是更新就是已是该证书
+      for (const c of inScope.filter((x) => x.decision.kind === "skip")) results.push(skipped(c.record, c.decision));
+      const updates = inScope.filter((c) => c.decision.kind === "update");
+      if (updates.length === 0) continue;
+      const items = updates.map((c) => planned(c.record, c.decision, cert));
+      results.push(...items);
+      push(updates[0]!, updates.map((c) => c.record), "update", items);
       continue;
     }
-    const items = updates.map((c) => planned(c.record, c.decision, cert));
-    results.push(...items);
-    push(updates[0]!, updates.map((c) => c.record), "update", items);
+    const canConfirm = confirmable(blockers);
+    const message = sharedBlockedMessage(group, blockers, canConfirm);
+    for (const c of inScope) {
+      const d = c.decision;
+      // 自身就不会处理的（已是该证书、不支持、没开 HTTPS 未点名等）照常报自身原因；
+      // --force 能放行整组时，需确认的记录也照常报自身原因（本身已带 needsConfirm）
+      if (d.kind === "skip" && (!d.needsConfirm || canConfirm)) {
+        results.push(skipped(c.record, d));
+        continue;
+      }
+      results.push({
+        ...skipped(c.record, { kind: "skip", ...(d.oldCert && { oldCert: d.oldCert }), ...(d.oldDaysLeft !== undefined && { oldDaysLeft: d.oldDaysLeft }) }),
+        reason: "shared_cert_blocked",
+        message,
+        ...(canConfirm && { needsConfirm: true as const }),
+      });
+    }
   }
 
   results.sort(byTarget);

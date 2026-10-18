@@ -4,7 +4,7 @@ import { NEEDS_CONFIRM, RENEW_WITHIN_DAYS, decide, pickOldCert } from "../src/de
 import type { DomainRecord } from "../src/types.js";
 
 const NOW = new Date("2026-10-15T00:00:00Z");
-const CERT = { notAfter: "2027-01-01T00:00:00.000Z", algorithm: "RSA", sans: ["example.com"] } as LocalCert;
+const CERT = { notBefore: "2026-10-01T00:00:00.000Z", notAfter: "2027-01-01T00:00:00.000Z", algorithm: "RSA", sans: ["example.com"] } as LocalCert;
 
 const rec = (r: Partial<DomainRecord>): DomainRecord => ({ provider: "aliyun", service: "cdn", domain: "example.com", https: true, ...r });
 const on = (notAfter?: string) => rec({ cert: notAfter ? { name: "old", notAfter } : { name: "old" } });
@@ -13,7 +13,7 @@ const opts = { named: false, force: false, now: NOW };
 describe("decide", () => {
   it("阈值固定 30 天", () => {
     expect(RENEW_WITHIN_DAYS).toBe(30);
-    expect([...NEEDS_CONFIRM].sort()).toEqual(["newer_current", "not_due", "unknown_expiry"]);
+    expect([...NEEDS_CONFIRM].sort()).toEqual(["newer_current", "not_due", "same_expiry", "unknown_expiry"]);
   });
 
   it("平台托管域名跳过（--force 也不处理）", () => {
@@ -44,6 +44,22 @@ describe("decide", () => {
     }
   });
 
+  it("旧证书签发时间也在 48 小时内（或查不到签发时间）才算同一张", () => {
+    const same = rec({ cert: { name: "old", notBefore: "2026-10-02T12:00:00Z", notAfter: "2027-01-01T00:00:00Z" } });
+    expect(decide(same, CERT, { ...opts, force: true })).toMatchObject({ kind: "skip", reason: "already_current" });
+    expect(decide(on("2027-01-01T00:00:00Z"), CERT, opts)).toMatchObject({ kind: "skip", reason: "already_current" });
+  });
+
+  it("到期时间相同但签发时间不同（重签的证书）：需确认，--force 后更新", () => {
+    const reissued = rec({ cert: { name: "old", notBefore: "2026-07-01T00:00:00Z", notAfter: "2027-01-01T00:00:00Z" } });
+    const d = decide(reissued, CERT, opts);
+    expect(d).toMatchObject({ kind: "skip", reason: "same_expiry", needsConfirm: true, oldCert: { name: "old" } });
+    expect(d.message).toBe(
+      "当前证书与新证书到期时间相同但签发时间不同（可能是重签的证书）；确需提前更换请向用户确认后加 --force 重新执行（可配合 -d 只针对这些域名）",
+    );
+    expect(decide(reissued, CERT, { ...opts, force: true })).toMatchObject({ kind: "update", oldCert: { name: "old" } });
+  });
+
   it("查不到旧证书到期时间：需确认，--force 后更新", () => {
     const d = decide(on(undefined), CERT, opts);
     expect(d).toMatchObject({ kind: "skip", reason: "unknown_expiry", needsConfirm: true });
@@ -66,6 +82,14 @@ describe("decide", () => {
       "当前证书还剩 31 天，未到更新时间；确需提前更换请向用户确认后加 --force 重新执行（可配合 -d 只针对这些域名）",
     );
     expect(decide(on("2026-11-15T00:00:00Z"), CERT, { ...opts, force: true })).toMatchObject({ kind: "update", oldDaysLeft: 31 });
+  });
+
+  it("30 天按毫秒比较：剩 30 天 23 小时仍未到更新时间（展示的天数向下取整）", () => {
+    const d = decide(on("2026-11-14T23:00:00Z"), CERT, opts);
+    expect(d).toMatchObject({ kind: "skip", reason: "not_due", needsConfirm: true, oldDaysLeft: 30 });
+    expect(d.message).toMatch(/^当前证书还剩 30 天，未到更新时间；/);
+    expect(decide(on("2026-11-14T00:00:01Z"), CERT, opts)).toMatchObject({ reason: "not_due" });
+    expect(decide(on("2026-11-13T23:00:00Z"), CERT, opts)).toMatchObject({ kind: "update", oldDaysLeft: 29 });
   });
 
   it("旧证书剩余 30 天以内或已过期：更新", () => {

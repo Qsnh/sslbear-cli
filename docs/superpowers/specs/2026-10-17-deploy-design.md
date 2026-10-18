@@ -47,7 +47,7 @@ sslbear-cli deploy --cert <fullchain.pem> --key <privkey.pem> [选项]
   -p, --provider <list>    只处理指定云厂商；默认为所有已配置凭证的云厂商
   -s, --service <list>     只处理指定服务（与 domains 的取值相同）
   -d, --domain <list>      只处理这些域名（精确匹配，逗号分隔，可重复）；点名的域名没开 HTTPS 时会部署并开启
-      --force              当前证书还有 30 天以上才到期（或到期时间查不到、比新证书还晚）时也替换；AI 调用前须先向用户确认
+      --force              当前证书还有 30 天以上才到期（或到期时间查不到、比新证书还晚、与新证书同时到期但签发时间不同）时也替换；AI 调用前须先向用户确认
       --dry-run            只输出计划，不做任何写操作（也不上传证书）
       --timeout <ms>       单个请求超时，默认 15000
       --json               输出单行 JSON
@@ -63,27 +63,37 @@ sslbear-cli deploy --cert <fullchain.pem> --key <privkey.pem> [选项]
    - 证书文件包含中间证书链（只有一张非自签叶子证书时拒绝，提示用 fullchain）。我的判断：缺链的证书部署上去会让部分客户端握手失败，宁可拒绝让 agent 修正。
    - 证书当前在有效期内。
    - 从证书取出覆盖的域名：SAN 里的 DNS 名（没有 SAN 时取 CN）。
-2. **查询现状**：复用 `domains` 的查询逻辑，拿到所选云/服务上的全部域名及当前证书。查询失败的服务记入 `issues`，其中的域名无法处理。
+2. **查询现状**：复用 `domains` 的查询逻辑，拿到所选云/服务上的全部域名及当前证书。查询失败的服务记入 `issues`，其中的域名无法处理。某个子查询失败导致无法判断一个域名是否开着 HTTPS / 绑着什么证书时，查询层在该记录的 `extra` 里标 `httpsUnknown: "true"`（不能当成没开 HTTPS）。
 3. **匹配域名**：云上域名被新证书覆盖才纳入，覆盖规则同浏览器：精确匹配，或 `*.example.com` 覆盖一级子域（不覆盖 `example.com` 本身，也不覆盖多级）。云上的泛域名（`*.example.com`，七牛写作 `.example.com`）只能由含同样泛域名的证书覆盖。`--domain` 点名但证书不覆盖、或在所选云/服务上找不到的域名，记为失败并说明原因（不是静默忽略）。
 4. **逐个域名决策**（按顺序，第一条命中即定）。「旧证书」指新证书将要替换掉的那张，即开着 HTTPS 的域名当前的证书。
 
    | # | 情况 | 动作（`reason`） | `--force` 后 |
    | --- | --- | --- | --- |
+   | 0 | 查询失败、无法判断 HTTPS 现状（`extra.httpsUnknown: "true"`） | **失败**（`code: "HttpsStateUnknown"`，`retryable: true`），不做任何修改 | 同左 |
    | 1 | 平台托管域名（`extra.managed: "platform"`） | 跳过（`platform_managed`） | 同左 |
    | 2 | 该服务的 API 无法安全地只替换证书 / 不支持 | 跳过（`unsupported`） | 同左 |
    | 3 | 没开 HTTPS，且未被 `--domain` 点名 | 跳过（`https_off`），提示需用 --domain 点名 | 同左 |
    | 4 | 没开 HTTPS，且被 `--domain` 点名 | **部署**并开启 HTTPS（`deployed`） | 同左 |
-   | 5 | 旧证书与新证书到期时间相同（视为同一张） | 跳过（`already_current`） | 同左 |
-   | 6 | 查不到旧证书的到期时间 | 跳过（`unknown_expiry`） | 更新 |
-   | 7 | 旧证书到期时间比新证书还晚 | 跳过（`newer_current`） | 更新 |
-   | 8 | 旧证书剩余 > 30 天 | 跳过（`not_due`），说明剩 N 天 | 更新 |
-   | 9 | 其余（旧证书剩余 ≤ 30 天或已过期） | **更新**为新证书（`updated`） | 同左 |
+   | 5 | 旧证书与新证书到期时间相同，且签发时间也相同或查不到旧证书的签发时间（视为同一张） | 跳过（`already_current`） | 同左 |
+   | 6 | 旧证书与新证书到期时间相同，但签发时间不同（可能是重签的证书） | 跳过（`same_expiry`） | 更新 |
+   | 7 | 查不到旧证书的到期时间 | 跳过（`unknown_expiry`） | 更新 |
+   | 8 | 旧证书到期时间比新证书还晚 | 跳过（`newer_current`） | 更新 |
+   | 9 | 旧证书剩余 > 30 天（按毫秒比较，剩 30 天 23 小时也算） | 跳过（`not_due`），说明剩 N 天（向下取整） | 更新 |
+   | 10 | 其余（旧证书剩余 ≤ 30 天或已过期） | **更新**为新证书（`updated`） | 同左 |
 
-   - 第 6~8 行统称「需确认」：`message` 统一提示「向用户确认后加 --force 重新执行（可配合 -d 只针对这些域名）」；终端交互模式下就是这几行触发询问。
-   - 「同一张证书」用到期时间判断（第 5 行），所以重复执行会自然跳过已完成的域名。到期时间比较允许各云的时间精度误差（有的服务只精确到天），具体容差由实现决定。
+   - 第 0 行：不能把它当成没开 HTTPS 跳过（它可能正是需要更新的域名），也不能部署或更新；在处理范围内（没用 `-d`，或被 `-d` 点名）的一律报失败，不论是否点名、是否 `--force`。
+   - 第 6~9 行统称「需确认」：`message` 统一提示「向用户确认后加 --force 重新执行（可配合 -d 只针对这些域名）」；终端交互模式下就是这几行触发询问。
+   - 「同一张证书」用到期时间 + 签发时间判断（第 5 行），所以重复执行会自然跳过已完成的域名。时间比较允许各云的时间精度误差（有的服务只精确到天，华为证书列表的时间还差 8 小时），实现取 48 小时：到期时间相差 48 小时内，且旧证书没有签发时间或签发时间也相差 48 小时内，才算同一张。
    - 第 4 行：被点名、没开 HTTPS 的域名直接部署，即使服务上还绑着一张旧证书（bound-off）也一样（用户点名即明确要部署）。
    - **双证书**（RSA + ECC 双证书，华为的国际 + 国密）：只替换与新证书同算法的那张，决策按那张的到期时间；域名上只有另一算法的证书时，把它当作旧证书。国密证书永远不动。另一张证书原样保留（我的判断：不能悄悄删掉用户的另一张证书；重复执行时同算法那张已是新证书，第 5 行跳过）。查询层需要能拿到每个域名的全部证书及其算法，而不只是最早到期的那张。
-   - **阿里云 ESA 普通记录**：证书挂在站点上，往站点上传一张证书会作用到站点下所有被它覆盖的记录，所以按站点整体判断：站点下被新证书覆盖、且开着 HTTPS 的记录必须**全部**会被更新（第 9 行，或加了 `--force` 时第 6~8 行），若用了 `--domain` 还必须全部被点名，才往站点上传证书；否则这些记录都跳过（`shared_cert_blocked`），`message` 写明是哪条记录挡住了、怎样才能放行。没开 HTTPS 的 ESA 记录即使被点名也不处理（`unsupported`），因为开启 HTTPS 要改站点的 SSL/TLS 规则，影响面超出单个域名。ESA 的 SaaS 域名证书在域名自身上，按上表逐个处理。（我的判断：不能因为更新一条记录而让未点名的记录被换证书。）
+   - **阿里云 ESA 普通记录**：证书挂在站点上，往站点上传一张证书会作用到站点下所有被它覆盖的记录，所以按站点整体判断：站点下被新证书覆盖、会受站点证书影响的记录（由 deployer 的 `sharedScope` 判定，不论是否开着 HTTPS——没开 HTTPS 的记录在站点加证书后可能开始用新证书提供 HTTPS）必须**全部**会被更新（第 10 行，或加了 `--force` 时第 6~9 行）或已是该证书（第 5 行），若用了 `--domain` 还必须全部被点名，才往站点上传证书。否则挡住整组：
+     - 阻挡项 = 范围外的记录、HTTPS 状态未知的记录、没开 HTTPS 的记录（必然是阻挡项），以及自身会被跳过的记录（已是该证书的除外）。
+     - 阻挡项里有范围外的、或不是「需确认」的（如 `https_off`、`unsupported`、`HttpsStateUnknown`）：组内范围内会被更新 / 部署或需确认的记录都报 `shared_cert_blocked`，不带 `needsConfirm`（`--force` 也放行不了）。
+     - 阻挡项都在范围内且都是「需确认」的跳过：会被更新的记录报 `shared_cert_blocked` 并带 `needsConfirm`，需确认的记录照常报自身原因（`--force` 后整组放行）。
+     - 组内自身已是该证书、不支持、没开 HTTPS 未点名的记录照常报自身原因；HTTPS 状态未知的照常报失败。
+     - `message` 逐个列出阻挡项及原因（如「b.example.com（未用 -d 点名）」「c.example.com（未开启 HTTPS，站点加证书后会开始用新证书提供 HTTPS）」「d.example.com（当前证书还剩 47 天）」），并说明怎样才能放行。
+
+     没开 HTTPS 的 ESA 记录即使被点名也不处理（`unsupported`），因为开启 HTTPS 要改站点的 SSL/TLS 规则，影响面超出单个域名。ESA 的 SaaS 域名证书在域名自身上，按上表逐个处理。（我的判断：不能因为更新一条记录而让未点名的记录被换证书。）
 5. **执行**（非 `--dry-run`）：
    - 需要证书 ID 才能绑定的服务，先把证书上传到该云的证书服务，同一次运行内每家云只传一次；证书服务里已有同一张证书（同指纹或同序列号）时复用，不重复上传。上传后的证书名带域名和到期日，便于在 `certs` 里认出来（命名格式实现时定）。
    - 能直接接收 PEM 的服务可以直接传 PEM，是否仍先上传到证书服务由实现决定（倾向于统一走证书服务，便于复用和在控制台查看）。
@@ -112,13 +122,14 @@ sslbear-cli deploy --cert <fullchain.pem> --key <privkey.pem> [选项]
 }}
 ```
 
-- `action`：`deployed`（原先没开 HTTPS）、`updated`（替换旧证书）、`skipped`、`failed`；`--dry-run` 时为 `would_deploy` / `would_update` / `skipped` / `failed`（failed 仅限点名域名不存在、不覆盖这类本地可判定的问题）。
-- `needsConfirm: true`：跳过原因属于「需确认」（`unknown_expiry` / `newer_current` / `not_due`）的条目带此标记，agent 据此决定是否向用户确认。
-- `reason`（跳过原因的稳定枚举，供 agent 判断）：`platform_managed`、`unsupported`、`https_off`、`already_current`、`unknown_expiry`、`newer_current`、`not_due`、`shared_cert_blocked`；`message` 为中文说明。
+- `action`：`deployed`（原先没开 HTTPS）、`updated`（替换旧证书）、`skipped`、`failed`；`--dry-run` 时为 `would_deploy` / `would_update` / `skipped` / `failed`（failed 仅限点名域名不存在（`DomainNotFound`）、不覆盖（`NotCovered`）、HTTPS 状态未知（`HttpsStateUnknown`）这类不调用写接口就能判定的问题）。
+- `needsConfirm: true`：跳过原因属于「需确认」（`unknown_expiry` / `newer_current` / `not_due` / `same_expiry`，以及 `--force` 能放行的 `shared_cert_blocked`）的条目带此标记，agent 据此决定是否向用户确认。
+- `reason`（跳过原因的稳定枚举，供 agent 判断）：`platform_managed`、`unsupported`、`https_off`、`already_current`、`unknown_expiry`、`newer_current`、`not_due`、`same_expiry`、`shared_cert_blocked`；`message` 为中文说明。
+- `DomainNotFound`：`message` 列出所有失败的查询（带子项的写成 `provider/service target`），其中有可重试的错误码（限流、超时、网络错误）时 `retryable: true`。
 - `retryable`：失败是否值得原样重试（限流、超时、网络错误为 true；鉴权、权限、参数错误为 false）。
 - 退出码：
   - `0`：没有任何 `failed`（全部成功或跳过，包括「什么都没改」）。
-  - `1`：至少一个域名失败，或所有查询都失败。stderr 输出 `{"ok":false,"status":"DeployFailed","message":"…","results":[…],"uploads":[…],"issues":[…]}`，完整结果仍可解析。
+  - `1`：至少一个域名失败，或所有查询都失败。stderr 输出 `{"ok":false,"status":"DeployFailed","message":"…","dryRun":…,"cert":{…},"uploads":[…],"results":[…],"issues":[…]}`，完整结果仍可解析；所有查询都失败时 `message` 以「没有任何查询成功」开头并带错误明细，点名的域名在 `results` 里逐条记为失败（`--dry-run` 同样）。
   - `2`：参数、证书文件或凭证配置错误（未调用任何写接口）。
 - 表格模式：每个域名一行（云厂商 / 服务 / 域名 / 动作 / 说明），最后一行汇总「更新 N、部署 N、跳过 N、失败 N」。
 
@@ -157,7 +168,7 @@ sslbear-cli deploy --cert <fullchain.pem> --key <privkey.pem> [选项]
 ## 我的判断（请顺带过目）
 
 - 二次确认的形式：AI 调用时用 `--force` 重新执行（结果里 `needsConfirm` 提示 agent 去问用户）；人在终端直接运行时当场询问 [y/N]。
-- 查不到旧证书到期时间、旧证书比新证书还晚，也归入「需确认」，`--force` 后替换。
+- 查不到旧证书到期时间、旧证书比新证书还晚、与新证书同时到期但签发时间不同，也归入「需确认」，`--force` 后替换。
 - 被点名、没开 HTTPS 的域名直接部署，不受 30 天限制。
 - 缺中间证书链的证书直接拒绝。
 - `deploy -d` 是精确域名列表，不是关键字过滤。
