@@ -304,6 +304,32 @@ describe("qiniu domains", () => {
     ]);
   });
 
+  it("处理中的域名列表里的 protocol 还是旧值（实测 sslize 后列表仍为 http），照常查详情，按详情（已提交的配置）输出", async () => {
+    const fetch = fakeFetch((req) => {
+      if (req.url.pathname === "/domain") {
+        return {
+          body: {
+            domains: [
+              { name: "a.example.com", type: "normal", protocol: "http", operatingState: "processing", operationType: "sslize" },
+              { name: "b.example.com", type: "normal", protocol: "http", operatingState: "success", operationType: "unsslize" },
+            ],
+            marker: "",
+          },
+        };
+      }
+      if (req.url.pathname === "/domain/a.example.com") {
+        return { body: { name: "a.example.com", protocol: "https", operatingState: "processing", https: { certId: "cert-www", forceHttps: false, http2Enable: true } } };
+      }
+      return sslRoute(req);
+    });
+    const r = await runCli(["domains", "-p", "qiniu", "--json"], { env: QINIU_ENV, fetch });
+    const byDomain = Object.fromEntries(r.json.data.items.map((d: any) => [d.domain, d]));
+    expect(byDomain["a.example.com"]).toMatchObject({ status: "processing", https: true, cert: { id: "cert-www", notAfter: "2026-11-01T00:00:00.000Z" } });
+    // 不在处理中的 HTTP 域名仍不查详情
+    expect(byDomain["b.example.com"]).toMatchObject({ status: "success", https: false });
+    expect(fetch.calls.some((c) => c.url.pathname === "/domain/b.example.com")).toBe(false);
+  });
+
   it("详情里 protocol 为 http 时不计证书（绑了证书但未开启 HTTPS）", async () => {
     const fetch = fakeFetch((req) => {
       if (req.url.pathname === "/domain") return { body: { domains: [{ name: "a.example.com", operatingState: "success" }], marker: "" } };

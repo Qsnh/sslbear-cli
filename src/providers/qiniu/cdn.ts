@@ -25,8 +25,8 @@ interface HttpsConf {
   certId?: string;
   forceHttps?: boolean;
   http2Enable?: boolean;
-  /** 如 TLSv1.2/TLSv1.3；文档没写域名详情是否返回 */
-  tlsVersions?: string;
+  /** 实测域名详情返回数组，如 ["TLSv1.2","TLSv1.3"]；HTTP 域名为 null 或空数组 */
+  tlsVersions?: string[] | null;
 }
 
 interface CdnDomainDetail extends CdnDomain {
@@ -89,10 +89,19 @@ async function writeHttps(
 }
 
 /**
+ * 2026-10 实测：没有 CN 的证书（Let's Encrypt tlsserver 配置文件签发的 45 天证书）七牛能上传、sslize / httpsconf 也返回成功，
+ * 但域名一直停在 processing（观察超过 1 小时），证书始终没下发到边缘，之后对该域名的修改（包括换回原证书、关闭 HTTPS）
+ * 也不再生效；同一时间带 CN 的新证书（同一中间证书、同样经 fusion 上传）1–2 分钟即下发完成。所以不上传、不写配置，直接报错。
+ */
+const NO_CN_MESSAGE =
+  "七牛 CDN 无法正常下发没有通用名（CN）的证书（如 Let's Encrypt tlsserver / shortlived 配置文件签发的证书）：实测部署后域名会一直处于处理中、证书不下发，之后的修改也不再生效。未做修改；请改用带 CN 的证书（如 Let's Encrypt classic 配置文件）";
+
+/**
  * 七牛单个域名只能绑一张证书，没有双证书。按证书 ID 绑定（先上传到 SSL 证书服务）：
  * - deploy：PUT /domain/<域名>/sslize 开启 HTTPS；
- * - update：PUT /domain/<域名>/httpsconf 换证书。该接口的 forceHttps / http2Enable 不传时是否保留原值没有保证，
- *   所以先读域名详情，把当前的强制跳转、HTTP/2、TLS 版本原样带回，只换 certId。
+ * - update：PUT /domain/<域名>/httpsconf 换证书。实测该接口不传 forceHttps 会被重置为 false、不传 tlsVersions
+ *   会恢复为默认的 TLSv1.0–1.3（http2Enable 不传时保留原值），所以先读域名详情，把当前的强制跳转、HTTP/2、
+ *   TLS 版本原样带回，只换 certId。
  * 域名处理中（上一次修改未生效）等情况七牛会拒绝修改（如 400030 正在处理中），错误原样上报，不等待。
  * 写请求不原样重发，见 writeHttps。
  */
@@ -102,6 +111,9 @@ const deployer: Deployer<AccessKeyCredentials> = {
     return undefined;
   },
   async apply(ctx, creds, target, input) {
+    if (!input.cert.commonName) {
+      throw new CloudApiError("qiniu", "CertWithoutCommonName", NO_CN_MESSAGE);
+    }
     let certId: string | undefined;
     let note: string | undefined;
     for (const record of target.records) {
@@ -125,7 +137,8 @@ const deployer: Deployer<AccessKeyCredentials> = {
 
 /**
  * CDN 域名（含全站加速 dcdn 域名，二者共用域名管理接口）：列表只有 HTTPS 开关没有证书 ID，
- * 对开启了 HTTPS 的域名逐个查详情（并发 5）取 certId，再从证书列表补全有效期。
+ * 对开启了 HTTPS 的域名（以及处理中的域名）逐个查详情（并发 5）取 certId，再从证书列表补全有效期。
+ * 处理中的域名按详情输出，即已提交、可能尚未下发到边缘的配置。
  * 详情查询失败的域名按列表信息输出（没有证书 ID，列表缺 protocol 时 https 为 false），并标 httpsUnknown。
  * 已下线 / 冻结的域名照常列出，状态见 status。七牛给每个新建 bucket 自动分配的测试域名（type test，
  * 七牛自有的 *.clouddn.com 域名，不能配置 HTTPS、30 天后回收）不是用户的域名，不列出。
@@ -139,7 +152,8 @@ export const cdn: DomainService<AccessKeyCredentials> = {
       return { items: res.domains ?? [], marker: res.marker };
     }).then((list) => list.filter((d) => d.type !== "test"));
     const records = await mapLimit(domains, 5, async (d) => {
-      if (d.protocol === "http") return toRecord(d);
+      // 处理中的域名列表里还是旧的 protocol（实测 sslize 后要等处理完才变），详情才是已提交的配置
+      if (d.protocol === "http" && d.operatingState !== "processing") return toRecord(d);
       try {
         const detail = await qiniuGet<CdnDomainDetail>(ctx, creds, API_HOST, `/domain/${encodeURIComponent(d.name)}`);
         return toRecord({ ...d, ...detail });

@@ -294,7 +294,8 @@ describe("qiniu cdn deployer：写接口只发一次，可重试的错误先重�
 describe("qiniu cdn deployer", () => {
   it("update：先读域名详情，PUT httpsconf 只换 certId，强制跳转 / HTTP/2 / TLS 版本原样带回", async () => {
     for (const https of [
-      { certId: "cert-old", forceHttps: true, http2Enable: false, tlsVersions: "TLSv1.2/TLSv1.3" },
+      // 详情的 tlsVersions 实测是数组；httpsconf 不传 forceHttps / tlsVersions 会被重置，必须原样带回
+      { certId: "cert-old", forceHttps: true, http2Enable: false, tlsVersions: ["TLSv1.2", "TLSv1.3"] },
       { certId: "cert-old", forceHttps: false, http2Enable: true },
     ]) {
       const fetch = fakeFetch((req) => {
@@ -319,7 +320,7 @@ describe("qiniu cdn deployer", () => {
     }
   });
 
-  it("update：详情里没有 forceHttps / http2Enable 时不传（七牛对未传项保留原值），不会按 false 覆盖", async () => {
+  it("update：详情里没有 forceHttps / http2Enable 时不传，不自行补默认值", async () => {
     const fetch = fakeFetch((req) => {
       if (req.method === "GET") return { body: { name: "www.example.com", protocol: "https", https: { certId: "cert-old" } } };
       if (req.method === "PUT") return { body: { code: 200 } };
@@ -347,6 +348,23 @@ describe("qiniu cdn deployer", () => {
     expect(put.url.href).toBe("https://api.qiniu.com/domain/img.example.com/sslize");
     expect(put.json).toEqual({ certId: "new-cert", forceHttps: false, http2Enable: true });
     expectSigned(put);
+  });
+
+  it("证书没有 CN（如 Let's Encrypt tlsserver / shortlived 配置文件签发的）时不上传、不改配置，直接报错", async () => {
+    const fetch = fakeFetch(() => ({ body: { code: 200 } }));
+    const noCn: LocalCert = { ...RSA, commonName: undefined };
+    for (const [r, mode] of [
+      [record("www.example.com"), "update"],
+      [record("img.example.com", { https: false, cert: undefined }), "deploy"],
+    ] as const) {
+      const i = { ...input(), cert: noCn };
+      const err = await deployer.apply(ctxOf(fetch), CREDS, { records: [r], mode }, i).catch((e) => e);
+      expect(err).toBeInstanceOf(CloudApiError);
+      expect(err).toMatchObject({ provider: "qiniu", code: "CertWithoutCommonName" });
+      expect(isRetryable(err)).toBe(false);
+      expect(i.uploads).toBe(0);
+    }
+    expect(fetch.calls).toHaveLength(0);
   });
 
   it("泛域名（七牛写作 .example.com）原样放进路径", async () => {
