@@ -176,7 +176,8 @@ const deployer: Deployer<TencentCredentials> = {
 
 /**
  * 对象存储 COS 的自定义源站域名：先列 bucket，再逐个 bucket 查自定义域名，最后逐个域名查证书配置（各阶段并发 5）。
- * HTTPS 以域名证书配置的 Status 为 Enabled 为准；只给了证书 ID 没给有效期的从 SSL 证书列表补。
+ * HTTPS 以域名证书配置的 Status 为 Enabled 为准（404 表示从没配置过证书，即未开启；其他错误标记 httpsUnknown）；
+ * 只给了证书 ID 没给有效期的从 SSL 证书列表补。
  */
 export const cos: DomainService<TencentCredentials> = {
   key: "cos",
@@ -190,10 +191,16 @@ export const cos: DomainService<TencentCredentials> = {
       }),
     );
     const records = await mapLimit(perBucket.flat(), 5, async (d) => {
-      const cert = await getDomainCert(ctx, creds, d).catch((e: unknown) => {
+      let cert: DomainCert | undefined;
+      // 证书配置查询失败（404 以外）时不知道是否开着 HTTPS：https 记为 false，同时标记 httpsUnknown，
+      // 编排层据此不会把它当作未开启而直接部署覆盖线上证书
+      let httpsUnknown: "true" | undefined;
+      try {
+        cert = await getDomainCert(ctx, creds, d);
+      } catch (e) {
         warn(e, `domain ${d.name}`);
-        return undefined;
-      });
+        httpsUnknown = "true";
+      }
       const https = cert?.status?.toLowerCase() === "enabled";
       return compact({
         provider: "tencent" as const,
@@ -210,7 +217,7 @@ export const cos: DomainService<TencentCredentials> = {
                 status: cert.status,
               })
             : undefined,
-        extra: compact({ bucket: d.bucket.name, region: d.bucket.region, type: d.type }),
+        extra: compact({ bucket: d.bucket.name, region: d.bucket.region, type: d.type, httpsUnknown }),
       });
     });
     return enrichFromSsl(ctx, creds, warn, records);

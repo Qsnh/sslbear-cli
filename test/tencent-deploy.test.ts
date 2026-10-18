@@ -56,6 +56,27 @@ describe("tencent uploadCertificate（SSL 证书）", () => {
     expect(await upload(fetch)).toEqual({ id: "old-9", reused: true });
   });
 
+  it("超时后自动重试不会重复建证书：重发的仍是 Repeatable=false，首次已建成时服务端按指纹返回 RepeatCertId", async () => {
+    // 模拟首个请求在服务端已建成证书、客户端却超时：之后同指纹的上传都命中 RepeatCertId
+    let created = false;
+    const inner = fakeFetch((req) => {
+      if (req.action !== "UploadCertificate") return undefined;
+      if (created) return ok({ CertificateId: "", RepeatCertId: "new-1" });
+      created = true;
+      return ok({ CertificateId: "new-1", RepeatCertId: "" });
+    });
+    let n = 0;
+    const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const res = await inner(input, init);
+      if (n++ === 0) throw Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
+      return res;
+    }) as Fetch;
+    expect(await upload(fetch)).toEqual({ id: "new-1", reused: true });
+    expect(inner.calls).toHaveLength(2);
+    expect(inner.calls.map((c) => c.json?.Repeatable)).toEqual([false, false]);
+    expect(inner.calls[1]!.body).toBe(inner.calls[0]!.body);
+  });
+
   it("证书名里的 * 换成 _；没有 CN 时用第一个 SAN", async () => {
     const fetch = fakeFetch(() => ok({ CertificateId: "x" }));
     await upload(fetch, { ...RSA, commonName: "*.example.com" });
@@ -164,6 +185,27 @@ describe("tencent cdn 部署", () => {
       { mode: "deploy", records: [rec("cdn", "www.example.com", { https: false })] },
     );
     expect((await result).note).toContain("HTTPS 服务");
+  });
+
+  it("deploy：写之前读到 HTTPS 已开启（与查询时不同）时不上传、不写配置，报 HttpsAlreadyEnabled", async () => {
+    let uploaded = 0;
+    const input: DeployInput = { cert: RSA, certId: async () => (uploaded++, "new-cert") };
+    const https = { ...HTTPS_OFF, Switch: "on", CertInfo: { CertId: "other", Message: "other", ExpireTime: "2027-06-01 08:00:00" }, SslStatus: "deployed" };
+    const { fetch, result } = apply(
+      "cdn",
+      (req) => (req.action === "DescribeDomainsConfig" ? describeReply(https) : ok()),
+      { mode: "deploy", records: [rec("cdn", "www.example.com", { https: false })] },
+      input,
+    );
+    const err = await result.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CloudApiError);
+    expect(err).toMatchObject({
+      provider: "tencent",
+      code: "HttpsAlreadyEnabled",
+      message: "该域名的 HTTPS 已开启（与查询时不同），未做修改；请重新执行，按更新规则判断",
+    });
+    expect(fetch.calls.map((c) => c.action)).toEqual(["DescribeDomainsConfig"]);
+    expect(uploaded).toBe(0);
   });
 
   it("deploy：查不到该域名时报错，不写配置", async () => {

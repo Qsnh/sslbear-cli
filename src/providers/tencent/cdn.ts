@@ -77,7 +77,8 @@ const HTTPS_BILLING_OFF =
 /**
  * update：ModifyDomainConfig 按配置路径只改叶子节点 Https.CertInfo.CertId（官方示例「更新 HTTPS 服务器证书 ID」），
  * 其他 HTTPS 配置（HTTP/2、HSTS、OCSP、TLS 版本等）和强制跳转都不动。
- * deploy：没有单独开启 HTTPS 的路径，先读出 Https 整体配置，开启开关、换上证书后用 UpdateDomainConfig 写回。
+ * deploy：没有单独开启 HTTPS 的路径，先读出 Https 整体配置，开启开关、换上证书后用 UpdateDomainConfig 写回；
+ * 读到 HTTPS 其实已开启（查询之后被改过）时不写，交给重新执行时按更新规则判断。
  */
 const deployer: Deployer<TencentCredentials> = {
   async apply(ctx, creds, target, input) {
@@ -88,6 +89,9 @@ const deployer: Deployer<TencentCredentials> = {
       return { certId };
     }
     const current = await describeDomain(ctx, creds, domain);
+    if (current.Https?.Switch === "on") {
+      throw new CloudApiError("tencent", "HttpsAlreadyEnabled", "该域名的 HTTPS 已开启（与查询时不同），未做修改；请重新执行，按更新规则判断");
+    }
     const certId = await input.certId();
     await call(ctx, creds, "UpdateDomainConfig", { Domain: domain, Https: httpsWith(current.Https, certId) });
     // HTTPS 服务是计费开关，不替用户打开，只提示

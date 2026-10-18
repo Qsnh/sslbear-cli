@@ -149,7 +149,15 @@ describe("tencent cos", () => {
         extra: { ...extra, type: "REST" },
         daysLeft: 36,
       },
-      { provider: "tencent", service: "cos", domain: "dl.example.com", status: "ENABLED", https: false, extra: { ...extra, type: "ACCELERATE" } },
+      // 证书配置查询失败（非 404）：不知道是否开着 HTTPS，标记 httpsUnknown，不能当作未开启
+      {
+        provider: "tencent",
+        service: "cos",
+        domain: "dl.example.com",
+        status: "ENABLED",
+        https: false,
+        extra: { ...extra, type: "ACCELERATE", httpsUnknown: "true" },
+      },
       { provider: "tencent", service: "cos", domain: "old.example.com", status: "DISABLED", https: false, extra: { ...extra, type: "REST" } },
       { provider: "tencent", service: "cos", domain: "site.example.com", status: "ENABLED", https: false, extra: { ...extra, type: "WEBSITE" } },
     ]);
@@ -160,6 +168,38 @@ describe("tencent cos", () => {
     ]);
     // 证书缺名称时会按 ID 拉 SSL 证书列表补名称；有到期时间，拉取失败（这里没有路由）不记 issue
     expect(fetch.calls.filter((c) => c.url.host === "ssl.tencentcloudapi.com")).toHaveLength(1);
+  });
+
+  it("证书配置查询无权限 / 限流重试仍失败时标记 httpsUnknown；404（从没配置过证书）才是确定的未开启", async () => {
+    const fetch = fakeFetch((req) => {
+      if (req.url.host === SERVICE) {
+        return { body: `<ListAllMyBucketsResult><Buckets><Bucket><Name>b-1250000000</Name><Location>ap-nanjing</Location></Bucket></Buckets></ListAllMyBucketsResult>` };
+      }
+      if (req.url.search === "?domain") {
+        const rule = (name: string) => `<DomainRule><Status>ENABLED</Status><Name>${name}</Name><Type>REST</Type></DomainRule>`;
+        return { body: `<DomainConfiguration>${rule("denied.example.com")}${rule("slow.example.com")}${rule("none.example.com")}</DomainConfiguration>` };
+      }
+      switch (req.url.searchParams.get("domainname")) {
+        case "denied.example.com":
+          return cosErr(403, "AccessDenied", "Access Denied.");
+        case "slow.example.com":
+          return cosErr(503, "SlowDown", "Reduce your request rate.");
+        case "none.example.com":
+          return cosErr(404, "NoSuchCertificate", "certificate not found");
+      }
+      return undefined;
+    });
+    const r = await runCli(["domains", "-s", "cos", "--json"], { env: TENCENT_ENV, fetch });
+    expect(r.code).toBe(0);
+    expect(r.json.data.items.map((d: any) => [d.domain, d.https, d.extra.httpsUnknown])).toEqual([
+      ["denied.example.com", false, "true"],
+      ["none.example.com", false, undefined],
+      ["slow.example.com", false, "true"],
+    ]);
+    expect(r.json.data.issues.map((i: any) => [i.target, i.code])).toEqual([
+      ["domain denied.example.com", "AccessDenied"],
+      ["domain slow.example.com", "Throttling"],
+    ]);
   });
 
   it("请求格式：GET + q-sign 签名头，签 host 与所有请求参数", async () => {
