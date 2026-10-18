@@ -10,6 +10,7 @@ import { callHuawei, listProjects } from "./client.js";
 import {
   earliest,
   HTTPS_ALREADY_ENABLED,
+  httpsDisabled,
   markHttpsUnknown,
   orderCerts,
   parsePem,
@@ -163,6 +164,7 @@ async function applyLive(ctx: QueryContext, creds: AccessKeyCredentials, target:
     const req = { host: `live.${region}.myhuaweicloud.com`, path: `/v1/${projectId}/guard/https-cert`, query: { domain: record.domain }, projectId };
     const current = await callHuawei<HttpsCertConfig>(ctx, creds, req);
     if (target.mode === "deploy" && hasCert(current)) throw new CloudApiError("huawei", "HttpsAlreadyEnabled", HTTPS_ALREADY_ENABLED);
+    if (target.mode === "update" && !hasCert(current)) throw new CloudApiError("huawei", "HttpsDisabled", httpsDisabled(record.domain));
     const gm = current.gm_certificate;
     const hasGm = !!(gm?.cert_id || gm?.sign_certificate || gm?.enc_certificate);
     if (hasGm && !(gm?.source === "scm" && gm.cert_id)) throw new CloudApiError("huawei", "SmCertNotPreservable", SM_CERT_LOCKED);

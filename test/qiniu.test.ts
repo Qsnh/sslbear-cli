@@ -152,6 +152,7 @@ describe("qiniu certs", () => {
         sans: ["*.example.com"],
         notBefore: "2026-07-01T00:00:00.000Z",
         notAfter: "2026-10-20T00:00:00.000Z",
+        algorithm: "RSA",
         daysLeft: 5,
       },
       {
@@ -162,6 +163,7 @@ describe("qiniu certs", () => {
         sans: ["www.example.com", "example.com"],
         notBefore: "2026-08-01T00:00:00.000Z",
         notAfter: "2026-11-01T00:00:00.000Z",
+        algorithm: "RSA",
         daysLeft: 17,
       },
     ]);
@@ -264,6 +266,8 @@ describe("qiniu domains", () => {
         sans: ["www.example.com", "example.com"],
         notBefore: "2026-08-01T00:00:00.000Z",
         notAfter: "2026-11-01T00:00:00.000Z",
+        // 证书算法来自证书列表的 encrypt：同期签发的 RSA / ECC 两张靠它区分（决策表的 already_current）
+        algorithm: "RSA",
       },
       extra: { type: "normal", product: "cdn", geoCover: "china" },
       daysLeft: 17,

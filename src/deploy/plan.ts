@@ -73,15 +73,19 @@ export function decide(record: DomainRecord, cert: LocalCert, o: DecideOptions):
   let confirm: [SkipReason, string] | undefined;
   if (Number.isFinite(oldMs) && near(oldMs, newMs)) {
     // 到期时间相同还要看签发时间与算法：同一天到期的重签证书、同时签发的 RSA / ECC 两张都不是同一张。
-    // 查不到签发时间只能按到期时间判断；查不到算法时无法区分同时签发的两张，按同一张跳过，但用户坚持（--force）就换
+    // 查不到签发时间只能按到期时间判断；查不到算法时无法区分同时签发的两张，按同一张跳过，
+    // 但用户点名并坚持（-d + --force）就换；只加 --force 不波及它们（它们不在需确认清单里，用户没被问过）
     const oldStart = Date.parse(oldCert?.notBefore ?? "");
     const startNear = !Number.isFinite(oldStart) || near(oldStart, Date.parse(cert.notBefore));
     const oldAlg = oldCert?.algorithm;
     if (startNear && (!oldAlg || oldAlg === cert.algorithm)) {
       if (oldAlg) return { ...skip("already_current", "已是该证书（到期时间相同）"), ...base };
-      if (!o.force) {
+      if (!(o.force && o.named)) {
         return {
-          ...skip("already_current", "已是该证书（到期时间相同）；若其实是同期签发的另一张证书（如 RSA / ECC 各一张），向用户确认后加 --force 可强制替换"),
+          ...skip(
+            "already_current",
+            "已是该证书（到期时间相同）；若其实是同期签发的另一张证书（如 RSA / ECC 各一张），向用户确认后用 -d 点名该域名并加 --force 可强制替换",
+          ),
           ...base,
         };
       }

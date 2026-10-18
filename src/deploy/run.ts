@@ -55,6 +55,9 @@ export interface DeployPlan {
   pending: PendingItem[];
 }
 
+/** 写入前发现状态与查询时不同而放弃的错误：重新执行会按新状态重新判断，所以算可重试 */
+const RERUNNABLE = new Set(["HttpsAlreadyEnabled", "HttpsDisabled"]);
+
 const NO_CN =
   "不接受没有通用名（CN）的证书（如 Let's Encrypt shortlived / tlsserver 配置文件签发的证书），未做修改；请改用带 CN 的证书（如 Let's Encrypt classic 配置文件）";
 
@@ -284,6 +287,13 @@ export function buildPlan(ctx: QueryContext, cert: LocalCert, opts: DeployOption
     }
   }
 
+  // 查不到到期时间可能只是补全证书信息的查询失败了：提示先重试，而不是直接去问用户要不要强制替换
+  const failedServices = new Set(query.issues.filter((i) => i.kind === "error").map((i) => `${i.provider}/${i.service}`));
+  for (const r of results) {
+    if (r.reason === "unknown_expiry" && failedServices.has(`${r.provider}/${r.service}`)) {
+      r.message = `${r.message}；同一服务有查询失败（见 issues），可能因此缺少证书信息，可先稍后重试`;
+    }
+  }
   results.sort(byTarget);
   return {
     report: {
@@ -359,7 +369,7 @@ export async function executeDeploy(ctx: QueryContext, cert: LocalCert, plan: De
               code: err?.code ?? "Unknown",
               message,
               ...(err?.requestId && { requestId: err.requestId }),
-              retryable: isRetryable(e),
+              retryable: isRetryable(e) || RERUNNABLE.has(err?.code ?? ""),
             });
           }
         }

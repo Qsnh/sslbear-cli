@@ -6,7 +6,7 @@ import { toIso } from "../../lib/time.js";
 import type { CertInfo, DomainRecord } from "../../types.js";
 import type { DeployInput, DeployOutcome, DeployTarget, DomainService } from "../registry.js";
 import { callHuawei } from "./client.js";
-import { certName, earliest, HTTPS_ALREADY_ENABLED, orderCerts, parsePem, SM_CERT_LOCKED, smCertLocked, withoutSource } from "./common.js";
+import { certName, earliest, HTTPS_ALREADY_ENABLED, httpsDisabled, orderCerts, parsePem, SM_CERT_LOCKED, smCertLocked, withoutSource } from "./common.js";
 
 /** CDN 是全局服务，不区分地域 */
 const HOST = "cdn.myhuaweicloud.com";
@@ -114,6 +114,7 @@ async function applyCdn(ctx: QueryContext, creds: AccessKeyCredentials, target: 
     if (target.mode === "deploy" && current.https_status && current.https_status !== "off") {
       throw new CloudApiError("huawei", "HttpsAlreadyEnabled", HTTPS_ALREADY_ENABLED);
     }
+    if (target.mode === "update" && current.https_status === "off") throw new CloudApiError("huawei", "HttpsDisabled", httpsDisabled(record.domain));
     const all = current.certificates?.length ? current.certificates : current.certificate_type ? [current] : [];
     // 关闭 HTTPS 时证书会被一并删除，读到的残留不算
     const sm = current.https_status !== "off" ? all.find((c) => c.certificate_type === "server_sm") : undefined;

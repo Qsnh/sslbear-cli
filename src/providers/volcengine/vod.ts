@@ -7,7 +7,7 @@ import type { CertInfo, DomainRecord } from "../../types.js";
 import type { DomainService, Warn } from "../registry.js";
 import { completeCerts, fillDualAlgorithms } from "./certs.js";
 import { callVolc } from "./client.js";
-import { AMBIGUOUS_DUAL, HTTPS_UNKNOWN, ambiguousCerts, ambiguousDual, certsToKeep, earliest, explainNoCommonName, httpsAlreadyEnabled, pemAlgorithm } from "./common.js";
+import { AMBIGUOUS_DUAL, HTTPS_UNKNOWN, ambiguousCerts, ambiguousDual, certsToKeep, earliest, explainNoCommonName, httpsAlreadyEnabled, httpsDisabled, pemAlgorithm } from "./common.js";
 
 /** 点播按地域部署，空间与域名要到空间所在地域的 endpoint 查；柔佛仅对企业用户开放 */
 const REGIONS: Record<string, string> = {
@@ -237,6 +237,7 @@ export const vod: DomainService<AccessKeyCredentials> = {
       if (keep.length > 1) throw new CloudApiError("volcengine", "TooManyCerts", `域名上有 ${keep.length + 1} 张证书，最多支持双证书，未做修改`);
       const cfg = await call<DomainConfig>("DescribeVodDomainConfig", { SpaceName: space, DomainType: type, DescribeCdnDomainParam: { Domain: record!.domain } });
       if (target.mode === "deploy" && cfg.DomainInfo?.DomainConfig?.HTTPS?.Switch === true) throw httpsAlreadyEnabled();
+      if (target.mode === "update" && cfg.DomainInfo?.DomainConfig?.HTTPS?.Switch === false) throw httpsDisabled(record!.domain);
       const certId = await input.certId();
       const ids = [certId, ...keep.map((c) => c.id!)];
       const { CertInfo: _single, CertInfoList: _dual, ...rest } = writable(cfg.DomainInfo?.DomainConfig?.HTTPS ?? {}) as VodHttps;

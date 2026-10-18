@@ -67,7 +67,8 @@ export function ambiguousCerts(certs: readonly CertInfo[]): boolean {
   return intl.length > 1 && intl.some((c) => !c.algorithm);
 }
 
-export const ambiguousDual = (record: DomainRecord): boolean => ambiguousCerts(allCerts(record));
+/** 双证书但算法不明；查询失败导致的不明（httpsUnknown）交给编排层记为可重试的失败，不算「不支持」 */
+export const ambiguousDual = (record: DomainRecord): boolean => record.extra?.httpsUnknown !== "true" && ambiguousCerts(allCerts(record));
 
 export const AMBIGUOUS_DUAL = "该域名绑了两张证书但查不到各自的算法（RSA / ECC），无法确定替换哪一张";
 
@@ -81,6 +82,11 @@ export function certsToKeep(record: DomainRecord, algorithm: LocalCert["algorith
  * 部署（编排层认为域名没开 HTTPS）前读到的配置显示 HTTPS 其实已开启：不写入，让用户重新执行按更新规则判断。
  * 只用于写之前本来就要读配置的服务，不为此新增读请求。
  */
+/** update 模式写入前读到 HTTPS 已关闭（与查询时不同，如等待终端确认期间有人关了）：不写入，免得把 HTTPS 重新打开 */
+export function httpsDisabled(domain: string): CloudApiError {
+  return new CloudApiError("volcengine", "HttpsDisabled", `域名 ${domain} 的 HTTPS 已关闭（与查询时不同），未替换证书；如需部署并开启 HTTPS 请用 --domain 点名后重新执行`);
+}
+
 export function httpsAlreadyEnabled(): CloudApiError {
   return new CloudApiError("volcengine", "HttpsAlreadyEnabled", "该域名的 HTTPS 已开启（与查询时不同），未做修改；请重新执行，按更新规则判断");
 }

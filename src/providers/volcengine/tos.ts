@@ -6,7 +6,7 @@ import { mapLimit } from "../../lib/pool.js";
 import type { DomainRecord } from "../../types.js";
 import type { DomainService, Warn } from "../registry.js";
 import { enrichFromCertCenter } from "./certs.js";
-import { httpsAlreadyEnabled } from "./common.js";
+import { httpsAlreadyEnabled, httpsDisabled } from "./common.js";
 import { canonicalQuery, sha256Hex, tosAuthorization, volcDate } from "./sign.js";
 
 /** ListBuckets 返回账号下所有地域的桶，任一地域的 endpoint 都可以 */
@@ -184,6 +184,7 @@ export const tos: DomainService<AccessKeyCredentials> = {
       const rule = (res.CustomDomainRules ?? []).find((r) => r.Domain.toLowerCase() === record!.domain.toLowerCase());
       if (!rule) throw new CloudApiError("volcengine", "DomainNotFound", `桶 ${bucket} 上已没有自定义域名 ${record!.domain}`);
       if (target.mode === "deploy" && ruleHttps(rule)) throw httpsAlreadyEnabled();
+      if (target.mode === "update" && !ruleHttps(rule)) throw httpsDisabled(record!.domain);
       const certId = await input.certId();
       const body = JSON.stringify({ CustomDomainRule: compact({ Domain: rule.Domain, CertId: certId, Protocol: rule.Protocol }) });
       await tosCall(ctx, creds, { ...req, method: "PUT", body });

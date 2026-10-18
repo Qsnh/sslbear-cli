@@ -49,6 +49,10 @@ export async function scmCertIdOrPem(input: DeployInput): Promise<string | undef
 export const PEM_FALLBACK_NOTE = "云证书管理服务（CCM）不接受没有通用名（CN）的证书（SCM.0009），已改为直接上传证书内容绑定，该证书在 certs 里看不到";
 
 /** deploy 模式（查询时 HTTPS 未开启）写入前读到的配置显示 HTTPS 其实已开启：不写入，交给重新执行按更新规则判断 */
+/** update 模式写入前读到 HTTPS 已关闭（与查询时不同，如等待终端确认期间有人关了）：不写入，免得把 HTTPS 重新打开 */
+export const httpsDisabled = (domain: string) =>
+  `域名 ${domain} 的 HTTPS 已关闭（与查询时不同），未替换证书；如需部署并开启 HTTPS 请用 --domain 点名后重新执行`;
+
 export const HTTPS_ALREADY_ENABLED = "该域名的 HTTPS 已开启（与查询时不同），未做修改；请重新执行，按更新规则判断";
 
 /**

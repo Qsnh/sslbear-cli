@@ -1,7 +1,7 @@
 import type { LocalCert } from "../../deploy/cert.js";
 import { SAME_CERT_TOLERANCE_MS } from "../../deploy/plan.js";
 import type { AccessKeyCredentials } from "../../lib/env.js";
-import { CloudApiError, isRetryable, withRetry, type QueryContext } from "../../lib/http.js";
+import { CloudApiError, withRetry, type QueryContext } from "../../lib/http.js";
 import { compact } from "../../lib/compact.js";
 import { memo, paginate } from "../../lib/paginate.js";
 import { mapLimit } from "../../lib/pool.js";
@@ -79,7 +79,7 @@ const uploads = memo<QueryContext, string>();
 /**
  * 直播证书管理里与本地证书同一张的证书链 ID（每次都重新拉 ListCertV2，不用缓存）。ListCertV2 不给指纹：
  * 先按项目与到期时间（48 小时内）筛候选，再逐个用 DescribeCertDetailSecretV2 取证书链比对叶子指纹，
- * 避免把同域名、同到期时间的另一算法证书当成同一张；取不到某张候选的证书链（拿不到指纹）时按不是同一张处理。
+ * 避免把同域名、同到期时间的另一算法证书当成同一张；候选已被删除时按不是同一张处理，读取失败则报错。
  */
 async function findLiveCert(ctx: QueryContext, creds: AccessKeyCredentials, cert: LocalCert, project: string): Promise<string | undefined> {
   const list = (await call<{ CertList?: LiveCert[] | null }>(ctx, creds, "ListCertV2", {})).CertList ?? [];
@@ -93,9 +93,10 @@ async function findLiveCert(ctx: QueryContext, creds: AccessKeyCredentials, cert
       const detail = await call<{ SSL?: { Chain?: string[] | null } | null }>(ctx, creds, "DescribeCertDetailSecretV2", { ChainID: c.ChainID });
       chain = detail.SSL?.Chain ?? [];
     } catch (e) {
-      // 限流、超时等交给外层整轮重来；其余错误（如证书已删除）视为拿不到指纹
-      if (isRetryable(e)) throw e;
-      continue;
+      // 证书在列表与详情之间被删除：不是同一张，看下一个候选；其余错误（限流、超时交给外层整轮重来，无权限等直接报错）
+      // 一律抛出，不能当成「不是同一张」去上传，否则缺权限时每次运行都会多传一份
+      if (e instanceof CloudApiError && /NotFound|NotExist/i.test(e.code)) continue;
+      throw e;
     }
     if (pemFingerprints(chain.join("\n")).includes(cert.fingerprint)) return c.ChainID!;
   }

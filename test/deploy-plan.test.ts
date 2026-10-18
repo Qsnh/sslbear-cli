@@ -51,12 +51,15 @@ describe("decide", () => {
     expect(decide(on("2027-01-01T00:00:00Z"), CERT, opts)).toMatchObject({ kind: "skip", reason: "already_current" });
   });
 
-  it("查不到旧证书算法时按同一张跳过，但提示可 --force；加 --force 后更新（同时签发的 RSA / ECC 两张无法靠时间区分）", () => {
+  it("查不到旧证书算法时按同一张跳过，但提示可点名 + --force；只有用 -d 点名且加 --force 才更新（同时签发的 RSA / ECC 两张无法靠时间区分）", () => {
     const d = decide(on("2027-01-01T00:00:00Z"), CERT, opts);
     expect(d).toMatchObject({ kind: "skip", reason: "already_current" });
     expect(d.needsConfirm).toBeUndefined();
+    expect(d.message).toContain("-d");
     expect(d.message).toContain("--force");
-    expect(decide(on("2027-01-01T00:00:00Z"), CERT, { ...opts, force: true })).toMatchObject({ kind: "update", oldCert: { name: "old" } });
+    // 没点名时 --force 不波及它：它不在需确认清单里，用户没被问过
+    expect(decide(on("2027-01-01T00:00:00Z"), CERT, { ...opts, force: true })).toMatchObject({ kind: "skip", reason: "already_current" });
+    expect(decide(on("2027-01-01T00:00:00Z"), CERT, { ...opts, force: true, named: true })).toMatchObject({ kind: "update", oldCert: { name: "old" } });
   });
 
   it("到期时间相同但算法不同：需确认，--force 后更新", () => {

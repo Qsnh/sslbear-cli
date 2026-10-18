@@ -477,7 +477,7 @@ describe("baidu CDN 部署", () => {
       httpsRows: [{ domain: "www.example.com", certId: "cert-old", certStopTime: DUE, certType: 1, status: 1 }],
       config: { "www.example.com": { https: { ...FULL_HTTPS, enabled: false } } },
     });
-    expect(byDomain["www.example.com"]).toMatchObject({ action: "failed", code: "HttpsDisabled", retryable: false });
+    expect(byDomain["www.example.com"]).toMatchObject({ action: "failed", code: "HttpsDisabled", retryable: true });
     expect(puts(fetch)).toEqual([]);
   });
 
@@ -486,7 +486,7 @@ describe("baidu CDN 部署", () => {
       { domains: [{ domain: "www.example.com", status: "RUNNING" }], httpsRows: [], config: { "www.example.com": { https: FULL_HTTPS } } },
       { domains: ["www.example.com"] },
     );
-    expect(byDomain["www.example.com"]).toMatchObject({ action: "failed", code: "HttpsAlreadyEnabled", retryable: false });
+    expect(byDomain["www.example.com"]).toMatchObject({ action: "failed", code: "HttpsAlreadyEnabled", retryable: true });
     expect(byDomain["www.example.com"]!.message).toContain("HTTPS 已开启");
     expect(puts(fetch)).toEqual([]);
     expect(posts(fetch)).toEqual([]);
@@ -557,9 +557,8 @@ describe("baidu CDN 部署", () => {
 
       const { report, fetch, byDomain } = await deploy(failing, { force: true });
       expect(report.issues).toEqual([expect.objectContaining({ provider: "baidu", service: "cdn", code: "InternalError", target: "domain www.example.com HTTPS 配置（用于区分国密证书）" })]);
-      // 编排层对 httpsUnknown 记 HttpsStateUnknown；没有该处理时 deployer 按 unsupported 兜底
-      const r = byDomain["www.example.com"]!;
-      expect(r.reason === "unsupported" || r.code === "HttpsStateUnknown").toBe(true);
+      // 状态未知不能当成「不支持」跳过（exit 0、agent 会放弃）：记为可重试的 HttpsStateUnknown 失败
+      expect(byDomain["www.example.com"]).toMatchObject({ action: "failed", code: "HttpsStateUnknown", retryable: true });
       expect(puts(fetch)).toEqual([]);
     });
   });

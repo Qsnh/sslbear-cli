@@ -227,6 +227,8 @@ export const cdn: DomainService<AccessKeyCredentials> = {
     // 实测证书管理不接受没有 CN 的证书（CertificateParameterInvalid）
     requiresCommonName: true,
     unsupported(record) {
+      // 查询失败导致状态未知时交给编排层记为可重试的失败（HttpsStateUnknown），不能说成「不支持」
+      if (record.extra?.httpsUnknown === "true") return undefined;
       const certs = record.certs ?? [];
       if (certs.length > 1 && !certs.some((c) => c.algorithm === "SM2")) {
         return "该域名绑定了多张证书，但查不到 HTTPS 配置、无法区分国际证书与国密证书，为避免换错未处理；请稍后重试";

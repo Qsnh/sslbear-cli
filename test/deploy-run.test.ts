@@ -410,6 +410,34 @@ describe("planDeploy / executeDeploy", () => {
     expect(r.results[1]!.message).toContain("[私钥已隐藏]");
   });
 
+  it("写入前发现状态与查询时不同（HttpsAlreadyEnabled / HttpsDisabled）：记为可重试，重新执行会按新状态判断", async () => {
+    const dep = {
+      apply: vi.fn(async (_c: QueryContext, _cr: unknown, t: { records: DomainRecord[] }) => {
+        throw new CloudApiError("aliyun", t.records[0]!.domain.startsWith("a") ? "HttpsAlreadyEnabled" : "HttpsDisabled", "changed");
+      }),
+    };
+    const d = defs(def("aliyun", [svc("cdn", [rec("cdn", "a.example.com"), rec("cdn", "b.example.com")], dep)]));
+    const r = await run(d);
+    expect(r.results.map((x) => [x.code, x.retryable])).toEqual([
+      ["HttpsAlreadyEnabled", true],
+      ["HttpsDisabled", true],
+    ]);
+  });
+
+  it("查不到到期时间且同一服务有查询失败时，提示可能是查询失败所致、可先重试", async () => {
+    const dep = okDeployer();
+    const s1 = svc("cdn", [rec("cdn", "a.example.com", { cert: { name: "old" } })], dep);
+    s1.list = async (_c, _cr, warn) => {
+      warn(new CloudApiError("aliyun", "Throttling", "slow"), "HTTPS 证书列表");
+      return [rec("cdn", "a.example.com", { cert: { name: "old" } })];
+    };
+    const s2 = svc("dcdn", [rec("dcdn", "a.example.com", { cert: { name: "old" } })], okDeployer());
+    const r = await run(defs(def("aliyun", [s1, s2])));
+    expect(r.results[0]).toMatchObject({ service: "cdn", reason: "unknown_expiry", message: expect.stringContaining("同一服务有查询失败") });
+    expect(r.results[1]).toMatchObject({ service: "dcdn", reason: "unknown_expiry" });
+    expect(r.results[1]!.message).not.toContain("同一服务有查询失败");
+  });
+
   it("云厂商没有 uploadCertificate 时 certId() 失败只影响用到它的服务", async () => {
     const pem = { apply: vi.fn(async () => ({})) };
     const d = defs(def("aliyun", [svc("cdn", [rec("cdn", "a.example.com")], okDeployer()), svc("vod", [rec("vod", "a.example.com")], pem)]));

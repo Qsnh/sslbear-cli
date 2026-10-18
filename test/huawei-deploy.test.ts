@@ -370,6 +370,12 @@ describe("huawei cdn deployer", () => {
     expect(fetch.calls.map((c) => c.method)).toEqual(["GET"]);
   });
 
+  it("update 模式：读到 HTTPS 已关闭（与查询时不同）时不写入，报 HttpsDisabled，不会把 HTTPS 重新打开", async () => {
+    const { ctx, fetch } = ctxOf(cdnRoute({ https_status: "off", certificate_name: "stale" }));
+    await expect(cdn.deployer!.apply(ctx, CREDS, { records: [cdnRecord()], mode: "update" }, pemOnly())).rejects.toMatchObject({ code: "HttpsDisabled" });
+    expect(fetch.calls.map((c) => c.method)).toEqual(["GET"]);
+  });
+
   it("deploy 模式：配置里没有 https 或 https_status 为 off 时照常开启", async () => {
     for (const configs of [{}, { https: null }, { https: {} }, { https: { https_status: "off", certificate_name: "stale" } }]) {
       const { ctx, fetch } = ctxOf((req) => (req.method === "GET" ? { body: { configs } } : { body: "" }));
@@ -555,10 +561,18 @@ describe("huawei live deployer", () => {
     }
   });
 
+  it("update 模式：读到没有任何证书（HTTPS 已被关闭）时不上传、不写入，报 HttpsDisabled", async () => {
+    const { ctx, fetch } = ctxOf(liveRoute({ force_redirect: false, tls_certificate: {} }));
+    const input = viaScm();
+    await expect(live.deployer!.apply(ctx, CREDS, { records: [liveRecord()], mode: "update" }, input)).rejects.toMatchObject({ code: "HttpsDisabled" });
+    expect(input.certId).not.toHaveBeenCalled();
+    expect(fetch.calls.map((c) => c.method)).toEqual(["GET"]);
+  });
+
   it("extra 里没有项目 ID 时按地域从 IAM 项目列表取", async () => {
     const { ctx, fetch } = ctxOf((req) => {
       if (req.url.host === "iam.myhuaweicloud.com") return { body: { projects: [{ id: "p-bj4", name: "cn-north-4" }] } };
-      return liveRoute({ force_redirect: false })(req);
+      return liveRoute({ force_redirect: false, tls_certificate: { source: "scm", cert_id: "scs-old" } })(req);
     });
     await live.deployer!.apply(ctx, CREDS, { records: [liveRecord({ extra: { region: "cn-north-4", type: "pull" } })], mode: "update" }, viaScm());
     expect(fetch.calls.map((c) => `${c.method} ${c.url.host}`)).toEqual(["GET iam.myhuaweicloud.com", `GET ${LIVE_HOST}`, `PUT ${LIVE_HOST}`]);
@@ -599,7 +613,8 @@ describe("huawei live deployer", () => {
   });
 
   it("写接口失败抛 CloudApiError", async () => {
-    const { ctx } = ctxOf((req) => (req.method === "PUT" ? apigError(400, "LIVE.100011001", "Request Illegal") : liveRoute({ force_redirect: false })(req)));
+    const current = { force_redirect: false, tls_certificate: { source: "scm", cert_id: "scs-old" } };
+    const { ctx } = ctxOf((req) => (req.method === "PUT" ? apigError(400, "LIVE.100011001", "Request Illegal") : liveRoute(current)(req)));
     await expect(live.deployer!.apply(ctx, CREDS, { records: [liveRecord()], mode: "update" }, viaScm())).rejects.toMatchObject({
       code: "LIVE.100011001",
       requestId: "rid-LIVE.100011001",

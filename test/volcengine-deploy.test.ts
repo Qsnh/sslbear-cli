@@ -442,6 +442,14 @@ describe("volcengine tos 部署", () => {
     expect(inp.uploads()).toBe(0);
   });
 
+  it("更新时读到该域名已解绑证书（HTTPS 已关闭，与查询时不同）：不写入、不上传，报 HttpsDisabled", async () => {
+    const { fetch, ctx } = setup(route);
+    const inp = input();
+    await expect(deployer("tos").apply(ctx, CREDS, target(rec("tos", "http.example.com", { extra }), "update"), inp)).rejects.toMatchObject({ code: "HttpsDisabled" });
+    expect(fetch.calls.filter((c) => c.method === "PUT")).toHaveLength(0);
+    expect(inp.uploads()).toBe(0);
+  });
+
   it("部署时绑的证书已不可用（CertNotExist）照常视为未开启，换绑新证书", async () => {
     const gone = [{ Domain: "gone.example.com", Forbidden: false, CertId: "cert-gone", Protocol: "tos", CertStatus: "CertNotExist" }];
     const { fetch, ctx } = setup((req) => (req.method === "GET" && req.url.host === "b1.tos-cn-shanghai.volces.com" ? { body: { CustomDomainRules: gone } } : route(req)));
@@ -542,6 +550,14 @@ describe("volcengine vod 部署", () => {
     expect(fetch.calls[1]!.json).toMatchObject({
       UpdateCdnConfigParam: { Domain: "v.example.com", HTTPS: { Switch: true, CertInfo: { CertId: "cert-new" }, HTTP2: false, TlsVersion: ["tlsv1.1", "tlsv1.2", "tlsv1.3"] } },
     });
+  });
+
+  it("更新时读到 HTTPS 开关已关闭（与查询时不同）：不写入、不上传，报 HttpsDisabled", async () => {
+    const { fetch, ctx } = setup(routes({ Switch: false, CertInfo: { CertId: "cert-old" } }));
+    const inp = input();
+    await expect(deployer("vod").apply(ctx, CREDS, target(rec("vod", "v.example.com", { extra }), "update"), inp)).rejects.toMatchObject({ code: "HttpsDisabled" });
+    expect(fetch.calls.map((c) => c.action)).toEqual(["DescribeVodDomainConfig"]);
+    expect(inp.uploads()).toBe(0);
   });
 
   it("部署时读到 HTTPS 开关其实已打开：不写入、不上传", async () => {
@@ -704,6 +720,13 @@ describe("volcengine live 部署", () => {
         message: expect.stringMatching(/视频直播不接受没有通用名（CN）的证书.*db error/),
       });
       expect(fetch.calls.filter((c) => c.action === "CreateCert")).toHaveLength(1);
+    });
+
+    it("查重时候选证书的详情读取失败（如无权限）：报错、不上传，免得每次运行都多传一份", async () => {
+      const base = routes([{ ChainID: "chain-same", NotAfter: RSA.notAfter, ProjectName: "default" }]);
+      const { fetch, ctx } = setup((req) => (req.action === "DescribeCertDetailSecretV2" ? volcError("AccessDenied", "no permission", 403) : base(req)));
+      await expect(deployer("live").apply(ctx, CREDS, target(pull), input(RSA))).rejects.toMatchObject({ code: "AccessDenied" });
+      expect(fetch.calls.filter((c) => c.action === "CreateCert")).toHaveLength(0);
     });
 
     it("候选证书的详情查不到（拿不到指纹）时按不是同一张处理，照常上传", async () => {
@@ -1036,6 +1059,9 @@ describe("volcengine 查询失败导致 HTTPS 状态 / 证书不明时标记 htt
     expect(warned).toHaveLength(1);
     expect(byDomain["dual.example.com"]).toMatchObject({ https: true, extra: { httpsUnknown: "true" } });
     expect(byDomain["single.example.com"]!.extra?.httpsUnknown).toBeUndefined();
+    // 状态未知交给编排层记 HttpsStateUnknown（可重试的失败），deployer 不能把它说成「不支持」
+    const svc = volcengine.services.find((s) => s.key === "cdn")!;
+    expect(svc.deployer!.unsupported!(byDomain["dual.example.com"]!, "update")).toBeUndefined();
   });
 
   it("点播：双证书没有 PEM 可识别算法、证书中心又查询失败时标记 httpsUnknown", async () => {

@@ -33,6 +33,9 @@ function fetchRaw(ctx: QueryContext, creds: AccessKeyCredentials): Promise<SslCe
   });
 }
 
+/** 证书列表的 encrypt：RSA / ECDSA（实测 ECC 证书为 ECDSA） */
+const ALGORITHMS: Record<string, LocalCert["algorithm"]> = { RSA: "RSA", ECDSA: "ECC", ECC: "ECC", EC: "ECC" };
+
 async function fetchAll(ctx: QueryContext, creds: AccessKeyCredentials): Promise<CertificateRecord[]> {
   const list = await fetchRaw(ctx, creds);
   return list.map((c) =>
@@ -44,6 +47,7 @@ async function fetchAll(ctx: QueryContext, creds: AccessKeyCredentials): Promise
       sans: c.dnsnames ?? undefined,
       notBefore: unixToIso(c.not_before),
       notAfter: unixToIso(c.not_after),
+      algorithm: ALGORITHMS[(c.encrypt ?? "").toUpperCase()],
     }),
   );
 }
@@ -78,7 +82,7 @@ export async function enrichFromSsl(
   for (const r of pending) {
     const c = byId.get(r.cert!.id!);
     if (!c) continue;
-    r.cert = compact({ ...r.cert, name: c.name, commonName: c.commonName, sans: c.sans, notBefore: c.notBefore, notAfter: c.notAfter });
+    r.cert = compact({ ...r.cert, name: c.name, commonName: c.commonName, sans: c.sans, notBefore: c.notBefore, notAfter: c.notAfter, algorithm: c.algorithm });
   }
   return records;
 }
@@ -92,8 +96,6 @@ function certName(cert: LocalCert): string {
   const cn = (cert.commonName ?? cert.sans[0] ?? "cert").replace(/\*/g, "_");
   return `sslbear-${cn}`.slice(0, NAME_MAX - suffix.length) + suffix;
 }
-
-const ALGORITHMS: Record<string, LocalCert["algorithm"]> = { RSA: "RSA", ECDSA: "ECC", ECC: "ECC", EC: "ECC" };
 
 const toUnix = (iso: string) => Math.floor(Date.parse(iso) / 1000);
 
