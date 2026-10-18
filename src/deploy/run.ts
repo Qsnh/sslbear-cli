@@ -200,15 +200,17 @@ export function buildPlan(ctx: QueryContext, cert: LocalCert, opts: DeployOption
     const def = defs[record.provider];
     const service = def.services.find((s) => s.key === record.service)!;
     const inScope = !named || isNamed;
-    if (record.extra?.httpsUnknown === "true") {
+    const unsupportedFor = (mode: DeployTarget["mode"]) => (service.deployer ? service.deployer.unsupported?.(record, mode) : UNSUPPORTED_SERVICE);
+    // 平台托管、或无论开没开 HTTPS 都不能部署的记录，状态未知也无妨：照常按决策表跳过
+    const neverDeployable = record.extra?.managed === "platform" || (unsupportedFor("update") && unsupportedFor("deploy"));
+    if (record.extra?.httpsUnknown === "true" && !neverDeployable) {
       // 不能当成没开 HTTPS 跳过（它可能正是要更新的域名），也不能部署或更新：一律记为可重试的失败；
       // 仍参与共享作用域分组，挡住同组的其他记录
       if (inScope) results.push(failure(record, "HttpsStateUnknown", HTTPS_UNKNOWN, true));
       candidates.push({ record, service, decision: { kind: "skip" }, inScope, httpsUnknown: true });
       continue;
     }
-    const mode = record.https ? "update" : "deploy";
-    const unsupported = service.deployer ? service.deployer.unsupported?.(record, mode) : UNSUPPORTED_SERVICE;
+    const unsupported = unsupportedFor(record.https ? "update" : "deploy") ?? (neverDeployable ? unsupportedFor("update") : undefined);
     const decision = decide(record, cert, { named: isNamed, force: opts.force, now: ctx.now, ...(unsupported && { unsupported }) });
     candidates.push({ record, service, decision, inScope, httpsUnknown: false });
   }

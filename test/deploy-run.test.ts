@@ -178,6 +178,23 @@ describe("planDeploy / executeDeploy", () => {
     expect(other.results).toEqual([expect.objectContaining({ domain: "c.example.com", action: "would_update" })]);
   });
 
+  it("HTTPS 状态未知但无论如何都不能部署的记录（平台托管、服务或记录不支持）照常跳过，不记失败", async () => {
+    const unknown = { httpsUnknown: "true" };
+    const d = defs(
+      def("aliyun", [
+        svc("cdn", [rec("cdn", "a.example.com", { extra: unknown })]),
+        svc("live", [rec("live", "push.example.com", { https: false, extra: unknown })], { ...okDeployer(), unsupported: () => "推流域名不能绑定证书" }),
+        svc("vod", [rec("vod", "v.example.com", { extra: { ...unknown, managed: "platform" } })], okDeployer()),
+      ]),
+    );
+    const r = await run(d);
+    expect(r.results).toEqual([
+      expect.objectContaining({ service: "cdn", action: "skipped", reason: "unsupported" }),
+      expect.objectContaining({ service: "live", action: "skipped", reason: "unsupported", message: "推流域名不能绑定证书" }),
+      expect.objectContaining({ service: "vod", action: "skipped", reason: "platform_managed" }),
+    ]);
+  });
+
   it("没有 deployer 的服务、deployer 声明不支持的记录：跳过 unsupported", async () => {
     const d = defs(
       def("aliyun", [

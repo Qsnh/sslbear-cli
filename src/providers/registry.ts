@@ -40,7 +40,10 @@ export interface DeployOutcome {
 export interface Deployer<C> {
   /** 记录级的限制：返回不支持的原因（中文），undefined 表示支持；如推流域名不能绑证书、该服务不能经 API 开启 HTTPS */
   unsupported?(record: DomainRecord, mode: DeployTarget["mode"]): string | undefined;
-  /** 证书挂在多个域名共享的对象上时（如 ESA 站点）返回该对象的键，同键的记录要么一起更新、要么都不动 */
+  /**
+   * 证书挂在多个域名共享的对象上时（如 ESA 站点）返回该对象的键，同键的记录要么一起更新、要么都不动。
+   * 没开 HTTPS 的记录也会被询问：共享证书会让它开始提供 HTTPS 的，同样要返回键（它会挡住整组）
+   */
   sharedScope?(record: DomainRecord): string | undefined;
   /** 执行部署；失败直接抛错（CloudApiError 会带上错误码与 RequestId） */
   apply(ctx: QueryContext, creds: C, target: DeployTarget, input: DeployInput): Promise<DeployOutcome>;
