@@ -2,14 +2,14 @@ import { X509Certificate } from "node:crypto";
 import type { LocalCert } from "../../deploy/cert.js";
 import { SAME_CERT_TOLERANCE_MS } from "../../deploy/plan.js";
 import type { AccessKeyCredentials } from "../../lib/env.js";
-import { CloudApiError, type QueryContext } from "../../lib/http.js";
+import { CloudApiError, withRetry, type QueryContext } from "../../lib/http.js";
 import { compact } from "../../lib/compact.js";
 import { memo, paginate } from "../../lib/paginate.js";
 import { toIso } from "../../lib/time.js";
 import type { CertInfo, CertificateRecord, DomainRecord } from "../../types.js";
 import type { Warn } from "../registry.js";
 import { callHuawei } from "./client.js";
-import { certName } from "./common.js";
+import { certName, markHttpsUnknown } from "./common.js";
 
 /** 云证书管理服务 CCM（原 SCM）的 SSL 证书接口是全局服务，中国站统一走北京四 */
 const SCM_HOST = "scm.cn-north-4.myhuaweicloud.com";
@@ -74,7 +74,8 @@ const certsOf = (r: DomainRecord) => [r.cert, ...(r.certs ?? [])];
 
 /**
  * 域名接口只给了证书 ID、缺到期时间（或缺 CN / SAN）时，用 SSL 证书列表按 ID 补全（cert 与 certs 里的每一张）；已有的字段不覆盖。
- * 补全失败（如没有 SCM 只读权限）时，有域名缺到期时间才记一条 issue，域名本身照常返回。
+ * 补全失败（如没有 SCM 只读权限）时，有域名缺到期时间才记一条 issue，域名本身照常返回；
+ * 其中国际证书因此缺到期时间的域名标 httpsUnknown（不知道绑着的证书何时到期，不能当成「查不到到期时间」去决策）。
  */
 export async function enrichFromScm(
   ctx: QueryContext,
@@ -89,6 +90,7 @@ export async function enrichFromScm(
     certs = await listScmCertificates(ctx, creds);
   } catch (e) {
     if (pending.some((r) => certsOf(r).some(needsExpiry))) warn(e, "SSL 证书列表（用于补全到期时间）");
+    for (const r of pending) if (certsOf(r).some((c) => needsExpiry(c) && c!.algorithm !== "SM2")) markHttpsUnknown(r);
     return records;
   }
   const byId = new Map(certs.map((c) => [c.id, c]));
@@ -124,33 +126,56 @@ function isCandidate(c: CertificateRecord, cert: LocalCert): boolean {
   return Number.isFinite(at) && Math.abs(at - Date.parse(cert.notAfter)) <= SAME_CERT_TOLERANCE_MS;
 }
 
+const hex = (s: string | null | undefined) => (s ?? "").replace(/:/g, "").toLowerCase();
+
 /**
- * 上传到云证书管理服务（ImportCertificate）。先查重：列表里 CN、域名、到期时间都相同的候选，
- * 再用证书详情（ShowCertificate）的 SHA-1 指纹确认是同一张；详情不给指纹时按候选条件复用。
- * certificate 字段上限 4096 字符，叶子 + 中间证书容易超出，所以证书链单独放 certificate_chain（上限 8192）。
+ * 证书详情里的指纹是否就是要上传的这张：文档写的是 SHA-1（40 位十六进制），64 位的按 SHA-256 比对。
+ * 没有指纹或格式认不出时按不是同一张处理，宁可多传一份：同 CN、同 SAN、到期只差几秒的 RSA / ECC 两张证书不能互相复用。
  */
-export async function uploadScmCertificate(ctx: QueryContext, creds: AccessKeyCredentials, cert: LocalCert): Promise<{ id: string; reused: boolean }> {
-  const [leaf, ...chain] = cert.certPem.match(PEM_CERT) ?? [];
-  const sha1 = new X509Certificate(leaf!).fingerprint.replace(/:/g, "").toLowerCase();
-  const listed = await listScmCertificates(ctx, creds);
+function sameFingerprint(fingerprint: string | null | undefined, sha1: string, sha256: string): boolean {
+  const fp = hex(fingerprint);
+  if (/^[0-9a-f]{40}$/.test(fp)) return fp === sha1;
+  if (/^[0-9a-f]{64}$/.test(fp)) return fp === sha256;
+  return false;
+}
+
+/** 证书服务里已有的同一张证书：每次都重新拉列表（不用缓存，上一轮导入可能其实已成功），候选再逐个查详情（ShowCertificate）比对指纹 */
+async function findSame(ctx: QueryContext, creds: AccessKeyCredentials, cert: LocalCert, sha1: string): Promise<string | undefined> {
+  const listed = await fetchAll(ctx, creds);
   for (const c of listed.filter((x) => isCandidate(x, cert))) {
     const detail = await callHuawei<{ fingerprint?: string | null }>(ctx, creds, { host: SCM_HOST, path: `/v3/scm/certificates/${c.id}` });
-    const fingerprint = detail.fingerprint?.replace(/:/g, "").toLowerCase();
-    if (!fingerprint || fingerprint === sha1) return { id: c.id, reused: true };
+    if (sameFingerprint(detail.fingerprint, sha1, cert.fingerprint)) return c.id;
   }
-  const res = await callHuawei<{ certificate_id?: string }>(ctx, creds, {
-    host: SCM_HOST,
-    path: "/v3/scm/certificates/import",
-    method: "POST",
-    body: {
-      name: certName(cert),
-      certificate: `${leaf}\n`,
-      ...(chain.length > 0 && { certificate_chain: `${chain.join("\n")}\n` }),
-      private_key: cert.keyPem,
-      // 已自行查重；交给服务端查重的话，重复时的报错码文档没写
-      duplicate_check: false,
-    },
+  return undefined;
+}
+
+/**
+ * 上传到云证书管理服务（ImportCertificate），已有同一张证书（指纹一致）时复用。
+ * 导入不幂等（没有幂等键，duplicate_check 关闭）：导入请求只发一次，遇到超时、限流等可重试错误时整轮重来，
+ * 先重新查重（上一次其实已导入成功时直接复用）再导入，最多 3 轮，不会在证书服务里传出两份。
+ * certificate 字段上限 4096 字符，叶子 + 中间证书容易超出，所以证书链单独放 certificate_chain（上限 8192）。
+ */
+export function uploadScmCertificate(ctx: QueryContext, creds: AccessKeyCredentials, cert: LocalCert): Promise<{ id: string; reused: boolean }> {
+  const [leaf, ...chain] = cert.certPem.match(PEM_CERT) ?? [];
+  const sha1 = hex(new X509Certificate(leaf!).fingerprint);
+  return withRetry(ctx, async () => {
+    const same = await findSame(ctx, creds, cert, sha1);
+    if (same) return { id: same, reused: true };
+    const res = await callHuawei<{ certificate_id?: string }>(ctx, creds, {
+      host: SCM_HOST,
+      path: "/v3/scm/certificates/import",
+      method: "POST",
+      body: {
+        name: certName(cert),
+        certificate: `${leaf}\n`,
+        ...(chain.length > 0 && { certificate_chain: `${chain.join("\n")}\n` }),
+        private_key: cert.keyPem,
+        // 已自行查重；交给服务端查重的话，重复时的报错码文档没写
+        duplicate_check: false,
+      },
+      retry: false,
+    });
+    if (!res.certificate_id) throw new CloudApiError("huawei", "InvalidResponse", "导入证书成功但未返回证书 ID");
+    return { id: res.certificate_id, reused: false };
   });
-  if (!res.certificate_id) throw new CloudApiError("huawei", "InvalidResponse", "导入证书成功但未返回证书 ID");
-  return { id: res.certificate_id, reused: false };
 }

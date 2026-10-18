@@ -13,6 +13,8 @@ export interface HuaweiRequest {
   body?: unknown;
   /** 区域级服务（如视频直播）用 AK/SK 认证时必须带 X-Project-Id */
   projectId?: string;
+  /** 默认对限流、超时等自动重试；非幂等的写接口（导入证书）传 false 只发一次，由调用方查重后自行重试 */
+  retry?: boolean;
 }
 
 interface ErrorFields {
@@ -58,7 +60,7 @@ function findError(body: unknown, status: number): { code: string; message: stri
  * RequestId 只在 X-Request-Id 响应头里稳定出现，send() 拿不到响应头，这里取错误体中的 request_id（网关错误都带）。
  */
 export async function callHuawei<T>(ctx: QueryContext, creds: AccessKeyCredentials, req: HuaweiRequest): Promise<T> {
-  return withRetry(ctx, async () => {
+  const once = async (): Promise<T> => {
     const query = Object.fromEntries(
       Object.entries(req.query ?? {})
         .filter(([, v]) => v !== undefined && v !== "")
@@ -99,7 +101,8 @@ export async function callHuawei<T>(ctx: QueryContext, creds: AccessKeyCredentia
       throw new CloudApiError("huawei", code, err.message, err.requestId, raw.status);
     }
     return parsed as T;
-  });
+  };
+  return req.retry === false ? once() : withRetry(ctx, once);
 }
 
 /** 全局 IAM endpoint，查询项目不区分地域 */

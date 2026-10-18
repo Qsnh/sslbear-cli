@@ -30,6 +30,17 @@ export function smCertLocked(record: DomainRecord): string | undefined {
   return source && source !== "scm" ? SM_CERT_LOCKED : undefined;
 }
 
+/** deploy 模式（查询时 HTTPS 未开启）写入前读到的配置显示 HTTPS 其实已开启：不写入，交给重新执行按更新规则判断 */
+export const HTTPS_ALREADY_ENABLED = "该域名的 HTTPS 已开启（与查询时不同），未做修改；请重新执行，按更新规则判断";
+
+/**
+ * 查询时某个查询失败（已记 issue），无法确定域名是否开着 HTTPS / 绑着什么证书：在 extra 里打 httpsUnknown 标记，
+ * 编排层据此把该域名记为可重试的失败、不做写操作，而不是按 https:false 或「查不到到期时间」处理
+ */
+export function markHttpsUnknown(record: DomainRecord): void {
+  record.extra = { ...record.extra, httpsUnknown: "true" };
+}
+
 /** 证书名：sslbear-<CN，不允许的字符换成 _>-<到期日 YYYYMMDD>；CCM、OBS 限 3~63 位英文字母、数字、下划线、中划线、英文句点，CDN 限 3~64 位 */
 const NAME_MAX = 63;
 export function certName(cert: Pick<LocalCert, "commonName" | "sans" | "notAfter">): string {

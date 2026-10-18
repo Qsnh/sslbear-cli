@@ -146,10 +146,59 @@ describe("huawei uploadCertificate（云证书管理服务 CCM / SCM）", () => 
     ]);
   });
 
-  it("证书详情没有指纹时，按 CN + SAN + 到期时间相差 48 小时内复用", async () => {
-    const { ctx, fetch } = ctxOf(scm([{ ...listed[2], expire_time: "2027-01-02 20:00:00.0" }], { scs0000000000003: { id: "scs0000000000003" } }));
+  it("证书详情没有指纹、或指纹格式认不出时按不是同一张处理，照常导入（同 CN、同 SAN、到期只差几秒的另一张证书不能复用）", async () => {
+    for (const detail of [{ id: "scs0000000000003" }, { id: "scs0000000000003", fingerprint: null }, { id: "scs0000000000003", fingerprint: "" }, { id: "scs0000000000003", fingerprint: "sha1:unknown" }]) {
+      const { ctx, fetch } = ctxOf(
+        scm([{ ...listed[2], expire_time: "2027-01-01 08:00:05.0" }], { scs0000000000003: detail }, () => ({ body: { certificate_id: "scs1600313391074" } })),
+      );
+      await expect(huawei.uploadCertificate!(ctx, CREDS, CERT)).resolves.toEqual({ id: "scs1600313391074", reused: false });
+      expect(fetch.calls.filter((c) => c.method === "POST")).toHaveLength(1);
+    }
+  });
+
+  it("详情给的是 SHA-256 指纹（64 位十六进制）时按 SHA-256 比对", async () => {
+    const same = ctxOf(scm([listed[2]], { scs0000000000003: { fingerprint: CERT.fingerprint.toUpperCase().replace(/(..)(?!$)/g, "$1:") } }));
+    await expect(huawei.uploadCertificate!(same.ctx, CREDS, CERT)).resolves.toEqual({ id: "scs0000000000003", reused: true });
+    const other = ctxOf(scm([listed[2]], { scs0000000000003: { fingerprint: "a".repeat(64) } }, () => ({ body: { certificate_id: "scs1600313391074" } })));
+    await expect(huawei.uploadCertificate!(other.ctx, CREDS, CERT)).resolves.toEqual({ id: "scs1600313391074", reused: false });
+  });
+
+  /** 模拟请求超时：服务端可能已经处理了这次请求 */
+  const timeout = (): never => {
+    throw Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
+  };
+  const call = (c: FakeRequest) => `${c.method} ${c.url.pathname}`;
+
+  it("导入超时（服务端其实已导入成功）：导入请求不原样重发，下一轮重新拉列表查重，查到即复用", async () => {
+    const stored: unknown[] = [];
+    const { ctx, fetch } = ctxOf(
+      scm(stored, { scs1600313391074: { id: "scs1600313391074", fingerprint: SHA1 } }, () => {
+        stored.push({ id: "scs1600313391074", name: NAME, domain: "example.com", sans: "*.example.com", expire_time: "2027-01-01 08:00:00.0", status: "UPLOAD" });
+        return timeout();
+      }),
+    );
+    await expect(huawei.uploadCertificate!(ctx, CREDS, CERT)).resolves.toEqual({ id: "scs1600313391074", reused: true });
+    expect(fetch.calls.map(call)).toEqual([
+      "GET /v3/scm/certificates",
+      "POST /v3/scm/certificates/import",
+      "GET /v3/scm/certificates",
+      "GET /v3/scm/certificates/scs1600313391074",
+    ]);
+  });
+
+  it("导入一直限流：每轮先重新查重再导入一次，最多 3 轮", async () => {
+    const { ctx, fetch } = ctxOf(scm([], {}, () => apigError(429, "APIGW.0308", "The throttling threshold has been reached")));
+    await expect(huawei.uploadCertificate!(ctx, CREDS, CERT)).rejects.toMatchObject({ code: "APIGW.0308" });
+    expect(fetch.calls.map(call)).toEqual(Array.from({ length: 3 }, () => ["GET /v3/scm/certificates", "POST /v3/scm/certificates/import"]).flat());
+  });
+
+  it("查重不用缓存：同一次命令里已拉过证书列表，上传前仍重新拉取", async () => {
+    const stored: unknown[] = [];
+    const { ctx, fetch } = ctxOf(scm(stored, { scs0000000000003: { fingerprint: SHA1 } }, () => ({ body: { certificate_id: "scs1600313391074" } })));
+    await expect(huawei.listCertificates(ctx, CREDS)).resolves.toEqual([]);
+    stored.push(listed[2]);
     await expect(huawei.uploadCertificate!(ctx, CREDS, CERT)).resolves.toEqual({ id: "scs0000000000003", reused: true });
-    expect(fetch.calls.some((c) => c.method === "POST")).toBe(false);
+    expect(fetch.calls.map(call)).toEqual(["GET /v3/scm/certificates", "GET /v3/scm/certificates", "GET /v3/scm/certificates/scs0000000000003"]);
   });
 
   it("查重未命中：POST 导入，叶子证书与证书链分开传，私钥只在请求体里，请求体参与签名", async () => {
@@ -168,11 +217,12 @@ describe("huawei uploadCertificate（云证书管理服务 CCM / SCM）", () => 
     expectNoKeyInUrl(fetch.calls);
   });
 
-  it("导入失败抛 CloudApiError（错误码、RequestId），错误信息里没有私钥", async () => {
-    const { ctx } = ctxOf(scm([], {}, () => apigError(400, "SCM.0016", "Certificate content is invalid.")));
+  it("导入失败抛 CloudApiError（错误码、RequestId），不可重试的错误不再重来，错误信息里没有私钥", async () => {
+    const { ctx, fetch } = ctxOf(scm([], {}, () => apigError(400, "SCM.0016", "Certificate content is invalid.")));
     const err = await huawei.uploadCertificate!(ctx, CREDS, CERT).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(CloudApiError);
     expect(err).toMatchObject({ code: "SCM.0016", requestId: "rid-SCM.0016" });
+    expect(fetch.calls.filter((c) => c.method === "POST")).toHaveLength(1);
     expect(String((err as Error).message)).not.toContain("PRIVATE KEY");
   });
 
@@ -282,6 +332,42 @@ describe("huawei cdn deployer", () => {
     );
     await expect(cdn.deployer!.apply(ctx, CREDS, { records: [cdnRecord()], mode: "update" }, pemOnly())).rejects.toMatchObject({ code: "SmCertNotPreservable" });
     expect(fetch.calls.map((c) => c.method)).toEqual(["GET"]);
+  });
+
+  it("双证书：读回的 CCM 国密证书没有证书名称时不写入（不省掉该字段），报错说明原因", async () => {
+    for (const name of [{}, { certificate_name: "" }, { certificate_name: null }]) {
+      const { ctx, fetch } = ctxOf(
+        cdnRoute({
+          https_status: "on",
+          certificates: [
+            { certificate_type: "server", certificate_source: 0, certificate_name: "old", certificate_value: OLD_ECC_PEM },
+            { certificate_type: "server_sm", certificate_source: 2, scm_certificate_id: "scs0000000000099", ...name },
+          ],
+        }),
+      );
+      const err = await cdn.deployer!.apply(ctx, CREDS, { records: [cdnRecord()], mode: "update" }, pemOnly()).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(CloudApiError);
+      expect(err).toMatchObject({ code: "SmCertNotPreservable", message: expect.stringContaining("没有证书名称") });
+      expect((err as Error).message).toContain("scs0000000000099");
+      expect(fetch.calls.map((c) => c.method)).toEqual(["GET"]);
+    }
+  });
+
+  it("deploy 模式：读到 HTTPS 其实已开启（与查询时不同）时不写入，报 HttpsAlreadyEnabled", async () => {
+    const { ctx, fetch } = ctxOf(cdnRoute({ https_status: "on", certificate_type: "server", certificate_source: 0, certificate_name: "old", certificate_value: OLD_ECC_PEM }));
+    await expect(cdn.deployer!.apply(ctx, CREDS, { records: [cdnRecord({ https: false, cert: undefined })], mode: "deploy" }, pemOnly())).rejects.toMatchObject({
+      code: "HttpsAlreadyEnabled",
+      message: "该域名的 HTTPS 已开启（与查询时不同），未做修改；请重新执行，按更新规则判断",
+    });
+    expect(fetch.calls.map((c) => c.method)).toEqual(["GET"]);
+  });
+
+  it("deploy 模式：配置里没有 https 或 https_status 为 off 时照常开启", async () => {
+    for (const configs of [{}, { https: null }, { https: {} }, { https: { https_status: "off", certificate_name: "stale" } }]) {
+      const { ctx, fetch } = ctxOf((req) => (req.method === "GET" ? { body: { configs } } : { body: "" }));
+      await cdn.deployer!.apply(ctx, CREDS, { records: [cdnRecord({ https: false, cert: undefined })], mode: "deploy" }, pemOnly());
+      expect(fetch.calls.map((c) => c.method)).toEqual(["GET", "PUT"]);
+    }
   });
 
   it("unsupported：查询时已知国密证书为自有上传的域名不更新；其余支持", () => {
@@ -441,6 +527,24 @@ describe("huawei live deployer", () => {
     await expect(live.deployer!.apply(ctx, CREDS, { records: [liveRecord()], mode: "update" }, input)).rejects.toMatchObject({ code: "SmCertNotPreservable" });
     expect(input.certId).not.toHaveBeenCalled();
     expect(fetch.calls.map((c) => c.method)).toEqual(["GET"]);
+  });
+
+  it("deploy 模式：读到已配置证书（HTTPS 其实已开启）时不上传、不写入，报 HttpsAlreadyEnabled", async () => {
+    for (const current of [
+      { certificate_format: "PEM", certificate: OLD_ECC_PEM, force_redirect: false, gm_certificate: {}, tls_certificate: { certificate: OLD_ECC_PEM } },
+      { force_redirect: false, tls_certificate: { source: "scm", cert_id: "scs-old" } },
+      { certificate: OLD_ECC_PEM },
+      { gm_certificate: { source: "scm", cert_id: "scs-gm", cert_name: "gm" }, tls_certificate: {} },
+    ]) {
+      const { ctx, fetch } = ctxOf(liveRoute(current));
+      const input = viaScm();
+      await expect(live.deployer!.apply(ctx, CREDS, { records: [liveRecord({ https: false, cert: undefined })], mode: "deploy" }, input)).rejects.toMatchObject({
+        code: "HttpsAlreadyEnabled",
+        message: "该域名的 HTTPS 已开启（与查询时不同），未做修改；请重新执行，按更新规则判断",
+      });
+      expect(input.certId).not.toHaveBeenCalled();
+      expect(fetch.calls.map((c) => c.method)).toEqual(["GET"]);
+    }
   });
 
   it("extra 里没有项目 ID 时按地域从 IAM 项目列表取", async () => {

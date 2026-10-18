@@ -537,6 +537,56 @@ describe("huawei live", () => {
     ]);
   });
 
+  it("查询失败导致国际证书缺到期时间（取证书内容失败且列表没给时间、SCM 补全失败）时标 httpsUnknown；只缺国密证书的到期时间不标", async () => {
+    const onlyBj4 = [{ id: "p-bj4", name: "cn-north-4" }];
+    const fetch = fakeFetch((req) => {
+      const iam = iamRoute(req, onlyBj4);
+      if (iam) return iam;
+      if (req.url.host === "scm.cn-north-4.myhuaweicloud.com") return apigError(403, "SCM.0403", "Permission denied");
+      const path = req.url.pathname;
+      if (path === "/v1/p-bj4/domain") {
+        const names = ["nopem", "timed", "scm", "gm", "ok"];
+        return { body: { total: names.length, domain_info: names.map((n) => ({ domain: `${n}.example.cn`, domain_type: "pull", status: "on" })) } };
+      }
+      if (path === "/v2/p-bj4/certificates") {
+        return {
+          body: {
+            total: 6,
+            certificates_info: [
+              // 取证书内容失败、列表也没给时间
+              { play_domain: "nopem.example.cn", cert_type: 0, source: "user" },
+              // 取证书内容失败，但列表给了时间
+              { play_domain: "timed.example.cn", cert_type: 0, source: "user", expire_time: "2026-12-30T16:00:00Z" },
+              // 没有 PEM 也没有时间，要从 SCM 补全，SCM 失败
+              { play_domain: "scm.example.cn", cert_type: 0, source: "scm", cert_id: "scs1554192131150", cert_name: "wild" },
+              // 国际证书齐全，只有国密证书缺时间
+              { play_domain: "gm.example.cn", cert_type: 0, source: "user", expire_time: "2026-12-30T16:00:00Z" },
+              { play_domain: "gm.example.cn", cert_type: 1, gm_cert_type: 1, source: "scm", cert_id: "scs1554192131151", cert_name: "gm" },
+              { play_domain: "ok.example.cn", cert_type: 0, source: "user" },
+            ],
+          },
+        };
+      }
+      if (path === "/v1/p-bj4/guard/https-cert") {
+        const domain = req.url.searchParams.get("domain");
+        if (domain === "nopem.example.cn" || domain === "timed.example.cn") return apigError(500, "LIVE.100011005", "Server internal error");
+        if (domain === "ok.example.cn") return { body: { tls_certificate: { certificate: LEAF_PEM } } };
+        return { body: { tls_certificate: {}, gm_certificate: {} } };
+      }
+      return undefined;
+    });
+    const r = await runCli(["domains", "-p", "huawei", "-s", "live", "--json"], { env: HUAWEI_ENV, fetch });
+    expect(r.code).toBe(0);
+    const map = byDomain(r.json.data.items);
+    expect(map["nopem.example.cn"]).toMatchObject({ https: true, extra: { httpsUnknown: "true" } });
+    expect(map["scm.example.cn"]).toMatchObject({ https: true, cert: { id: "scs1554192131150" }, extra: { httpsUnknown: "true" } });
+    for (const d of ["timed.example.cn", "gm.example.cn", "ok.example.cn"]) {
+      expect(map[d].https).toBe(true);
+      expect(map[d].extra.httpsUnknown).toBeUndefined();
+    }
+    expect(r.json.data.issues.map((i: any) => i.code).sort()).toEqual(["LIVE.100011005", "LIVE.100011005", "SCM.0403"]);
+  });
+
   it("账号下没有直播地域的项目时报错", async () => {
     const r = await runCli(["domains", "-p", "huawei", "-s", "live", "--json"], {
       env: HUAWEI_ENV,
@@ -650,6 +700,31 @@ describe("huawei obs", () => {
         obsStringToSign("GET", { "x-obs-date": list.headers["x-obs-date"]!, "x-obs-bucket-type": "OBJECT", "x-obs-security-token": "tok" }, "/"),
       ),
     );
+  });
+
+  it("SCM 补全失败：缺到期时间的服务端证书所在域名标 httpsUnknown，只缺 CN / 只缺国密证书时间的不标", async () => {
+    const fetch = fakeFetch((req) => {
+      if (req.url.host === "scm.cn-north-4.myhuaweicloud.com") return apigError(403, "SCM.0403", "Permission denied");
+      if (req.url.host === "obs.cn-north-4.myhuaweicloud.com") {
+        return { body: "<ListAllMyBucketsResult><Buckets><Bucket><Name>static-prod</Name><Location>cn-east-3</Location></Bucket></Buckets></ListAllMyBucketsResult>" };
+      }
+      if (req.url.host === "static-prod.obs.cn-east-3.myhuaweicloud.com") {
+        return {
+          body:
+            CUSTOM_DOMAINS.replace("</ListBucketCustomDomainsResult>", "") +
+            "<Domains><DomainName>gm.example.cn</DomainName><CertName>rsa</CertName><CertificateId>scs0000000000021</CertificateId><CertificateType>server</CertificateType><ExpiredTime>2027-03-13T10:22:05.912Z</ExpiredTime></Domains>" +
+            "<Domains><DomainName>gm.example.cn</DomainName><CertName>sm2</CertName><CertificateId>scs0000000000022</CertificateId><CertificateType>server_sm</CertificateType></Domains>" +
+            "</ListBucketCustomDomainsResult>",
+        };
+      }
+      return undefined;
+    });
+    const r = await runCli(["domains", "-p", "huawei", "-s", "obs", "--json"], { env: HUAWEI_ENV, fetch });
+    expect(r.code).toBe(0);
+    const map = byDomain(r.json.data.items);
+    expect(map["old.example.cn"]).toMatchObject({ https: true, cert: { id: "scs1554192131150" }, extra: { bucket: "static-prod", httpsUnknown: "true" } });
+    for (const d of ["ccm.example.cn", "cdn.example.cn", "own.example.cn", "http.example.cn", "gm.example.cn"]) expect(map[d].extra.httpsUnknown).toBeUndefined();
+    expect(r.json.data.issues).toEqual([expect.objectContaining({ service: "obs", kind: "error", code: "SCM.0403" })]);
   });
 
   it("ListBuckets 按 NextMarker 翻页；SlowDown（HTTP 503）自动重试", async () => {
