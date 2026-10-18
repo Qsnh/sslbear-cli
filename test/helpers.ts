@@ -1,6 +1,7 @@
 import { vi } from "vitest";
 import { run } from "../src/cli.js";
 import type { Fetch } from "../src/lib/http.js";
+import type { ProviderDefs } from "../src/query.js";
 
 export interface FakeRequest {
   url: URL;
@@ -48,7 +49,18 @@ export interface CliResult {
   json?: any;
 }
 
-export async function runCli(argv: string[], opts: { env?: Record<string, string>; fetch?: Fetch; now?: string; cwd?: string } = {}): Promise<CliResult> {
+export interface RunCliOptions {
+  env?: Record<string, string>;
+  fetch?: Fetch;
+  now?: string;
+  cwd?: string;
+  /** 以下透传给 Deps：假的云厂商定义、终端确认、读文件 */
+  defs?: ProviderDefs;
+  confirm?: (question: string) => Promise<boolean>;
+  readFile?: (path: string) => string;
+}
+
+export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<CliResult> {
   const out: string[] = [];
   const err: string[] = [];
   const log = vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => void out.push(a.join(" ")));
@@ -62,6 +74,9 @@ export async function runCli(argv: string[], opts: { env?: Record<string, string
       now: () => new Date(opts.now ?? "2026-10-15T00:00:00Z"),
       cwd: opts.cwd ?? "/nonexistent-sslbear-test",
       sleep: async () => {},
+      ...(opts.defs && { defs: opts.defs }),
+      ...(opts.confirm && { confirm: opts.confirm }),
+      ...(opts.readFile && { readFile: opts.readFile }),
     });
     const stdout = out.join("\n");
     let json: unknown;
