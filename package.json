@@ -8,7 +8,9 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "docs/permissions.md",
+    "docs/limitations.md"
   ],
   "engines": {
     "node": ">=18.17"
