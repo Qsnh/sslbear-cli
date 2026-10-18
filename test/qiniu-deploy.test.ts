@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { loadLocalCert, type LocalCert } from "../src/deploy/cert.js";
 import { executeDeploy, planDeploy } from "../src/deploy/run.js";
-import { CloudApiError, type Fetch, type QueryContext } from "../src/lib/http.js";
+import { CloudApiError, isRetryable, type Fetch, type QueryContext } from "../src/lib/http.js";
 import { qiniu } from "../src/providers/qiniu/index.js";
 import { qboxAuthorization, qiniuAuthorization } from "../src/providers/qiniu/sign.js";
 import type { DeployInput } from "../src/providers/registry.js";
@@ -156,8 +156,8 @@ describe("qiniu uploadCertificate", () => {
   });
 
   it("查重用的证书列表失败时不上传", async () => {
-    const fetch = fakeFetch((req) => (isUpload(req) ? { body: { certID: "x" } } : { status: 403, body: { code: 403022, error: "no permission" } }));
-    await expect(qiniu.uploadCertificate!(ctxOf(fetch), CREDS, RSA)).rejects.toMatchObject({ code: "403022" });
+    const fetch = fakeFetch((req) => (isUpload(req) ? { body: { certID: "x" } } : { status: 403, body: { code: 403001, error: "no permission" } }));
+    await expect(qiniu.uploadCertificate!(ctxOf(fetch), CREDS, RSA)).rejects.toMatchObject({ code: "403001" });
     expect(fetch.calls.some(isUpload)).toBe(false);
   });
 });
@@ -202,6 +202,94 @@ function expectSigned(call: FakeRequest) {
     }),
   );
 }
+
+/** 写接口的结果：ok 生效；timeout 服务端已生效但响应超时；其余为原样返回的错误（未生效） */
+type PutOutcome = "ok" | "timeout" | { status: number; body: unknown };
+
+const THROTTLED = { status: 403, body: { code: 403022, error: "全局 QPS 超限" } };
+
+/** 单个域名的有状态模拟：httpsconf / sslize 生效后，域名详情随之变化 */
+function domainApi(domain: string, state: { protocol: string; https?: Record<string, unknown> }, outcomes: PutOutcome[]) {
+  let n = 0;
+  let timeout = false;
+  const inner = fakeFetch((req) => {
+    const path = `/domain/${domain}`;
+    if (req.method === "GET" && req.url.pathname === path) return { body: { name: domain, operatingState: "success", ...state } };
+    if (req.method === "PUT" && (req.url.pathname === `${path}/httpsconf` || req.url.pathname === `${path}/sslize`)) {
+      const o = outcomes[n++] ?? "ok";
+      if (typeof o === "object") return o;
+      timeout = o === "timeout";
+      state.protocol = "https";
+      state.https = { ...state.https, ...req.json };
+      return { body: { code: 200 } };
+    }
+    return undefined;
+  });
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const res = await inner(input, init);
+    if (timeout) {
+      timeout = false;
+      throw Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
+    }
+    return res;
+  }) as Fetch;
+  return { fetch, calls: inner.calls, trace: () => inner.calls.map((c) => `${c.method} ${pathOf(c)}`) };
+}
+
+describe("qiniu cdn deployer：写接口只发一次，可重试的错误先重读详情再决定是否重发", () => {
+  const OLD = { certId: "cert-old", forceHttps: true, http2Enable: true };
+  const update = (api: ReturnType<typeof domainApi>) =>
+    deployer.apply(ctxOf(api.fetch), CREDS, { records: [record("www.example.com")], mode: "update" }, input());
+  const deploy = (api: ReturnType<typeof domainApi>) =>
+    deployer.apply(ctxOf(api.fetch), CREDS, { records: [record("img.example.com", { https: false, cert: undefined })], mode: "deploy" }, input());
+
+  it("update：httpsconf 超时但其实已生效，重读详情已是新证书即算成功，不重发", async () => {
+    const api = domainApi("www.example.com", { protocol: "https", https: { ...OLD } }, ["timeout"]);
+    await expect(update(api)).resolves.toEqual({ certId: "new-cert" });
+    expect(api.trace()).toEqual(["GET /domain/www.example.com", "PUT /domain/www.example.com/httpsconf", "GET /domain/www.example.com"]);
+  });
+
+  it("update：限流（403022）后重读详情仍是旧证书则重发，第二次成功", async () => {
+    const api = domainApi("www.example.com", { protocol: "https", https: { ...OLD } }, [THROTTLED, "ok"]);
+    await expect(update(api)).resolves.toEqual({ certId: "new-cert" });
+    expect(api.trace()).toEqual([
+      "GET /domain/www.example.com",
+      "PUT /domain/www.example.com/httpsconf",
+      "GET /domain/www.example.com",
+      "PUT /domain/www.example.com/httpsconf",
+    ]);
+    expect(api.calls[3]!.json).toEqual({ certId: "new-cert", forceHttps: true, http2Enable: true });
+  });
+
+  it("update：一直限流时最多发 3 次，最终错误可重试", async () => {
+    const api = domainApi("www.example.com", { protocol: "https", https: { ...OLD } }, [THROTTLED, THROTTLED, THROTTLED, "ok"]);
+    const err = await update(api).catch((e) => e);
+    expect(err).toMatchObject({ provider: "qiniu", code: "Throttling" });
+    expect(isRetryable(err)).toBe(true);
+    expect(api.calls.filter((c) => c.method === "PUT")).toHaveLength(3);
+  });
+
+  it("deploy：sslize 超时但其实已生效（重读详情为 https 且是新证书）即算成功，不重发", async () => {
+    const api = domainApi("img.example.com", { protocol: "http" }, ["timeout"]);
+    await expect(deploy(api)).resolves.toEqual({ certId: "new-cert" });
+    expect(api.trace()).toEqual(["PUT /domain/img.example.com/sslize", "GET /domain/img.example.com"]);
+  });
+
+  it("deploy：sslize 超时、重读详情仍未开启 HTTPS 时重发", async () => {
+    const api = domainApi("img.example.com", { protocol: "http", https: { certId: "new-cert" } }, [{ status: 429, body: "Too Many Requests" }, "ok"]);
+    await expect(deploy(api)).resolves.toEqual({ certId: "new-cert" });
+    expect(api.trace()).toEqual(["PUT /domain/img.example.com/sslize", "GET /domain/img.example.com", "PUT /domain/img.example.com/sslize"]);
+  });
+
+  it("deploy：重发前读到 HTTPS 已用别的证书开启（与查询时不同）时不再写入，抛 HttpsAlreadyEnabled", async () => {
+    const api = domainApi("img.example.com", { protocol: "https", https: { certId: "cert-other" } }, [{ status: 429, body: "Too Many Requests" }]);
+    const err = await deploy(api).catch((e) => e);
+    expect(err).toBeInstanceOf(CloudApiError);
+    expect(err).toMatchObject({ provider: "qiniu", code: "HttpsAlreadyEnabled" });
+    expect(isRetryable(err)).toBe(false);
+    expect(api.calls.filter((c) => c.method === "PUT")).toHaveLength(1);
+  });
+});
 
 describe("qiniu cdn deployer", () => {
   it("update：先读域名详情，PUT httpsconf 只换 certId，强制跳转 / HTTP/2 / TLS 版本原样带回", async () => {
@@ -385,5 +473,15 @@ describe("qiniu deploy（planDeploy + executeDeploy）", () => {
     expect(report.results).toEqual([expect.objectContaining({ domain: "www.example.com", action: "failed", code: "400030", retryable: false })]);
     expect(report.results[0]!.message).toMatch(/^正在处理中/);
     expect(JSON.stringify(report)).not.toContain(RSA.keyPem.split("\n")[1]);
+  });
+
+  it("全局 QPS 超限（403022）重试后仍失败：记为 failed，retryable 为 true", async () => {
+    const base = route(CERTS);
+    const fetch = fakeFetch((req) => (req.method === "PUT" ? THROTTLED : base(req)));
+    const ctx = ctxOf(fetch);
+    const report = await executeDeploy(ctx, RSA, await planDeploy(ctx, RSA, { providers: ["qiniu"], domains: ["www.example.com"], force: false, dryRun: false }));
+    expect(report.results).toEqual([expect.objectContaining({ domain: "www.example.com", action: "failed", code: "Throttling", retryable: true })]);
+    expect(report.results[0]!.message).toContain("403022");
+    expect(fetch.calls.filter((c) => c.method === "PUT")).toHaveLength(3);
   });
 });

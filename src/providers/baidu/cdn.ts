@@ -95,9 +95,17 @@ function getHttpsConfig(ctx: QueryContext, creds: AccessKeyCredentials, domain: 
 
 /**
  * HTTPS 列表里同一域名有多张服务端证书时（国际证书 + 国密证书）：HTTPS 配置里绑定的是国际证书（每个域名只能绑一张 RSA / ECC），
- * 其余标为国密（SM2），部署决策只按国际证书判断。查不到配置时记 issue，该域名不标算法，部署时按 unsupported 跳过。
+ * 其余标为国密（SM2），部署决策只按国际证书判断。查不到配置时记 issue，该域名不标算法、记入 unknown（不知道绑的是哪张国际证书），
+ * 部署时也按 unsupported 跳过。
  */
-async function markSm2(ctx: QueryContext, creds: AccessKeyCredentials, warn: Warn, domains: UserDomain[], byDomain: Map<string, CertInfo[]>): Promise<void> {
+async function markSm2(
+  ctx: QueryContext,
+  creds: AccessKeyCredentials,
+  warn: Warn,
+  domains: UserDomain[],
+  byDomain: Map<string, CertInfo[]>,
+  unknown: Set<string>,
+): Promise<void> {
   const multi = domains.filter((d) => (byDomain.get(d.domain)?.length ?? 0) > 1);
   await mapLimit(multi, 5, async (d) => {
     try {
@@ -110,15 +118,22 @@ async function markSm2(ctx: QueryContext, creds: AccessKeyCredentials, warn: War
       );
     } catch (e) {
       warn(e, `domain ${d.domain} HTTPS 配置（用于区分国密证书）`);
+      unknown.add(d.domain);
     }
   });
 }
 
 /**
  * 批量接口失败时的退路：逐域名查 HTTPS 配置（并发 5），enabled 且有证书 ID 才算 HTTPS，
- * 证书详情之后统一从证书管理按 ID 补全。单个域名失败只记 issue，该域名按未开启 HTTPS 输出。
+ * 证书详情之后统一从证书管理按 ID 补全。单个域名失败只记 issue，该域名按未开启 HTTPS 输出并记入 unknown（HTTPS 状态未知）。
  */
-async function httpsPerDomain(ctx: QueryContext, creds: AccessKeyCredentials, warn: Warn, domains: UserDomain[]): Promise<Map<string, CertInfo[]>> {
+async function httpsPerDomain(
+  ctx: QueryContext,
+  creds: AccessKeyCredentials,
+  warn: Warn,
+  domains: UserDomain[],
+  unknown: Set<string>,
+): Promise<Map<string, CertInfo[]>> {
   const byDomain = new Map<string, CertInfo[]>();
   await mapLimit(domains, 5, async (d) => {
     try {
@@ -126,6 +141,7 @@ async function httpsPerDomain(ctx: QueryContext, creds: AccessKeyCredentials, wa
       if (https?.enabled && https.certId) byDomain.set(d.domain, [{ id: https.certId }]);
     } catch (e) {
       warn(e, `domain ${d.domain} HTTPS 配置`);
+      unknown.add(d.domain);
     }
   });
   return byDomain;
@@ -146,14 +162,27 @@ function writable(cfg: HttpsConfig): HttpsConfig {
  * 设置 HTTPS（PUT /v2/domain/{domain}/config?https）是全量配置接口：先读出当前配置，只换 certId
  * （部署时同时 enabled=true），跳转、HTTP/2、TLS 版本、双向认证等其余字段原样写回。
  * HSTS、OCSP、QUIC 与国密 HTTPS 是独立的配置项，不受影响。
+ * 读到的开关与查询时不同（更新时已关闭、部署时已开启）就不写入；先核对再取证书 ID，核对不过不会上传证书。
+ * 返回绑定的证书 ID。
  */
-async function bindCert(ctx: QueryContext, creds: AccessKeyCredentials, domain: string, certId: string, mode: DeployTarget["mode"]): Promise<void> {
+async function bindCert(
+  ctx: QueryContext,
+  creds: AccessKeyCredentials,
+  domain: string,
+  mode: DeployTarget["mode"],
+  certIdOf: () => Promise<string>,
+): Promise<string> {
   const current = (await getHttpsConfig(ctx, creds, domain)).https ?? {};
   if (mode === "update" && current.enabled !== true) {
     throw new CloudApiError("baidu", "HttpsDisabled", `域名 ${domain} 的 HTTPS 已关闭，未替换证书；如需部署并开启 HTTPS 请用 --domain 点名后重新执行`);
   }
+  if (mode === "deploy" && current.enabled === true) {
+    throw new CloudApiError("baidu", "HttpsAlreadyEnabled", "该域名的 HTTPS 已开启（与查询时不同），未做修改；请重新执行，按更新规则判断");
+  }
+  const certId = await certIdOf();
   const https: HttpsConfig = { ...writable(current), certId, ...(mode === "deploy" && { enabled: true }) };
   await callBce(ctx, creds, { host: HOST, path: configPath(domain), query: { https: "" }, method: "PUT", body: { https } });
+  return certId;
 }
 
 /**
@@ -161,6 +190,7 @@ async function bindCert(ctx: QueryContext, creds: AccessKeyCredentials, domain: 
  * 出现在 HTTPS 列表里即为已开启 HTTPS；列表只给证书 ID 没给到期时间的，从证书管理按 ID 补全。
  * 没有域名时不查 HTTPS 列表（未开通 CDN 的账号该接口固定返回响应体为空的 HTTP 500）；
  * HTTPS 列表接口失败时退回逐域名查询 HTTPS 配置。
+ * 因查询失败而判断不了 HTTPS 状态或绑定的证书的域名，在 extra 里标 httpsUnknown，部署时不按查询结果写入。
  */
 export const cdn: DomainService<AccessKeyCredentials> = {
   key: "cdn",
@@ -170,13 +200,14 @@ export const cdn: DomainService<AccessKeyCredentials> = {
     const res = await callBce<{ domains?: UserDomain[] | null }>(ctx, creds, { host: HOST, path: "/v2/user/domains", query: { status: "ALL" } });
     const domains = res.domains ?? [];
     if (domains.length === 0) return [];
+    const unknown = new Set<string>();
     let certsByDomain: Map<string, CertInfo[]>;
     try {
       certsByDomain = await httpsDomainsBatch(ctx, creds);
     } catch {
-      certsByDomain = await httpsPerDomain(ctx, creds, warn, domains);
+      certsByDomain = await httpsPerDomain(ctx, creds, warn, domains, unknown);
     }
-    await markSm2(ctx, creds, warn, domains, certsByDomain);
+    await markSm2(ctx, creds, warn, domains, certsByDomain, unknown);
     const records = domains.map((d) => {
       const certs = certsByDomain.get(d.domain);
       return compact({
@@ -187,6 +218,7 @@ export const cdn: DomainService<AccessKeyCredentials> = {
         https: !!certs,
         cert: certs && earliest(certs),
         certs: certs && certs.length > 1 ? certs : undefined,
+        extra: unknown.has(d.domain) ? { httpsUnknown: "true" } : undefined,
       });
     });
     return enrichFromCertService(ctx, creds, warn, records);
@@ -200,9 +232,9 @@ export const cdn: DomainService<AccessKeyCredentials> = {
       return undefined;
     },
     async apply(ctx, creds, target, input) {
-      const certId = await input.certId();
-      for (const r of target.records) await bindCert(ctx, creds, r.domain, certId, target.mode);
-      return { certId };
+      let certId: string | undefined;
+      for (const r of target.records) certId = await bindCert(ctx, creds, r.domain, target.mode, input.certId);
+      return compact({ certId });
     },
   },
 };

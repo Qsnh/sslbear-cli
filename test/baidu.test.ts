@@ -365,7 +365,15 @@ describe("baidu CDN：HTTPS 列表接口失败的处理", () => {
     });
     expect(byDomain["bound-off.test.example.com"]).toEqual({ provider: "baidu", service: "cdn", domain: "bound-off.test.example.com", status: "RUNNING", https: false });
     expect(byDomain["off.test.example.com"]).toEqual({ provider: "baidu", service: "cdn", domain: "off.test.example.com", status: "STOPPED", https: false });
-    expect(byDomain["broken.test.example.com"]).toEqual({ provider: "baidu", service: "cdn", domain: "broken.test.example.com", status: "RUNNING", https: false });
+    // 查询失败的域名无法判断 HTTPS 状态：https 按 false 输出，但标 httpsUnknown，部署时不能当成没开 HTTPS
+    expect(byDomain["broken.test.example.com"]).toEqual({
+      provider: "baidu",
+      service: "cdn",
+      domain: "broken.test.example.com",
+      status: "RUNNING",
+      https: false,
+      extra: { httpsUnknown: "true" },
+    });
     // 批量接口失败已由逐域名查询兜底，不单独报；只有查不到的那个域名记 issue
     expect(r.json.data.issues).toEqual([
       expect.objectContaining({ provider: "baidu", service: "cdn", kind: "error", code: "InternalError", target: "domain broken.test.example.com HTTPS 配置" }),

@@ -7,7 +7,7 @@ export const API_HOST = "api.qiniu.com";
 /** 证书管理、用量统计等接口，官方要求 QBox 鉴权 */
 export const FUSION_HOST = "fusion.qiniuapi.com";
 
-// 单用户 QPS 上限：api 10、fusion 5-10，超限报 403024。逐域名并发查详情时按最小间隔发出请求
+// 单用户 QPS 上限：api 10、fusion 5-10，超限报 403024（全局 QPS 超限为 403022）。逐域名并发查详情时按最小间隔发出请求
 const MIN_INTERVAL_MS = 125;
 const nextSlot = new WeakMap<QueryContext, number>();
 
@@ -34,13 +34,19 @@ interface QiniuError {
 const isSuccessCode = (code: unknown) => typeof code !== "number" || code === 0 || code === 200;
 
 /**
- * 把七牛的错误响应转成 CloudApiError。限流（HTTP 429 / 573、业务码 403024）统一记为 Throttling、
- * 503 记为 ServiceUnavailable，让 withRetry 识别重试；原始错误码保留在 message 里。
+ * 业务码里的限流：403024 单用户 QPS 超限、403022 全局 QPS 超限（官方错误码表：降低频率 / 稍后重试）。
+ * 注意 403001 才是「无操作权限」，不重试。
+ */
+const THROTTLE_CODES = new Set(["403022", "403024"]);
+
+/**
+ * 把七牛的错误响应转成 CloudApiError。限流（HTTP 429 / 573、业务码 403022 / 403024）统一记为 Throttling、
+ * 503 记为 ServiceUnavailable，让 withRetry / isRetryable 识别重试；原始错误码保留在 message 里。
  */
 function toError(status: number, body: QiniuError | undefined, text: string): CloudApiError {
   const raw = body?.error_code ?? (typeof body?.code === "number" ? String(body.code) : undefined);
   const message = body?.error || text.slice(0, 200) || `HTTP ${status}`;
-  const throttled = status === 429 || status === 573 || raw === "403024";
+  const throttled = status === 429 || status === 573 || THROTTLE_CODES.has(raw ?? "");
   if (throttled || (status === 503 && !raw)) {
     const code = throttled ? "Throttling" : "ServiceUnavailable";
     return new CloudApiError("qiniu", code, `${message}（${raw ?? `HTTP ${status}`}）`, undefined, status);
@@ -52,7 +58,7 @@ export interface QiniuRequest {
   method?: "GET" | "POST" | "PUT";
   /** 按 JSON 发送的请求体（私钥、证书等只放在请求体里，不上 URL） */
   body?: unknown;
-  /** 默认对限流、超时等自动重试；非幂等的写接口（上传证书）传 false，由调用方查重后自行重试 */
+  /** 默认对限流、超时等自动重试；非幂等或重发可能报错的写接口（上传证书、改 HTTPS 配置）传 false，由调用方核对后自行重试 */
   retry?: boolean;
 }
 

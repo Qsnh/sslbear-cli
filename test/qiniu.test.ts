@@ -185,11 +185,12 @@ describe("qiniu certs", () => {
     expect(JSON.parse(r.stderr)).toMatchObject({ ok: false, status: "BadToken", message: expect.stringContaining("bad token") });
   });
 
-  it("业务错误：{code, error}，错误码取 code", async () => {
-    const fetch = fakeFetch(() => ({ status: 403, body: { code: 403022, error: "permission denied" } }));
+  it("业务错误：{code, error}，错误码取 code（403001 无操作权限，不重试）", async () => {
+    const fetch = fakeFetch(() => ({ status: 403, body: { code: 403001, error: "permission denied" } }));
     const r = await runCli(["certs", "--json"], { env: QINIU_ENV, fetch });
     expect(r.code).toBe(1);
-    expect(JSON.parse(r.stderr)).toMatchObject({ ok: false, status: "403022" });
+    expect(JSON.parse(r.stderr)).toMatchObject({ ok: false, status: "403001" });
+    expect(fetch.calls).toHaveLength(1);
   });
 
   it("成功响应的业务码：0（证书列表）、200（写接口）或缺省都算成功", async () => {
@@ -210,9 +211,10 @@ describe("qiniu certs", () => {
     expect(JSON.parse(r.stderr)).toMatchObject({ ok: false, status: "400401", message: "没有任何查询成功：qiniu/cert 400401 无此证书" });
   });
 
-  it("限流（403024 / HTTP 573 / 429）记为 Throttling 并重试", async () => {
+  it("限流（403024 单用户 QPS 超限 / 403022 全局 QPS 超限 / HTTP 573 / 429）记为 Throttling 并重试", async () => {
     for (const reply of [
       { status: 403, body: { code: 403024, error: "too many requests" } },
+      { status: 403, body: { code: 403022, error: "global qps exceeded" } },
       { status: 573, body: { error: "frequency limited" } },
       { status: 429, body: "Too Many Requests" },
     ]) {
@@ -223,10 +225,12 @@ describe("qiniu certs", () => {
       expect(r.json.data.items).toHaveLength(2);
       expect(fetch.calls).toHaveLength(3);
     }
-    const fetch = fakeFetch(() => ({ status: 403, body: { code: 403024, error: "too many requests" } }));
-    const r = await runCli(["certs", "--json"], { env: QINIU_ENV, fetch });
-    expect(fetch.calls).toHaveLength(3);
-    expect(JSON.parse(r.stderr)).toMatchObject({ status: "Throttling", message: expect.stringContaining("403024") });
+    for (const code of [403024, 403022]) {
+      const fetch = fakeFetch(() => ({ status: 403, body: { code, error: "too many requests" } }));
+      const r = await runCli(["certs", "--json"], { env: QINIU_ENV, fetch });
+      expect(fetch.calls).toHaveLength(3);
+      expect(JSON.parse(r.stderr)).toMatchObject({ status: "Throttling", message: expect.stringContaining(String(code)) });
+    }
   });
 
   it("纯文本错误响应（路径不存在）", async () => {
@@ -286,14 +290,14 @@ describe("qiniu domains", () => {
     // 证书列表里找不到的证书只保留 ID
     expect(byDomain["other.example.com"]).toMatchObject({ https: true, cert: { id: "cert-gone" } });
     expect(byDomain["other.example.com"].daysLeft).toBeUndefined();
-    // 单个域名详情失败：记 issue，域名按列表信息返回
+    // 单个域名详情失败：记 issue，域名按列表信息返回；拿不到证书 ID，标 httpsUnknown（部署时不能按查询结果处理）
     expect(byDomain["broken.example.com"]).toEqual({
       provider: "qiniu",
       service: "cdn",
       domain: "broken.example.com",
       status: "success",
       https: true,
-      extra: { type: "normal" },
+      extra: { type: "normal", httpsUnknown: "true" },
     });
     expect(r.json.data.issues).toEqual([
       expect.objectContaining({ provider: "qiniu", service: "cdn", kind: "error", target: "domain broken.example.com", code: "404001", message: "无此域名" }),
@@ -311,16 +315,29 @@ describe("qiniu domains", () => {
     expect(fetch.calls.some((c) => c.url.pathname === "/sslcert")).toBe(false);
   });
 
+  it("列表没给 protocol 且详情查询失败时 https 按 false 输出，但标 httpsUnknown", async () => {
+    const fetch = fakeFetch((req) => {
+      if (req.url.pathname === "/domain") return { body: { domains: [{ name: "a.example.com", type: "normal", operatingState: "success" }], marker: "" } };
+      if (req.url.pathname === "/domain/a.example.com") return { status: 500, body: { code: 500000, error: "internal error" } };
+      return undefined;
+    });
+    const r = await runCli(["domains", "-p", "qiniu", "--json"], { env: QINIU_ENV, fetch });
+    expect(r.json.data.items).toEqual([
+      { provider: "qiniu", service: "cdn", domain: "a.example.com", status: "success", https: false, extra: { type: "normal", httpsUnknown: "true" } },
+    ]);
+    expect(r.json.data.issues).toEqual([expect.objectContaining({ target: "domain a.example.com", code: "500000" })]);
+  });
+
   it("证书列表失败只记 issue，域名照常返回", async () => {
     const fetch = fakeFetch((req) => {
-      if (req.url.host === "fusion.qiniuapi.com") return { status: 403, body: { code: 403022, error: "no permission" } };
+      if (req.url.host === "fusion.qiniuapi.com") return { status: 403, body: { code: 403001, error: "no permission" } };
       return cdnRoute(req);
     });
     const r = await runCli(["domains", "-p", "qiniu", "--json"], { env: QINIU_ENV, fetch });
     expect(r.code).toBe(0);
     expect(r.json.data.items.find((d: any) => d.domain === "www.example.com")).toMatchObject({ https: true, cert: { id: "cert-www" } });
     expect(r.json.data.issues).toContainEqual(
-      expect.objectContaining({ kind: "error", target: "SSL 证书列表（用于补全到期时间）", code: "403022" }),
+      expect.objectContaining({ kind: "error", target: "SSL 证书列表（用于补全到期时间）", code: "403001" }),
     );
   });
 
