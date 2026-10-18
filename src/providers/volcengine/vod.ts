@@ -7,7 +7,7 @@ import type { CertInfo, DomainRecord } from "../../types.js";
 import type { DomainService, Warn } from "../registry.js";
 import { completeCerts, fillDualAlgorithms } from "./certs.js";
 import { callVolc } from "./client.js";
-import { AMBIGUOUS_DUAL, ambiguousDual, certsToKeep, earliest, pemAlgorithm } from "./common.js";
+import { AMBIGUOUS_DUAL, HTTPS_UNKNOWN, ambiguousCerts, ambiguousDual, certsToKeep, earliest, httpsAlreadyEnabled, pemAlgorithm } from "./common.js";
 
 /** 点播按地域部署，空间与域名要到空间所在地域的 endpoint 查；柔佛仅对企业用户开放 */
 const REGIONS: Record<string, string> = {
@@ -156,8 +156,9 @@ export const vod: DomainService<AccessKeyCredentials> = {
       }
     });
     const domains = perSpace.flat();
-    // 只有开了 HTTPS（或不在 CDN 列表里、开关未知）的域名才需要读配置
-    const configs = await mapLimit(domains, 5, async (d) => {
+    // 只有开了 HTTPS（或不在 CDN 列表里、开关未知）的域名才需要读配置；读失败的域名开关与证书都不明，打 httpsUnknown 标记
+    const configFailed = new Set<number>();
+    const configs = await mapLimit(domains, 5, async (d, i) => {
       if (d.cdn && d.cdn.HTTPS !== true) return undefined;
       if (!d.type) return undefined;
       try {
@@ -168,6 +169,7 @@ export const vod: DomainService<AccessKeyCredentials> = {
         });
       } catch (e) {
         warn(e, `域名 ${d.domain}`);
+        configFailed.add(i);
         return undefined;
       }
     });
@@ -187,14 +189,20 @@ export const vod: DomainService<AccessKeyCredentials> = {
     });
     const filled = await completeCerts(ctx, creds, warn, candidates.flatMap((c) => c.certs));
     let next = 0;
+    // 证书中心查询失败导致双证书的算法不明时，不知道该替换哪一张，同样打 httpsUnknown 标记
+    let algorithmsFailed = false;
     const grouped = await fillDualAlgorithms(
       ctx,
       creds,
-      warn,
+      (e, target) => {
+        algorithmsFailed = true;
+        warn(e, target);
+      },
       candidates.map((c) => filled.slice(next, (next += c.certs.length))),
     );
     return domains.map((d, i) => {
       const certs = grouped[i]!;
+      const unknown = configFailed.has(i) || (algorithmsFailed && ambiguousCerts(certs));
       return compact({
         provider: "volcengine" as const,
         service: "vod",
@@ -203,7 +211,7 @@ export const vod: DomainService<AccessKeyCredentials> = {
         https: candidates[i]!.on,
         cert: earliest(certs),
         certs: certs.length > 1 ? certs : undefined,
-        extra: compact({ space: d.space.SpaceName, region: d.space.Region, type: d.type, serviceRegion: d.cdn?.ServiceRegion }),
+        extra: compact({ space: d.space.SpaceName, region: d.space.Region, type: d.type, serviceRegion: d.cdn?.ServiceRegion, ...(unknown && HTTPS_UNKNOWN) }),
       });
     });
   },
@@ -216,6 +224,7 @@ export const vod: DomainService<AccessKeyCredentials> = {
     /**
      * UpdateVodDomainConfig 按模块整块覆盖：先用 DescribeVodDomainConfig 读出 HTTPS 模块，只换证书（部署时同时打开开关）再写回，
      * HTTP/2、TLS 版本、强制跳转、HSTS、OCSP 等原样带回。双证书时用 CertInfoList 保留另一张。
+     * 部署时读到的 HTTPS 开关其实已打开则不写入。
      */
     async apply(ctx, creds, target, input) {
       const [record] = target.records;
@@ -225,6 +234,7 @@ export const vod: DomainService<AccessKeyCredentials> = {
       const keep = target.mode === "update" ? certsToKeep(record!, input.cert.algorithm) : [];
       if (keep.length > 1) throw new CloudApiError("volcengine", "TooManyCerts", `域名上有 ${keep.length + 1} 张证书，最多支持双证书，未做修改`);
       const cfg = await call<DomainConfig>("DescribeVodDomainConfig", { SpaceName: space, DomainType: type, DescribeCdnDomainParam: { Domain: record!.domain } });
+      if (target.mode === "deploy" && cfg.DomainInfo?.DomainConfig?.HTTPS?.Switch === true) throw httpsAlreadyEnabled();
       const certId = await input.certId();
       const ids = [certId, ...keep.map((c) => c.id!)];
       const { CertInfo: _single, CertInfoList: _dual, ...rest } = writable(cfg.DomainInfo?.DomainConfig?.HTTPS ?? {}) as VodHttps;

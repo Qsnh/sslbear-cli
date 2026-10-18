@@ -7,7 +7,7 @@ import type { CertInfo, DomainRecord } from "../../types.js";
 import type { DomainService, Warn } from "../registry.js";
 import { fillDualAlgorithms } from "./certs.js";
 import { callVolc } from "./client.js";
-import { AMBIGUOUS_DUAL, ambiguousDual, certsToKeep, earliest, splitList } from "./common.js";
+import { AMBIGUOUS_DUAL, HTTPS_UNKNOWN, ambiguousCerts, ambiguousDual, certsToKeep, earliest, splitList } from "./common.js";
 
 interface CdnDomain {
   Domain: string;
@@ -88,10 +88,21 @@ export const cdn: DomainService<AccessKeyCredentials> = {
       }
     }
     const httpsDomains = domains.filter((d) => d.HTTPS === true);
-    const filled = await fillDualAlgorithms(ctx, creds, warn, httpsDomains.map((d) => certsByDomain.get(d.Domain) ?? []));
+    // 证书中心查询失败导致双证书的算法不明时，不知道该替换哪一张，打 httpsUnknown 标记（算法本就查不到的仍按 unsupported 处理）
+    let algorithmsFailed = false;
+    const filled = await fillDualAlgorithms(
+      ctx,
+      creds,
+      (e, target) => {
+        algorithmsFailed = true;
+        warn(e, target);
+      },
+      httpsDomains.map((d) => certsByDomain.get(d.Domain) ?? []),
+    );
     const certsOf = new Map(httpsDomains.map((d, i) => [d.Domain, filled[i]!]));
     return domains.map((d) => {
       const certs = certsOf.get(d.Domain) ?? [];
+      const unknown = algorithmsFailed && ambiguousCerts(certs);
       return compact({
         provider: "volcengine" as const,
         service: "cdn",
@@ -100,7 +111,7 @@ export const cdn: DomainService<AccessKeyCredentials> = {
         https: d.HTTPS === true,
         cert: earliest(certs),
         certs: certs.length > 1 ? certs : undefined,
-        extra: compact({ serviceType: d.ServiceType, serviceRegion: d.ServiceRegion, project: d.Project }),
+        extra: compact({ serviceType: d.ServiceType, serviceRegion: d.ServiceRegion, project: d.Project, ...(unknown && HTTPS_UNKNOWN) }),
       });
     });
   },

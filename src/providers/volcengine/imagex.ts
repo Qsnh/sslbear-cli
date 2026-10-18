@@ -7,6 +7,7 @@ import type { CertInfo, DomainRecord } from "../../types.js";
 import type { DomainService, Warn } from "../registry.js";
 import { enrichFromCertCenter } from "./certs.js";
 import { callVolc } from "./client.js";
+import { HTTPS_UNKNOWN, httpsAlreadyEnabled } from "./common.js";
 
 /** 每个地域有自己的 OpenAPI 域名，不支持跨地域调用；服务、域名都要到列出它的地域查 */
 const REGIONS: Record<string, string> = {
@@ -117,11 +118,14 @@ export const imagex: DomainService<AccessKeyCredentials> = {
     });
     const domains = perService.flat();
 
-    const configs = await mapLimit(domains, 5, async ({ d, service, region }) => {
+    // 读配置失败的域名开关与证书都不明，打 httpsUnknown 标记
+    const configFailed = new Set<number>();
+    const configs = await mapLimit(domains, 5, async ({ d, service, region }, i) => {
       try {
         return await call<DomainConfig>(region, "GetDomainConfig", { ServiceId: service.ServiceId, DomainName: d.domain });
       } catch (e) {
         warn(e, `域名 ${d.domain}`);
+        configFailed.add(i);
         return undefined;
       }
     });
@@ -142,8 +146,11 @@ export const imagex: DomainService<AccessKeyCredentials> = {
       const cfg = configs[i];
       const https = cfg?.https_config?.enable_https === true;
       let cert: CertInfo | undefined;
+      // 域名配置没给证书 ID、证书列表又查询失败时，不知道绑的是哪张证书
+      let unknown = configFailed.has(i);
       if (https) {
         const configured = cfg?.https_config?.cert_id || cfg?.https_config?.cert?.id;
+        if (!configured && !certsByRegion.has(region)) unknown = true;
         const c = certsByRegion.get(region)?.get(d.domain);
         // 证书列表与域名配置的证书 ID 不一致时（如刚换证书）以域名配置为准
         const listed = c && (!configured || (c.cert_id ?? c.CertID) === configured) ? c : undefined;
@@ -162,7 +169,7 @@ export const imagex: DomainService<AccessKeyCredentials> = {
         status: cfg?.status ?? d.status,
         https,
         cert,
-        extra: compact({ serviceId: service.ServiceId, serviceName: service.ServiceName, region }),
+        extra: compact({ serviceId: service.ServiceId, serviceName: service.ServiceName, region, ...(unknown && HTTPS_UNKNOWN) }),
       });
     });
     return enrichFromCertCenter(ctx, creds, warn, records);
@@ -174,6 +181,7 @@ export const imagex: DomainService<AccessKeyCredentials> = {
      * 更新：UpdateImageBatchDomainCert 只把证书中心的证书关联到域名，其他 HTTPS 配置不动。
      * 部署：UpdateHttps 是整块覆盖且 TLS 版本、OCSP 为必填，而 GetDomainConfig 只读得到 HTTPS / HTTP2 / 强制 HTTPS 三个开关，
      * 所以读得到的照原值带上，TLS 版本取默认 tlsv1.1–1.3、不开 OCSP（域名原先没开 HTTPS，这些本来就是待定的新配置）。
+     * 读到的 HTTPS 其实已开启时不写入（整块覆盖会把 TLS 版本、OCSP 等改成默认值）。
      */
     async apply(ctx, creds, target, input) {
       const [record] = target.records;
@@ -192,6 +200,7 @@ export const imagex: DomainService<AccessKeyCredentials> = {
         method: "GET",
         params: { ServiceId: serviceId, DomainName: record!.domain },
       });
+      if (cfg.https_config?.enable_https === true) throw httpsAlreadyEnabled();
       const certId = await input.certId();
       const https = cfg.https_config ?? {};
       await write(
