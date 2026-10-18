@@ -1,11 +1,15 @@
+import { X509Certificate } from "node:crypto";
+import type { LocalCert } from "../../deploy/cert.js";
+import { SAME_CERT_TOLERANCE_MS } from "../../deploy/plan.js";
 import type { AccessKeyCredentials } from "../../lib/env.js";
-import type { QueryContext } from "../../lib/http.js";
+import { CloudApiError, type QueryContext } from "../../lib/http.js";
 import { compact } from "../../lib/compact.js";
 import { memo, paginate } from "../../lib/paginate.js";
 import { toIso } from "../../lib/time.js";
-import type { CertificateRecord, DomainRecord } from "../../types.js";
+import type { CertInfo, CertificateRecord, DomainRecord } from "../../types.js";
 import type { Warn } from "../registry.js";
 import { callHuawei } from "./client.js";
+import { certName } from "./common.js";
 
 /** 云证书管理服务 CCM（原 SCM）的 SSL 证书接口是全局服务，中国站统一走北京四 */
 const SCM_HOST = "scm.cn-north-4.myhuaweicloud.com";
@@ -63,12 +67,13 @@ export function listScmCertificates(ctx: QueryContext, creds: AccessKeyCredentia
   return cached(ctx, `scm:${creds.accessKeyId}`, () => fetchAll(ctx, creds));
 }
 
-const needsExpiry = (r: DomainRecord) => !!r.cert?.id && !r.cert.notAfter;
+const needsExpiry = (c: CertInfo | undefined) => !!c?.id && !c.notAfter;
 /** 绑定的是 CCM 证书（ID 形如 scs1765868588104；OBS 自有证书自动生成的是 32 位十六进制 ID）但缺通用名，如 OBS 自定义域名 */
-const needsNames = (r: DomainRecord) => !!r.cert?.id && /^scs\d+$/.test(r.cert.id) && !r.cert.commonName;
+const needsNames = (c: CertInfo | undefined) => !!c?.id && /^scs\d+$/.test(c.id) && !c.commonName;
+const certsOf = (r: DomainRecord) => [r.cert, ...(r.certs ?? [])];
 
 /**
- * 域名接口只给了证书 ID、缺到期时间（或缺 CN / SAN）时，用 SSL 证书列表按 ID 补全；已有的到期时间不覆盖。
+ * 域名接口只给了证书 ID、缺到期时间（或缺 CN / SAN）时，用 SSL 证书列表按 ID 补全（cert 与 certs 里的每一张）；已有的字段不覆盖。
  * 补全失败（如没有 SCM 只读权限）时，有域名缺到期时间才记一条 issue，域名本身照常返回。
  */
 export async function enrichFromScm(
@@ -77,28 +82,75 @@ export async function enrichFromScm(
   warn: Warn,
   records: DomainRecord[],
 ): Promise<DomainRecord[]> {
-  const pending = records.filter((r) => needsExpiry(r) || needsNames(r));
+  const pending = records.filter((r) => certsOf(r).some((c) => needsExpiry(c) || needsNames(c)));
   if (pending.length === 0) return records;
   let certs: CertificateRecord[];
   try {
     certs = await listScmCertificates(ctx, creds);
   } catch (e) {
-    if (pending.some(needsExpiry)) warn(e, "SSL 证书列表（用于补全到期时间）");
+    if (pending.some((r) => certsOf(r).some(needsExpiry))) warn(e, "SSL 证书列表（用于补全到期时间）");
     return records;
   }
   const byId = new Map(certs.map((c) => [c.id, c]));
-  for (const r of pending) {
-    const c = byId.get(r.cert!.id!);
-    if (!c) continue;
-    r.cert = compact({
-      ...r.cert,
-      name: r.cert!.name ?? c.name,
-      commonName: r.cert!.commonName ?? c.commonName,
-      sans: r.cert!.sans ?? c.sans,
-      issuer: r.cert!.issuer ?? c.issuer,
-      notAfter: r.cert!.notAfter ?? c.notAfter,
-      status: r.cert!.status ?? c.status,
+  const fill = (cert: CertInfo): CertInfo => {
+    const c = cert.id ? byId.get(cert.id) : undefined;
+    if (!c) return cert;
+    return compact({
+      ...cert,
+      name: cert.name ?? c.name,
+      commonName: cert.commonName ?? c.commonName,
+      sans: cert.sans ?? c.sans,
+      issuer: cert.issuer ?? c.issuer,
+      notAfter: cert.notAfter ?? c.notAfter,
+      status: cert.status ?? c.status,
     });
+  };
+  for (const r of pending) {
+    if (r.cert) r.cert = fill(r.cert);
+    if (r.certs) r.certs = r.certs.map(fill);
   }
   return records;
+}
+
+const PEM_CERT = /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g;
+
+const nameSet = (names: (string | undefined)[]) => [...new Set(names.filter((n): n is string => !!n).map((n) => n.toLowerCase()))].sort().join(",");
+
+/** 列表不给指纹 / 序列号，先按 CN + 全部域名 + 到期时间（容差同决策表）筛出候选 */
+function isCandidate(c: CertificateRecord, cert: LocalCert): boolean {
+  if (cert.commonName && c.commonName?.toLowerCase() !== cert.commonName.toLowerCase()) return false;
+  if (nameSet(c.sans ?? [c.commonName]) !== nameSet([cert.commonName, ...cert.sans])) return false;
+  const at = Date.parse(c.notAfter ?? "");
+  return Number.isFinite(at) && Math.abs(at - Date.parse(cert.notAfter)) <= SAME_CERT_TOLERANCE_MS;
+}
+
+/**
+ * 上传到云证书管理服务（ImportCertificate）。先查重：列表里 CN、域名、到期时间都相同的候选，
+ * 再用证书详情（ShowCertificate）的 SHA-1 指纹确认是同一张；详情不给指纹时按候选条件复用。
+ * certificate 字段上限 4096 字符，叶子 + 中间证书容易超出，所以证书链单独放 certificate_chain（上限 8192）。
+ */
+export async function uploadScmCertificate(ctx: QueryContext, creds: AccessKeyCredentials, cert: LocalCert): Promise<{ id: string; reused: boolean }> {
+  const [leaf, ...chain] = cert.certPem.match(PEM_CERT) ?? [];
+  const sha1 = new X509Certificate(leaf!).fingerprint.replace(/:/g, "").toLowerCase();
+  const listed = await listScmCertificates(ctx, creds);
+  for (const c of listed.filter((x) => isCandidate(x, cert))) {
+    const detail = await callHuawei<{ fingerprint?: string | null }>(ctx, creds, { host: SCM_HOST, path: `/v3/scm/certificates/${c.id}` });
+    const fingerprint = detail.fingerprint?.replace(/:/g, "").toLowerCase();
+    if (!fingerprint || fingerprint === sha1) return { id: c.id, reused: true };
+  }
+  const res = await callHuawei<{ certificate_id?: string }>(ctx, creds, {
+    host: SCM_HOST,
+    path: "/v3/scm/certificates/import",
+    method: "POST",
+    body: {
+      name: certName(cert),
+      certificate: `${leaf}\n`,
+      ...(chain.length > 0 && { certificate_chain: `${chain.join("\n")}\n` }),
+      private_key: cert.keyPem,
+      // 已自行查重；交给服务端查重的话，重复时的报错码文档没写
+      duplicate_check: false,
+    },
+  });
+  if (!res.certificate_id) throw new CloudApiError("huawei", "InvalidResponse", "导入证书成功但未返回证书 ID");
+  return { id: res.certificate_id, reused: false };
 }

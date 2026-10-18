@@ -232,7 +232,21 @@ describe("huawei cdn", () => {
         issuer: "SSLBear Test CA",
         notBefore: "2026-08-01T00:00:00.000Z",
         notAfter: "2026-10-30T12:00:00.000Z",
+        algorithm: "ECC",
       },
+      // 多张证书时列出全部：算法已知的国际证书在前（取不到 PEM 的那张算法未知）
+      certs: [
+        {
+          name: "static-rsa",
+          commonName: "static.example.cn",
+          sans: ["static.example.cn", "*.example.cn"],
+          issuer: "SSLBear Test CA",
+          notBefore: "2026-08-01T00:00:00.000Z",
+          notAfter: "2026-10-30T12:00:00.000Z",
+          algorithm: "ECC",
+        },
+        { name: "static-sm2", notAfter: "2027-01-01T00:00:00.000Z" },
+      ],
       extra: { businessType: "web", serviceArea: "mainland_china", certSource: "user" },
       daysLeft: 15,
     });
@@ -245,11 +259,15 @@ describe("huawei cdn", () => {
       https: false,
       extra: { businessType: "download", serviceArea: "global" },
     });
-    // certificates 数组里的国密证书先到期
+    // certificates 数组里的国密证书先到期；certificates 的证书类型标出国密证书
     expect(items["dual.example.cn"]).toMatchObject({
       https: true,
-      cert: { name: "dual-sm2", notAfter: "2026-10-25T00:00:00.000Z" },
-      extra: { certSource: "scm" },
+      cert: { name: "dual-sm2", notAfter: "2026-10-25T00:00:00.000Z", algorithm: "SM2" },
+      certs: [
+        { name: "dual-rsa", notAfter: "2026-10-30T12:00:00.000Z", algorithm: "ECC" },
+        { name: "dual-sm2", algorithm: "SM2" },
+      ],
+      extra: { certSource: "scm", smCertSource: "scm" },
       daysLeft: 10,
     });
     // PEM 解析失败时退回接口给的毫秒时间戳
@@ -402,8 +420,21 @@ describe("huawei live", () => {
         issuer: "SSLBear Test CA",
         notBefore: "2026-08-01T00:00:00.000Z",
         notAfter: "2026-10-30T12:00:00.000Z",
+        algorithm: "ECC",
       },
-      extra: { region: "cn-north-4", type: "pull", serviceArea: "mainland_china", certSource: "user" },
+      // 国际 + 国密双证书时列出全部，国际证书在前
+      certs: [
+        {
+          commonName: "static.example.cn",
+          sans: ["static.example.cn", "*.example.cn"],
+          issuer: "SSLBear Test CA",
+          notBefore: "2026-08-01T00:00:00.000Z",
+          notAfter: "2026-10-30T12:00:00.000Z",
+          algorithm: "ECC",
+        },
+        { id: "scs-gm", name: "gm", notBefore: "2026-03-01T00:00:00.000Z", notAfter: "2027-03-01T00:00:00.000Z", algorithm: "SM2" },
+      ],
+      extra: { region: "cn-north-4", projectId: "p-bj4", type: "pull", serviceArea: "mainland_china", certSource: "user", smCertSource: "scm" },
       daysLeft: 15,
     });
     expect(map["push.example.cn"]).toEqual({
@@ -412,7 +443,7 @@ describe("huawei live", () => {
       domain: "push.example.cn",
       status: "on",
       https: false,
-      extra: { region: "cn-north-4", type: "push" },
+      extra: { region: "cn-north-4", projectId: "p-bj4", type: "push" },
     });
     expect(map["play2.example.cn"]).toMatchObject({
       status: "off",
@@ -498,7 +529,7 @@ describe("huawei live", () => {
       status: "on",
       https: true,
       cert: { id: "scs-a", name: "a", notBefore: "2026-10-01T00:00:00.000Z", notAfter: "2026-12-31T00:00:00.000Z" },
-      extra: { region: "cn-north-4", type: "pull", certSource: "scm" },
+      extra: { region: "cn-north-4", projectId: "p-bj4", type: "pull", certSource: "scm" },
       daysLeft: 77,
     });
     expect(r.json.data.issues).toEqual([
@@ -561,7 +592,11 @@ describe("huawei obs", () => {
       service: "obs",
       domain: "cdn.example.cn",
       https: true,
-      cert: { id: "scs0000000000012", name: "sm2", notAfter: "2026-11-13T10:22:05.912Z" },
+      cert: { id: "scs0000000000012", name: "sm2", notAfter: "2026-11-13T10:22:05.912Z", algorithm: "SM2" },
+      certs: [
+        { id: "scs0000000000011", name: "rsa", notAfter: "2027-03-13T10:22:05.912Z" },
+        { id: "scs0000000000012", name: "sm2", notAfter: "2026-11-13T10:22:05.912Z", algorithm: "SM2" },
+      ],
       extra: { bucket: "static-prod", region: "cn-east-3", certType: "server_sm" },
       daysLeft: 29,
     });

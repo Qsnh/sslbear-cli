@@ -5,9 +5,9 @@ import { paginate } from "../../lib/paginate.js";
 import { mapLimit } from "../../lib/pool.js";
 import { toIso } from "../../lib/time.js";
 import type { CertInfo, DomainRecord } from "../../types.js";
-import type { DomainService, Warn } from "../registry.js";
+import type { DeployInput, DeployOutcome, DeployTarget, DomainService, Warn } from "../registry.js";
 import { callHuawei, listProjects } from "./client.js";
-import { earliest, parsePem } from "./common.js";
+import { earliest, orderCerts, parsePem, SM_CERT_LOCKED, smCertLocked, withoutSource } from "./common.js";
 import { enrichFromScm } from "./scm.js";
 
 /**
@@ -52,8 +52,16 @@ interface LiveCert {
 /** ShowDomainHttpsCert：播放域名当前配置的证书内容（PEM，私钥不返回） */
 interface HttpsCertConfig {
   certificate?: string | null;
+  force_redirect?: boolean | null;
   tls_certificate?: { certificate?: string | null } | null;
-  gm_certificate?: { sign_certificate?: string | null; enc_certificate?: string | null } | null;
+  gm_certificate?: {
+    /** scm 云证书管理服务，user 自有证书 */
+    source?: string | null;
+    cert_id?: string | null;
+    cert_name?: string | null;
+    sign_certificate?: string | null;
+    enc_certificate?: string | null;
+  } | null;
 }
 
 /**
@@ -111,6 +119,41 @@ async function listRegion(ctx: QueryContext, creds: AccessKeyCredentials, region
   return { domains, certs, configs };
 }
 
+const PUSH_UNSUPPORTED = "推流域名不支持配置 HTTPS 证书（视频直播只有播放域名可以配置证书）";
+
+/**
+ * 修改播放域名的 HTTPS 证书（UpdateDomainHttpsCert）是整体覆盖：先读出当前配置（ShowDomainHttpsCert），
+ * 强制跳转原样带回；国际证书用 CCM 证书 ID 绑定；国密证书只能按 CCM 证书 ID 带回，自有上传的读不到私钥，无法保留。
+ * 直播没有单独的 HTTPS 开关，配置证书即开启，deploy 与 update 的请求相同。
+ */
+async function applyLive(ctx: QueryContext, creds: AccessKeyCredentials, target: DeployTarget, input: DeployInput): Promise<DeployOutcome> {
+  let certId: string | undefined;
+  for (const record of target.records) {
+    const region = record.extra?.region;
+    const projectId = record.extra?.projectId ?? (region ? (await listProjects(ctx, creds)).get(region) : undefined);
+    if (!region || !projectId) {
+      throw new CloudApiError("huawei", "ProjectNotFound", `未找到域名 ${record.domain} 所在地域（${region ?? "未知"}）的项目`);
+    }
+    const req = { host: `live.${region}.myhuaweicloud.com`, path: `/v1/${projectId}/guard/https-cert`, query: { domain: record.domain }, projectId };
+    const current = await callHuawei<HttpsCertConfig>(ctx, creds, req);
+    const gm = current.gm_certificate;
+    const hasGm = !!(gm?.cert_id || gm?.sign_certificate || gm?.enc_certificate);
+    if (hasGm && !(gm?.source === "scm" && gm.cert_id)) throw new CloudApiError("huawei", "SmCertNotPreservable", SM_CERT_LOCKED);
+    certId ??= await input.certId();
+    await callHuawei(ctx, creds, {
+      ...req,
+      method: "PUT",
+      body: {
+        certificate_format: "PEM",
+        ...(typeof current.force_redirect === "boolean" && { force_redirect: current.force_redirect }),
+        tls_certificate: { source: "scm", cert_id: certId },
+        ...(hasGm && { gm_certificate: compact({ source: "scm", cert_id: gm?.cert_id, cert_name: gm?.cert_name }) }),
+      },
+    });
+  }
+  return compact({ certId });
+}
+
 /**
  * 逐地域查直播域名 + 播放域名的 HTTPS 证书列表（ShowCertificateInfo 批量接口），按域名合并；
  * 配了证书的播放域名再查 ShowDomainHttpsCert 取 PEM，解析出 CN / SAN / 签发者和准确的有效期。
@@ -154,6 +197,7 @@ export const live: DomainService<AccessKeyCredentials> = {
           ...pem,
           notBefore: pem?.notBefore ?? infoTime(c.start_time),
           notAfter: pem?.notAfter ?? infoTime(c.expire_time),
+          ...(c.cert_type === 1 && { algorithm: "SM2" as const }),
           source: c.source,
         });
         certsByDomain.set(c.play_domain, [...(certsByDomain.get(c.play_domain) ?? []), cert]);
@@ -164,8 +208,8 @@ export const live: DomainService<AccessKeyCredentials> = {
         seen.add(d.domain);
         const cfg = data.configs.get(d.domain);
         if (cfg && "error" in cfg) warn(cfg.error, `domain ${d.domain} HTTPS 证书内容（到期时间改用证书列表）`);
-        const best = earliest(certsByDomain.get(d.domain) ?? []);
-        const { source, ...cert } = best ?? {};
+        const all = certsByDomain.get(d.domain) ?? [];
+        const best = earliest(all);
         records.push(
           compact({
             provider: "huawei" as const,
@@ -173,12 +217,24 @@ export const live: DomainService<AccessKeyCredentials> = {
             domain: d.domain,
             status: d.status,
             https: !!best,
-            cert: best ? cert : undefined,
-            extra: compact({ region, type: d.domain_type, serviceArea: d.service_area, certSource: source }),
+            cert: best && withoutSource(best),
+            certs: all.length > 1 ? orderCerts(all).map(withoutSource) : undefined,
+            extra: compact({
+              region,
+              projectId: projects.get(region),
+              type: d.domain_type,
+              serviceArea: d.service_area,
+              certSource: best?.source,
+              smCertSource: all.find((c) => c.algorithm === "SM2")?.source,
+            }),
           }),
         );
       }
     }
     return enrichFromScm(ctx, creds, warn, records);
+  },
+  deployer: {
+    unsupported: (record) => (record.extra?.type === "push" ? PUSH_UNSUPPORTED : smCertLocked(record)),
+    apply: applyLive,
   },
 };

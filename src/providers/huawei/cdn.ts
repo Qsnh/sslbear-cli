@@ -1,12 +1,12 @@
 import type { AccessKeyCredentials } from "../../lib/env.js";
-import type { QueryContext } from "../../lib/http.js";
+import { CloudApiError, type QueryContext } from "../../lib/http.js";
 import { compact } from "../../lib/compact.js";
 import { paginate } from "../../lib/paginate.js";
 import { toIso } from "../../lib/time.js";
 import type { CertInfo, DomainRecord } from "../../types.js";
-import type { DomainService } from "../registry.js";
+import type { DeployInput, DeployOutcome, DeployTarget, DomainService } from "../registry.js";
 import { callHuawei } from "./client.js";
-import { earliest, parsePem } from "./common.js";
+import { certName, earliest, orderCerts, parsePem, SM_CERT_LOCKED, smCertLocked, withoutSource } from "./common.js";
 
 /** CDN 是全局服务，不区分地域 */
 const HOST = "cdn.myhuaweicloud.com";
@@ -58,17 +58,85 @@ const CERT_SOURCE: Record<number, string> = { 0: "user", 1: "managed", 2: "scm" 
 
 const sourceOf = (n: number | undefined) => (n === undefined ? undefined : (CERT_SOURCE[n] ?? String(n)));
 
-function toCert(name: string | undefined, pemText: string | null | undefined, expire: number | undefined, source: number | undefined): CertInfo & { source?: string } {
+type SourcedCert = CertInfo & { source?: string };
+
+/** 国密证书按接口给的证书类型标 SM2；国际证书的 RSA / ECC 取自 PEM */
+function toCert(name: string | undefined, pemText: string | null | undefined, expire: number | undefined, source: number | undefined, sm = false): SourcedCert {
   const pem = parsePem(pemText);
-  return compact({ name, ...pem, notAfter: pem?.notAfter ?? toIso(expire), source: sourceOf(source) });
+  return compact({ name, ...pem, notAfter: pem?.notAfter ?? toIso(expire), ...(sm && { algorithm: "SM2" as const }), source: sourceOf(source) });
 }
 
 /** 一条 HTTPS 记录里的所有证书：有 certificates 数组时以它为准（双证书时国际、国密各一条），否则用外层字段 */
-function certsOf(h: HttpsDetail): (CertInfo & { source?: string })[] {
+function certsOf(h: HttpsDetail): SourcedCert[] {
   if (h.certificates?.length) {
-    return h.certificates.map((c) => toCert(c.certificate_name, c.certificate_value, c.expire_time, c.certificate_source));
+    return h.certificates.map((c) => toCert(c.certificate_name, c.certificate_value, c.expire_time, c.certificate_source, c.certificate_type === "server_sm"));
   }
   return [toCert(h.cert_name, h.certificate, h.expiration_time, h.certificate_type)];
+}
+
+/** ShowDomainFullConfig 里 configs.https 的证书部分（私钥不返回） */
+interface HttpsCertConfig {
+  certificate_type?: string;
+  /** 0 自有证书，1 华为云托管证书，2 SCM 证书 */
+  certificate_source?: number;
+  scm_certificate_id?: string;
+  certificate_name?: string;
+  certificate_value?: string | null;
+}
+
+interface HttpsConfig extends HttpsCertConfig {
+  https_status?: string;
+  certificates?: HttpsCertConfig[] | null;
+  http2_status?: string | null;
+  tls_version?: string | null;
+  ocsp_stapling_status?: string | null;
+}
+
+const configPath = (domain: string) => `/v1.1/cdn/configuration/domains/${domain}/configs`;
+
+/**
+ * 修改域名全量配置（UpdateDomainFullConfig）只发 configs.https：强制跳转、HSTS、QUIC、TLS 加密套件等是 configs 下的其它项，不发即不改；
+ * https 对象内未传的 HTTP/2 开关缺省为关闭，所以先读出（ShowDomainFullConfig）把 HTTP/2、TLS 版本、OCSP Stapling 原样带回。
+ * 证书直接传 PEM（自有证书）：用 CCM 证书需要先在控制台授权 CDN 访问 CCM（CDN.00010198）。
+ * 双证书只支持「国际 + 国密」：配了国密证书时要用 certificates 把两张一起传，国密证书只能按 CCM 证书 ID 带回，自有上传的读不到私钥，无法保留。
+ */
+async function applyCdn(ctx: QueryContext, creds: AccessKeyCredentials, target: DeployTarget, input: DeployInput): Promise<DeployOutcome> {
+  const { cert } = input;
+  for (const record of target.records) {
+    const res = await callHuawei<{ configs?: { https?: HttpsConfig | null } | null }>(ctx, creds, {
+      host: HOST,
+      path: configPath(record.domain),
+      query: { enterprise_project_id: ALL_PROJECTS },
+    });
+    const current = res.configs?.https ?? {};
+    const all = current.certificates?.length ? current.certificates : current.certificate_type ? [current] : [];
+    // 关闭 HTTPS 时证书会被一并删除，读到的残留不算
+    const sm = current.https_status !== "off" ? all.find((c) => c.certificate_type === "server_sm") : undefined;
+    if (sm && !(sm.certificate_source === 2 && sm.scm_certificate_id)) {
+      throw new CloudApiError("huawei", "SmCertNotPreservable", SM_CERT_LOCKED);
+    }
+    const intl = { certificate_type: "server", certificate_source: 0, certificate_name: certName(cert), certificate_value: cert.certPem, private_key: cert.keyPem };
+    const https = {
+      https_status: "on",
+      ...compact({ http2_status: current.http2_status, tls_version: current.tls_version, ocsp_stapling_status: current.ocsp_stapling_status }),
+      ...(sm
+        ? {
+            certificates: [
+              intl,
+              compact({ certificate_type: "server_sm", certificate_source: 2, scm_certificate_id: sm.scm_certificate_id, certificate_name: sm.certificate_name }),
+            ],
+          }
+        : intl),
+    };
+    await callHuawei(ctx, creds, {
+      host: HOST,
+      path: configPath(record.domain),
+      method: "PUT",
+      query: { enterprise_project_id: ALL_PROJECTS },
+      body: { configs: { https } },
+    });
+  }
+  return {};
 }
 
 /** 加速域名列表 + 「查询所有绑定HTTPS证书的域名信息」两次分页查询后按域名合并，避免逐个域名查配置 */
@@ -101,17 +169,27 @@ export const cdn: DomainService<AccessKeyCredentials> = {
       // 域名列表里的 HTTPS 开关为准；缺该字段时看 HTTPS 列表里是否启用
       const enabled = entries.filter((h) => h.https_status !== 0);
       const https = d.https_status === undefined ? enabled.length > 0 : d.https_status !== 0;
-      const best = https ? earliest(entries.flatMap(certsOf)) : undefined;
-      const { source, ...cert } = best ?? {};
+      const all = https ? entries.flatMap(certsOf) : [];
+      const best = earliest(all);
       return compact({
         provider: "huawei" as const,
         service: "cdn",
         domain: d.domain_name,
         status: d.domain_status,
         https,
-        cert: best ? cert : undefined,
-        extra: compact({ businessType: d.business_type, serviceArea: d.service_area, certSource: source }),
+        cert: best && withoutSource(best),
+        certs: all.length > 1 ? orderCerts(all).map(withoutSource) : undefined,
+        extra: compact({
+          businessType: d.business_type,
+          serviceArea: d.service_area,
+          certSource: best?.source,
+          smCertSource: all.find((c) => c.algorithm === "SM2")?.source,
+        }),
       });
     });
+  },
+  deployer: {
+    unsupported: smCertLocked,
+    apply: applyCdn,
   },
 };
