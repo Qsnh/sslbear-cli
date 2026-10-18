@@ -114,25 +114,52 @@ describe("volcengine 请求格式", () => {
 });
 
 describe("volcengine cdn", () => {
-  it("域名列表与已关联证书（RSA/ECC + 国密）按域名合并，双证书取先到期，未开 HTTPS 不给证书", async () => {
-    const r = await runCli(["domains", "-s", "cdn", "--json"], { env: VOLC_ENV, fetch: fakeFetch(cdnRoutes) });
+  it("域名列表与已关联证书（RSA/ECC + 国密）按域名合并，双证书取先到期并列出全部（算法从证书中心补），未开 HTTPS 不给证书", async () => {
+    // inter_cert 不区分 RSA / ECC，双证书域名的证书算法从证书中心按 ID 查
+    const certCenter = (req: FakeRequest) =>
+      req.action === "CertificateGetInstanceList"
+        ? ok({
+            TotalCount: 2,
+            Instances: [
+              { InstanceId: "cert-ecc", NotAfter: "2027-01-01 08:00:00", Status: "Issued", CertificateKeyAlgorithm: "EC 256" },
+              { InstanceId: "cert-rsa", NotAfter: "2026-12-01 08:00:00", Status: "Issued", CertificateKeyAlgorithm: "RSA 2048" },
+            ],
+          })
+        : undefined;
+    const fetch = fakeFetch((req) => cdnRoutes(req) ?? certCenter(req));
+    const r = await runCli(["domains", "-s", "cdn", "--json"], { env: VOLC_ENV, fetch });
     expect(r.code).toBe(0);
     expect(r.json.data.issues).toEqual([]);
+    expect(fetch.calls.filter((c) => c.action === "CertificateGetInstanceList")).toHaveLength(1);
     const byDomain = Object.fromEntries(r.json.data.items.map((d: any) => [d.domain, d]));
+    const rsa = {
+      id: "cert-rsa",
+      commonName: "www.example.com",
+      sans: ["www.example.com"],
+      notBefore: "2026-08-01T00:00:00.000Z",
+      notAfter: "2026-12-01T00:00:00.000Z",
+      status: "running",
+      algorithm: "RSA",
+    };
     expect(byDomain["www.example.com"]).toEqual({
       provider: "volcengine",
       service: "cdn",
       domain: "www.example.com",
       status: "online",
       https: true,
-      cert: {
-        id: "cert-rsa",
-        commonName: "www.example.com",
-        sans: ["www.example.com"],
-        notBefore: "2026-08-01T00:00:00.000Z",
-        notAfter: "2026-12-01T00:00:00.000Z",
-        status: "running",
-      },
+      cert: rsa,
+      certs: [
+        {
+          id: "cert-ecc",
+          commonName: "www.example.com",
+          sans: ["www.example.com", "example.com"],
+          notBefore: "2026-08-01T00:00:00.000Z",
+          notAfter: "2027-01-01T00:00:00.000Z",
+          status: "running",
+          algorithm: "ECC",
+        },
+        rsa,
+      ],
       extra: { serviceType: "web", serviceRegion: "chinese_mainland", project: "default" },
       daysLeft: 47,
     });
@@ -144,7 +171,13 @@ describe("volcengine cdn", () => {
       https: false,
       extra: { serviceType: "web" },
     });
-    expect(byDomain["*.example.org"]).toMatchObject({ https: true, cert: { id: "cert-org", status: "expired" }, daysLeft: -14 });
+    // 一张国际证书 + 一张国密证书：不用查算法
+    expect(byDomain["*.example.org"]).toMatchObject({
+      https: true,
+      cert: { id: "cert-org", status: "expired" },
+      certs: [{ id: "cert-org" }, { id: "cert-sm2", algorithm: "SM2" }],
+      daysLeft: -14,
+    });
   });
 
   it("翻页直到取完", async () => {
@@ -174,6 +207,7 @@ const CERT_CENTER = [
     NotAfter: "2026-11-01 07:59:59",
     Status: "Issued",
     InstanceType: "Paid",
+    CertificateKeyAlgorithm: "RSA 2048",
   },
   { InstanceId: "cert-pending", Tag: "待验证", CommonName: "new.example.com", Status: "Pending", InstanceType: "Free" },
 ];
@@ -207,6 +241,7 @@ describe("volcengine certs", () => {
         notAfter: "2026-10-31T23:59:59.000Z",
         status: "Issued",
         source: "Paid",
+        algorithm: "RSA",
         daysLeft: 16,
       },
     ]);
@@ -478,7 +513,7 @@ function vodRoutes(req: FakeRequest) {
 }
 
 describe("volcengine vod", () => {
-  it("列空间 → 列域名 → HTTPS 域名读配置；双证书取先到期（缺到期时间的从证书中心补）；柔佛未开通静默跳过", async () => {
+  it("列空间 → 列域名 → HTTPS 域名读配置；双证书取先到期并列出全部（缺到期时间、算法的从证书中心补）；柔佛未开通静默跳过", async () => {
     const fetch = fakeFetch((req) => vodRoutes(req) ?? certCenterRoute(req));
     const r = await runCli(["domains", "-s", "vod", "--json"], { env: VOLC_ENV, fetch });
     expect(r.code).toBe(0);
@@ -495,22 +530,26 @@ describe("volcengine vod", () => {
       expect.objectContaining({ service: "vod", kind: "error", code: "InvalidParameter.InvalidSpaceName", target: "空间 s2" }),
     ]);
     const byDomain = Object.fromEntries(r.json.data.items.map((d: any) => [d.domain, d]));
+    // 双证书：两张都列出；配置里没有证书内容时算法从证书中心按 ID 补（cert-rsa 不在证书中心，算法未知）
+    const wild = {
+      id: "cert-wild",
+      name: "未命名证书",
+      commonName: "*.example.com",
+      sans: ["*.example.com", "example.com"],
+      issuer: "RapidSSL TLS RSA CA G1",
+      notBefore: "2026-08-01T00:00:00.000Z",
+      notAfter: "2026-10-31T23:59:59.000Z",
+      status: "Issued",
+      algorithm: "RSA",
+    };
     expect(byDomain["play.example.com"]).toEqual({
       provider: "volcengine",
       service: "vod",
       domain: "play.example.com",
       status: "online",
       https: true,
-      cert: {
-        id: "cert-wild",
-        name: "未命名证书",
-        commonName: "*.example.com",
-        sans: ["*.example.com", "example.com"],
-        issuer: "RapidSSL TLS RSA CA G1",
-        notBefore: "2026-08-01T00:00:00.000Z",
-        notAfter: "2026-10-31T23:59:59.000Z",
-        status: "Issued",
-      },
+      cert: wild,
+      certs: [{ id: "cert-rsa", commonName: "play.example.com", notBefore: "2026-09-01T00:00:00.000Z", notAfter: "2026-12-01T00:00:00.000Z" }, wild],
       extra: { space: "s1", region: "cn-north-1", type: "vod_play", serviceRegion: "chinese_mainland" },
       daysLeft: 16,
     });
