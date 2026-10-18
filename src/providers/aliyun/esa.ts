@@ -1,11 +1,13 @@
+import type { LocalCert } from "../../deploy/cert.js";
 import type { AliyunCredentials } from "../../lib/env.js";
 import { CloudApiError, type QueryContext } from "../../lib/http.js";
 import { compact } from "../../lib/compact.js";
 import { paginate } from "../../lib/paginate.js";
 import { mapLimit } from "../../lib/pool.js";
 import { toIso } from "../../lib/time.js";
-import type { DomainRecord } from "../../types.js";
+import type { CertInfo, DomainRecord } from "../../types.js";
 import type { DomainService, Warn } from "../registry.js";
+import { CAS_REGION } from "./cas.js";
 import { callRpc } from "./client.js";
 import { matchHost } from "./esa-rule.js";
 
@@ -31,6 +33,10 @@ interface SiteCert {
   Issuer?: string;
   /** RSA / ECDSA 等 */
   PubAlg?: string;
+  /** 小写 hex */
+  FingerprintSha256?: string;
+  /** Type 为 cas 时是数字证书管理服务里的证书 ID */
+  CasId?: string | number;
   NotBefore?: string;
   NotAfter?: string;
   CreateTime?: string;
@@ -38,6 +44,8 @@ interface SiteCert {
 }
 
 interface CustomHostname {
+  HostnameId?: number;
+  RecordId?: number;
   Hostname: string;
   Status?: string;
   SslFlag?: string;
@@ -79,6 +87,18 @@ const CERT_PAGE = 20;
 // 各套餐都含 SaaS 域名配额；以防个别套餐不支持时报套餐类错误，这些错误等同没有 SaaS 域名
 const SAAS_UNSUPPORTED = new Set(["ErrSiteIdNoteEnterprise", "OperationDenied.UnsupportPlan", "QuotaCheckFailed.Function"]);
 
+function listSiteCerts(ctx: QueryContext, creds: AliyunCredentials, siteId: number | string): Promise<SiteCert[]> {
+  return paginate(CERT_PAGE, async (page) => {
+    const r = await callRpc<{ Result?: SiteCert[]; TotalCount?: number }>(ctx, creds, {
+      endpoint: ENDPOINT,
+      version: VERSION,
+      action: "ListCertificates",
+      params: { SiteId: siteId, PageNumber: page, PageSize: CERT_PAGE },
+    });
+    return { items: r.Result ?? [], total: r.TotalCount };
+  });
+}
+
 /** 站点证书接口的时间是不带时区的 "YYYY-MM-DD HH:mm:ss"，但按文档为 UTC，不同于其他阿里云接口的北京时间 */
 function utc(value?: string): string | undefined {
   const s = value?.trim();
@@ -101,21 +121,45 @@ const latest = (certs: Cert[], key: (c: Cert) => string | undefined) =>
 
 /**
  * 按 ESA 的证书选择优先级挑出域名当前生效的证书：有效期内的优先，同为有效时配置时间较晚的优先。
- * RSA 与 ECC 证书可能按客户端支持的算法分别下发，各取一张后报告先到期的那张，宁可早报。
+ * RSA 与 ECC 证书可能按客户端支持的算法分别下发，各取一张，按到期先后排列（第一张报告为 cert，宁可早报）。
  * 没有有效证书时取最近过期的那张以提示已过期；只有申请中 / 申请失败的证书时返回它以展示状态。
  */
-function pick(certs: Cert[], now: Date): Cert | undefined {
-  if (certs.length === 0) return undefined;
+function effective(certs: Cert[], now: Date): Cert[] {
+  if (certs.length === 0) return [];
   const t = now.toISOString();
   const issued = certs.filter((c) => c.notAfter);
   const valid = issued.filter((c) => c.notAfter! > t && (!c.notBefore || c.notBefore <= t));
   if (valid.length > 0) {
     const algs = [...new Set(valid.map((c) => c.raw.PubAlg))];
-    const effective = algs.map((alg) => latest(valid.filter((c) => c.raw.PubAlg === alg), (c) => c.configuredAt));
-    return effective.reduce((a, b) => (b.notAfter! < a.notAfter! ? b : a));
+    return algs
+      .map((alg) => latest(valid.filter((c) => c.raw.PubAlg === alg), (c) => c.configuredAt))
+      .sort((a, b) => (a.notAfter! < b.notAfter! ? -1 : a.notAfter! > b.notAfter! ? 1 : 0));
   }
-  if (issued.length > 0) return latest(issued, (c) => c.notAfter);
-  return certs[0];
+  if (issued.length > 0) return [latest(issued, (c) => c.notAfter)];
+  return [certs[0]!];
+}
+
+/** PubAlg 实测有 RSA、ECDSA */
+function algorithmOf(pubAlg?: string): CertInfo["algorithm"] {
+  const a = pubAlg?.toUpperCase();
+  if (!a) return undefined;
+  if (a.includes("SM2")) return "SM2";
+  if (a.startsWith("EC")) return "ECC";
+  return a.includes("RSA") ? "RSA" : undefined;
+}
+
+function certInfo(c: Cert): CertInfo {
+  return compact({
+    id: c.raw.Id,
+    name: c.raw.Name,
+    commonName: c.raw.CommonName,
+    sans: c.sans,
+    issuer: c.raw.Issuer,
+    notBefore: c.notBefore,
+    notAfter: c.notAfter,
+    status: c.raw.Status,
+    algorithm: algorithmOf(c.raw.PubAlg),
+  });
 }
 
 /**
@@ -139,6 +183,23 @@ function httpsSwitch(configs: HttpsConfig[], host: string): HttpsSwitch {
     return miss.state === state(rule) ? { state: miss.state } : compact({ state: "partial" as const, rule: rule.RuleName });
   };
   return resolve(0);
+}
+
+const hex = (s: string) => s.replace(/:/g, "").toLowerCase();
+
+/** 往站点添加一种算法的证书不会替换另一算法的证书：支持该算法的客户端仍可能拿到它，提示用户 */
+function keptNote(records: DomainRecord[], algorithm: LocalCert["algorithm"]): string | undefined {
+  const kept = new Map<string, CertInfo>();
+  for (const r of records) {
+    for (const c of r.certs ?? (r.cert ? [r.cert] : [])) {
+      if (c.algorithm && c.algorithm !== algorithm && c.algorithm !== "SM2") kept.set(c.id ?? c.name ?? "", c);
+    }
+  }
+  if (kept.size === 0) return undefined;
+  const list = [...kept.values()]
+    .map((c) => `${c.name ?? c.id}（${c.algorithm}${c.notAfter ? `，${c.notAfter.slice(0, 10)} 到期` : ""}）`)
+    .join("、");
+  return `已在站点添加新证书；站点上另一算法的证书 ${list} 未被替换，支持该算法的客户端仍可能拿到它`;
 }
 
 /**
@@ -168,14 +229,7 @@ export const esa: DomainService<AliyunCredentials> = {
           });
           return { items: r.Records ?? [], total: r.TotalCount };
         }),
-        paginate(CERT_PAGE, async (page) => {
-          const r = await call<{ Result?: SiteCert[]; TotalCount?: number }>("ListCertificates", {
-            ...siteParams,
-            PageNumber: page,
-            PageSize: CERT_PAGE,
-          });
-          return { items: r.Result ?? [], total: r.TotalCount };
-        }),
+        listSiteCerts(ctx, creds, site.SiteId),
         paginate(PAGE, async (page) => {
           const r = await call<{ Configs?: HttpsConfig[]; TotalCount?: number }>("ListHttpsBasicConfigurations", {
             ...siteParams,
@@ -223,25 +277,17 @@ export const esa: DomainService<AliyunCredentials> = {
         .map((r) => {
           const sw = httpsConfigs && httpsSwitch(httpsConfigs, r.RecordName);
           // HTTPS 关闭时证书不会下发，不展示；只有申请中 / 申请失败的证书时也无法提供 HTTPS，但证书状态仍保留在 cert 里
-          const c = sw?.state === "off" ? undefined : pick(certs.filter((x) => covers(x.names, r.RecordName)), ctx.now);
+          const eff = sw?.state === "off" ? [] : effective(certs.filter((x) => covers(x.names, r.RecordName)), ctx.now);
+          const c = eff[0];
           return compact({
             provider: "aliyun" as const,
             service: "esa",
             domain: r.RecordName,
             status: site.Status,
             https: !!c?.notAfter,
-            cert: c
-              ? compact({
-                  id: c.raw.Id,
-                  name: c.raw.Name,
-                  commonName: c.raw.CommonName,
-                  sans: c.sans,
-                  issuer: c.raw.Issuer,
-                  notBefore: c.notBefore,
-                  notAfter: c.notAfter,
-                  status: c.raw.Status,
-                })
-              : undefined,
+            cert: c ? certInfo(c) : undefined,
+            // RSA 与 ECC 两张同时生效时都列出，部署时只替换与新证书同算法的那张
+            certs: eff.length > 1 ? eff.map(certInfo) : undefined,
             extra: compact({ ...where, certType: c?.raw.Type, httpsSwitch: sw?.state, httpsRule: sw?.rule }),
           });
         });
@@ -254,11 +300,59 @@ export const esa: DomainService<AliyunCredentials> = {
           status: h.Status,
           https,
           cert: https ? compact({ notAfter: toIso(h.CertNotAfter), status: h.CertStatus }) : undefined,
-          extra: compact({ ...where, hostType: "saas", certType: https ? h.CertType : undefined }),
+          extra: compact({
+            ...where,
+            hostType: "saas",
+            certType: https ? h.CertType : undefined,
+            hostnameId: h.HostnameId?.toString(),
+            recordId: h.RecordId?.toString(),
+          }),
         });
       });
       return [...fromRecords, ...fromSaas];
     });
     return perSite.flat();
+  },
+  deployer: {
+    // 普通记录的证书挂在站点上，开启 HTTPS 要动站点级配置；SaaS 域名的 SSL 开关和证书在域名自身上
+    unsupported: (record, mode) =>
+      mode === "update" || record.extra?.hostType === "saas"
+        ? undefined
+        : "ESA 普通记录的证书挂在站点上，开启 HTTPS 要改站点的 SSL/TLS 规则或站点证书，影响面超出单个域名，请在 ESA 控制台操作",
+    sharedScope: (record) => (record.extra?.hostType === "saas" ? undefined : record.extra?.siteId),
+    async apply(ctx, creds, target, input) {
+      const casId = await input.certId();
+      const post = <T>(action: string, params: Record<string, string | undefined>) =>
+        callRpc<T>(ctx, creds, { endpoint: ENDPOINT, version: VERSION, action, method: "POST", params });
+      const first = target.records[0]!;
+      if (first.extra?.hostType === "saas") {
+        // 更新接口同时提交记录绑定，带回查询到的原值，只改 SSL 开关与证书
+        for (const r of target.records) {
+          const { hostnameId, recordId } = r.extra ?? {};
+          if (!hostnameId) throw new Error(`${r.domain} 缺少 SaaS 域名 ID`);
+          await post("UpdateCustomHostname", {
+            HostnameId: hostnameId,
+            RecordId: recordId,
+            SslFlag: "on",
+            CertType: "cas",
+            CasId: casId,
+            CasRegion: CAS_REGION,
+          });
+        }
+        return { certId: casId };
+      }
+      // 站点证书：新增一张（ESA 按「有效期内、配置时间较晚」优先，新证书即对它覆盖的记录生效），旧证书不删除。
+      // 站点上已有同一张证书时（如上次已添加、又被更晚配置的证书盖过）原地更新它，不重复添加
+      const siteId = first.extra?.siteId;
+      if (!siteId) throw new Error(`${first.domain} 缺少 ESA 站点 ID`);
+      const same = (await listSiteCerts(ctx, creds, siteId)).find(
+        (c) =>
+          (c.Type === "cas" || c.Type === "upload") &&
+          (c.FingerprintSha256 ? hex(c.FingerprintSha256) === input.cert.fingerprint : String(c.CasId) === casId),
+      );
+      const res = await post<{ Id?: string }>("SetCertificate", { SiteId: siteId, Type: "cas", CasId: casId, Region: CAS_REGION, Id: same?.Id });
+      const note = keptNote(target.records, input.cert.algorithm);
+      return { certId: res.Id ?? same?.Id ?? casId, ...(note && { note }) };
+    },
   },
 };

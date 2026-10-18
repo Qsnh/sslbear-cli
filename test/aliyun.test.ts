@@ -365,17 +365,23 @@ describe("aliyun esa", () => {
         notBefore: "2026-10-01T00:00:00.000Z",
         notAfter: "2027-03-01T00:00:00.000Z",
         status: "OK",
+        algorithm: "RSA",
       },
       extra: { siteId: "1001", site: "example.com", certType: "cas", httpsSwitch: "on", httpsRule: "example-on" },
       daysLeft: 137,
     });
-    // 域名大小写不敏感，泛域名证书覆盖一级子域；RSA 与 ECC 证书同时有效时报告先到期的那张
+    // 域名大小写不敏感，泛域名证书覆盖一级子域；RSA 与 ECC 证书同时有效时报告先到期的那张，certs 里列出两张并标算法
     expect(byDomain["API.example.com"]).toMatchObject({
       https: true,
-      cert: { id: "c-wild", issuer: "DigiCert", sans: ["*.example.com", "example.com"], notAfter: "2026-11-30T12:00:00.000Z" },
+      cert: { id: "c-wild", issuer: "DigiCert", sans: ["*.example.com", "example.com"], notAfter: "2026-11-30T12:00:00.000Z", algorithm: "RSA" },
+      certs: [
+        { id: "c-wild", algorithm: "RSA" },
+        { id: "c-api-ecc", algorithm: "ECC" },
+      ],
       extra: { certType: "upload" },
       daysLeft: 46,
     });
+    expect(byDomain["www.example.com"].certs).toBeUndefined();
     expect(byDomain["*.example.com"]).toMatchObject({ https: true, cert: { id: "c-wild" } });
     // 泛域名证书不覆盖多级子域
     expect(byDomain["deep.a.example.com"]).toEqual({

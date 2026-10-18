@@ -6,6 +6,7 @@ import { toIso } from "../../lib/time.js";
 import { xmlBlocks, xmlText } from "../../lib/xml.js";
 import type { DomainRecord } from "../../types.js";
 import type { DomainService, Warn } from "../registry.js";
+import { CAS_REGION } from "./cas.js";
 import { ossDate, ossV4Authorization, percentEncode } from "./sign.js";
 
 /** ListBuckets 是服务级接口，任一地域的 endpoint 都返回全部 bucket */
@@ -17,21 +18,26 @@ interface OssRequest {
   region: string;
   bucket?: string;
   query: Record<string, string>;
+  /** 默认 GET；带 XML 请求体时为 POST */
+  method?: "GET" | "POST";
+  body?: string;
 }
 
 /** OSS 签名 V1 已对新用户 / 新 bucket 停用，统一使用 V4 */
-async function ossGet(ctx: QueryContext, creds: AliyunCredentials, req: OssRequest): Promise<string> {
+async function ossRequest(ctx: QueryContext, creds: AliyunCredentials, req: OssRequest): Promise<string> {
+  const method = req.method ?? "GET";
   return withRetry(ctx, async () => {
     const headers: Record<string, string> = {
       "x-oss-date": ossDate(new Date()),
       "x-oss-content-sha256": "UNSIGNED-PAYLOAD",
     };
+    if (req.body !== undefined) headers["content-type"] = "application/xml";
     if (creds.securityToken) headers["x-oss-security-token"] = creds.securityToken;
     headers.Authorization = ossV4Authorization({
       accessKeyId: creds.accessKeyId,
       accessKeySecret: creds.accessKeySecret,
       region: req.region,
-      method: "GET",
+      method,
       ...(req.bucket && { bucket: req.bucket }),
       query: req.query,
       headers,
@@ -39,7 +45,11 @@ async function ossGet(ctx: QueryContext, creds: AliyunCredentials, req: OssReque
     const qs = Object.entries(req.query)
       .map(([k, v]) => (v ? `${percentEncode(k)}=${percentEncode(v)}` : percentEncode(k)))
       .join("&");
-    const raw = await send(ctx, "aliyun", `https://${req.host}/${qs ? `?${qs}` : ""}`, { method: "GET", headers });
+    const raw = await send(ctx, "aliyun", `https://${req.host}/${qs ? `?${qs}` : ""}`, {
+      method,
+      headers,
+      ...(req.body !== undefined && { body: req.body }),
+    });
     if (raw.status >= 400) {
       throw new CloudApiError(
         "aliyun",
@@ -63,7 +73,7 @@ async function listBuckets(ctx: QueryContext, creds: AliyunCredentials): Promise
   const buckets: Bucket[] = [];
   let marker: string | undefined;
   for (let page = 0; page < 200; page++) {
-    const xml = await ossGet(ctx, creds, {
+    const xml = await ossRequest(ctx, creds, {
       host: SERVICE_HOST,
       region: SERVICE_REGION,
       query: { "max-keys": "1000", ...(marker && { marker }) },
@@ -109,7 +119,13 @@ function parseCnames(xml: string, bucket: Bucket): DomainRecord[] {
   });
 }
 
-/** 对象存储 OSS 的自定义域名：先列 bucket，再逐个 bucket 查绑定的 CNAME 与证书（并发 5） */
+const escapeXml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+/**
+ * 对象存储 OSS 的自定义域名：先列 bucket，再逐个 bucket 查绑定的 CNAME 与证书（并发 5）。
+ * 部署对已绑定的域名再调一次 PutCname，只带证书配置（证书服务里的证书 ID 加地域后缀），其他 CNAME 配置不受影响。
+ * 用 Force 覆盖当前证书而不用 PreviousCertId 校验：超时重试时第一次可能已经换上新证书，校验会把成功误报为失败。
+ */
 export const oss: DomainService<AliyunCredentials> = {
   key: "oss",
   label: "对象存储 OSS",
@@ -117,7 +133,7 @@ export const oss: DomainService<AliyunCredentials> = {
     const buckets = await listBuckets(ctx, creds);
     const perBucket = await mapLimit(buckets, 5, async (bucket) => {
       try {
-        const xml = await ossGet(ctx, creds, {
+        const xml = await ossRequest(ctx, creds, {
           host: `${bucket.name}.${bucket.endpoint}`,
           region: bucket.region,
           bucket: bucket.name,
@@ -130,5 +146,26 @@ export const oss: DomainService<AliyunCredentials> = {
       }
     });
     return perBucket.flat();
+  },
+  deployer: {
+    async apply(ctx, creds, target, input) {
+      const certId = `${await input.certId()}-${CAS_REGION}`;
+      for (const r of target.records) {
+        const { bucket, region } = r.extra ?? {};
+        if (!bucket || !region) throw new Error(`${r.domain} 缺少 bucket / region 信息`);
+        await ossRequest(ctx, creds, {
+          method: "POST",
+          host: `${bucket}.oss-${region}.aliyuncs.com`,
+          region,
+          bucket,
+          query: { cname: "", comp: "add" },
+          body:
+            `<BucketCnameConfiguration><Cname><Domain>${escapeXml(r.domain)}</Domain>` +
+            `<CertificateConfiguration><CertId>${escapeXml(certId)}</CertId><Force>true</Force></CertificateConfiguration>` +
+            "</Cname></BucketCnameConfiguration>",
+        });
+      }
+      return { certId };
+    },
   },
 };
