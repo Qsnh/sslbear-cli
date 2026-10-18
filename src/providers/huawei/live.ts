@@ -7,7 +7,7 @@ import { toIso } from "../../lib/time.js";
 import type { CertInfo, DomainRecord } from "../../types.js";
 import type { DeployInput, DeployOutcome, DeployTarget, DomainService, Warn } from "../registry.js";
 import { callHuawei, listProjects } from "./client.js";
-import { earliest, orderCerts, parsePem, SM_CERT_LOCKED, smCertLocked, withoutSource } from "./common.js";
+import { earliest, HTTPS_ALREADY_ENABLED, markHttpsUnknown, orderCerts, parsePem, SM_CERT_LOCKED, smCertLocked, withoutSource } from "./common.js";
 import { enrichFromScm } from "./scm.js";
 
 /**
@@ -53,7 +53,7 @@ interface LiveCert {
 interface HttpsCertConfig {
   certificate?: string | null;
   force_redirect?: boolean | null;
-  tls_certificate?: { certificate?: string | null } | null;
+  tls_certificate?: { source?: string | null; cert_id?: string | null; certificate?: string | null } | null;
   gm_certificate?: {
     /** scm 云证书管理服务，user 自有证书 */
     source?: string | null;
@@ -119,12 +119,25 @@ async function listRegion(ctx: QueryContext, creds: AccessKeyCredentials, region
   return { domains, certs, configs };
 }
 
+/**
+ * 开着 HTTPS 的域名缺国际证书的到期时间：证书信息全空（compact 后没有 cert），或有国际证书没有到期时间。
+ * 部署时按国际证书的到期时间决策，国密证书不参与。
+ */
+const lacksIntlExpiry = (r: DomainRecord) => r.https && (!r.cert || [r.cert, ...(r.certs ?? [])].some((c) => c.algorithm !== "SM2" && !c.notAfter));
+
 const PUSH_UNSUPPORTED = "推流域名不支持配置 HTTPS 证书（视频直播只有播放域名可以配置证书）";
+
+/** 读到的配置里已有国际或国密证书，即已开启 HTTPS */
+function hasCert(cfg: HttpsCertConfig): boolean {
+  const gm = cfg.gm_certificate;
+  return !!(cfg.certificate || cfg.tls_certificate?.certificate || cfg.tls_certificate?.cert_id || gm?.cert_id || gm?.sign_certificate || gm?.enc_certificate);
+}
 
 /**
  * 修改播放域名的 HTTPS 证书（UpdateDomainHttpsCert）是整体覆盖：先读出当前配置（ShowDomainHttpsCert），
  * 强制跳转原样带回；国际证书用 CCM 证书 ID 绑定；国密证书只能按 CCM 证书 ID 带回，自有上传的读不到私钥，无法保留。
- * 直播没有单独的 HTTPS 开关，配置证书即开启，deploy 与 update 的请求相同。
+ * 直播没有单独的 HTTPS 开关，配置证书即开启，deploy 与 update 的请求相同；
+ * deploy（查询时没有证书）读到已配置了证书时说明 HTTPS 其实已开启，不写入，交给重新执行按更新规则判断。
  */
 async function applyLive(ctx: QueryContext, creds: AccessKeyCredentials, target: DeployTarget, input: DeployInput): Promise<DeployOutcome> {
   let certId: string | undefined;
@@ -136,6 +149,7 @@ async function applyLive(ctx: QueryContext, creds: AccessKeyCredentials, target:
     }
     const req = { host: `live.${region}.myhuaweicloud.com`, path: `/v1/${projectId}/guard/https-cert`, query: { domain: record.domain }, projectId };
     const current = await callHuawei<HttpsCertConfig>(ctx, creds, req);
+    if (target.mode === "deploy" && hasCert(current)) throw new CloudApiError("huawei", "HttpsAlreadyEnabled", HTTPS_ALREADY_ENABLED);
     const gm = current.gm_certificate;
     const hasGm = !!(gm?.cert_id || gm?.sign_certificate || gm?.enc_certificate);
     if (hasGm && !(gm?.source === "scm" && gm.cert_id)) throw new CloudApiError("huawei", "SmCertNotPreservable", SM_CERT_LOCKED);
@@ -181,6 +195,8 @@ export const live: DomainService<AccessKeyCredentials> = {
     }
     const seen = new Set<string>();
     const records: DomainRecord[] = [];
+    // 取证书内容失败的域名：补全后国际证书仍缺到期时间的，标 httpsUnknown
+    const pemFailed: DomainRecord[] = [];
     for (const { region, data, error } of results) {
       if (!data) {
         if (!unused(error)) warn(error, `region ${region}`);
@@ -210,28 +226,30 @@ export const live: DomainService<AccessKeyCredentials> = {
         if (cfg && "error" in cfg) warn(cfg.error, `domain ${d.domain} HTTPS 证书内容（到期时间改用证书列表）`);
         const all = certsByDomain.get(d.domain) ?? [];
         const best = earliest(all);
-        records.push(
-          compact({
-            provider: "huawei" as const,
-            service: "live",
-            domain: d.domain,
-            status: d.status,
-            https: !!best,
-            cert: best && withoutSource(best),
-            certs: all.length > 1 ? orderCerts(all).map(withoutSource) : undefined,
-            extra: compact({
-              region,
-              projectId: projects.get(region),
-              type: d.domain_type,
-              serviceArea: d.service_area,
-              certSource: best?.source,
-              smCertSource: all.find((c) => c.algorithm === "SM2")?.source,
-            }),
+        const record: DomainRecord = compact({
+          provider: "huawei" as const,
+          service: "live",
+          domain: d.domain,
+          status: d.status,
+          https: !!best,
+          cert: best && withoutSource(best),
+          certs: all.length > 1 ? orderCerts(all).map(withoutSource) : undefined,
+          extra: compact({
+            region,
+            projectId: projects.get(region),
+            type: d.domain_type,
+            serviceArea: d.service_area,
+            certSource: best?.source,
+            smCertSource: all.find((c) => c.algorithm === "SM2")?.source,
           }),
-        );
+        });
+        records.push(record);
+        if (cfg && "error" in cfg) pemFailed.push(record);
       }
     }
-    return enrichFromScm(ctx, creds, warn, records);
+    await enrichFromScm(ctx, creds, warn, records);
+    for (const r of pemFailed) if (lacksIntlExpiry(r)) markHttpsUnknown(r);
+    return records;
   },
   deployer: {
     unsupported: (record) => (record.extra?.type === "push" ? PUSH_UNSUPPORTED : smCertLocked(record)),

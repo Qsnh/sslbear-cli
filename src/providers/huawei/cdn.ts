@@ -6,7 +6,7 @@ import { toIso } from "../../lib/time.js";
 import type { CertInfo, DomainRecord } from "../../types.js";
 import type { DeployInput, DeployOutcome, DeployTarget, DomainService } from "../registry.js";
 import { callHuawei } from "./client.js";
-import { certName, earliest, orderCerts, parsePem, SM_CERT_LOCKED, smCertLocked, withoutSource } from "./common.js";
+import { certName, earliest, HTTPS_ALREADY_ENABLED, orderCerts, parsePem, SM_CERT_LOCKED, smCertLocked, withoutSource } from "./common.js";
 
 /** CDN 是全局服务，不区分地域 */
 const HOST = "cdn.myhuaweicloud.com";
@@ -98,7 +98,9 @@ const configPath = (domain: string) => `/v1.1/cdn/configuration/domains/${domain
  * 修改域名全量配置（UpdateDomainFullConfig）只发 configs.https：强制跳转、HSTS、QUIC、TLS 加密套件等是 configs 下的其它项，不发即不改；
  * https 对象内未传的 HTTP/2 开关缺省为关闭，所以先读出（ShowDomainFullConfig）把 HTTP/2、TLS 版本、OCSP Stapling 原样带回。
  * 证书直接传 PEM（自有证书）：用 CCM 证书需要先在控制台授权 CDN 访问 CCM（CDN.00010198）。
- * 双证书只支持「国际 + 国密」：配了国密证书时要用 certificates 把两张一起传，国密证书只能按 CCM 证书 ID 带回，自有上传的读不到私钥，无法保留。
+ * 双证书只支持「国际 + 国密」：配了国密证书时要用 certificates 把两张一起传，国密证书只能按 CCM 证书 ID 带回，自有上传的读不到私钥，无法保留；
+ * 带回时证书名称也要原样传，读不到名称就不写入。
+ * deploy（查询时 HTTPS 未开启）读到 HTTPS 其实已开启时不写入，交给重新执行按更新规则判断。
  */
 async function applyCdn(ctx: QueryContext, creds: AccessKeyCredentials, target: DeployTarget, input: DeployInput): Promise<DeployOutcome> {
   const { cert } = input;
@@ -109,11 +111,21 @@ async function applyCdn(ctx: QueryContext, creds: AccessKeyCredentials, target: 
       query: { enterprise_project_id: ALL_PROJECTS },
     });
     const current = res.configs?.https ?? {};
+    if (target.mode === "deploy" && current.https_status && current.https_status !== "off") {
+      throw new CloudApiError("huawei", "HttpsAlreadyEnabled", HTTPS_ALREADY_ENABLED);
+    }
     const all = current.certificates?.length ? current.certificates : current.certificate_type ? [current] : [];
     // 关闭 HTTPS 时证书会被一并删除，读到的残留不算
     const sm = current.https_status !== "off" ? all.find((c) => c.certificate_type === "server_sm") : undefined;
     if (sm && !(sm.certificate_source === 2 && sm.scm_certificate_id)) {
       throw new CloudApiError("huawei", "SmCertNotPreservable", SM_CERT_LOCKED);
+    }
+    if (sm && !sm.certificate_name) {
+      throw new CloudApiError(
+        "huawei",
+        "SmCertNotPreservable",
+        `读回的国密证书（CCM 证书 ${sm.scm_certificate_id}）没有证书名称，双证书要把国密证书连同名称原样带回，缺了名称无法确保它被保留；未做修改，请在控制台更换证书`,
+      );
     }
     const intl = { certificate_type: "server", certificate_source: 0, certificate_name: certName(cert), certificate_value: cert.certPem, private_key: cert.keyPem };
     const https = {
@@ -123,7 +135,7 @@ async function applyCdn(ctx: QueryContext, creds: AccessKeyCredentials, target: 
         ? {
             certificates: [
               intl,
-              compact({ certificate_type: "server_sm", certificate_source: 2, scm_certificate_id: sm.scm_certificate_id, certificate_name: sm.certificate_name }),
+              { certificate_type: "server_sm", certificate_source: 2, scm_certificate_id: sm.scm_certificate_id, certificate_name: sm.certificate_name },
             ],
           }
         : intl),
