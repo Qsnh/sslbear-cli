@@ -7,7 +7,7 @@ import type { DomainRecord } from "../../types.js";
 import type { Deployer, DomainService } from "../registry.js";
 import { callTencent } from "./client.js";
 import { asPlatformDomain, isPlatformDomain } from "./platform.js";
-import { explainMissingCn } from "./ssl.js";
+import { explainMissingCn, listSslCertificates } from "./ssl.js";
 
 interface CdnHttps {
   Switch?: string;
@@ -15,7 +15,7 @@ interface CdnHttps {
   OcspStapling?: string | null;
   VerifyClient?: string | null;
   Spdy?: string | null;
-  /** 实测 CertName 是证书的主域名（托管时自动生成），Message 才是证书备注（即 SSL 证书列表里的备注名） */
+  /** 实测 CertName 是证书的主域名（托管时自动生成），Message 才是证书备注（绑定时 SSL 证书列表里的备注名，只换 CertId 时不更新） */
   CertInfo?: { CertId?: string; CertName?: string; Message?: string; ExpireTime?: string; DeployTime?: string; From?: string } | null;
   ClientCertInfo?: { Certificate?: string | null; CertName?: string | null } | null;
   Hsts?: { Switch?: string; MaxAge?: number | null; IncludeSubDomains?: string | null } | null;
@@ -116,16 +116,25 @@ export const cdn: DomainService<TencentCredentials> = {
       });
       return { items: res.Domains ?? [], total: res.TotalNumber };
     });
+    // 实测用 ModifyDomainConfig 只换 CertId 后，CertInfo.Message（证书备注）仍是旧证书的，所以证书名以 SSL 证书列表里
+    // 该 ID 的备注名为准；列表拉不到（如没有 SSL 只读权限）时退回 Message，不记 issue（到期时间 CDN 自己就给了）
+    const sslAlias = domains.some((d) => d.Https?.Switch === "on" && d.Https.CertInfo?.CertId)
+      ? await listSslCertificates(ctx, creds).then(
+          (certs) => new Map(certs.map((c) => [c.id, c.name])),
+          () => undefined,
+        )
+      : undefined;
     return domains.map((d) => {
       const cert = d.Https?.CertInfo;
       const https = d.Https?.Switch === "on";
+      const name = (cert?.CertId && sslAlias?.get(cert.CertId)) || cert?.Message || cert?.CertName;
       const record = compact({
         provider: "tencent" as const,
         service: "cdn",
         domain: d.Domain,
         status: d.Status,
         https,
-        cert: https && cert ? compact({ id: cert.CertId, name: cert.Message || cert.CertName, notAfter: toIso(cert.ExpireTime) }) : undefined,
+        cert: https && cert ? compact({ id: cert.CertId, name, notAfter: toIso(cert.ExpireTime) }) : undefined,
         extra: d.Area ? { area: d.Area } : undefined,
       });
       // 平台域名（如 *.video.myqcloud.com）有 HTTPS 开关但没有用户证书，HTTPS 以开关为准
