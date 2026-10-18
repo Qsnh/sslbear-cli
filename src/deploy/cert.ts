@@ -21,9 +21,9 @@ export interface LocalCert {
 
 const PEM_CERT = /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g;
 
-/** X509Certificate.subject / issuer 是多行 "K=V"，取 CN */
-function cnOf(dn: string): string | undefined {
-  return dn
+/** X509Certificate.subject / issuer 是多行 "K=V"，取 CN；subject 为空的证书（如 Let's Encrypt 短期证书）该字段为 undefined */
+function cnOf(dn: string | undefined): string | undefined {
+  return (dn ?? "")
     .split("\n")
     .map((l) => /^CN=(.*)$/.exec(l.trim())?.[1])
     .find((v) => v !== undefined);

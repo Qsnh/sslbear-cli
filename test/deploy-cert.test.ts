@@ -43,6 +43,13 @@ describe("loadLocalCert", () => {
     expect(c.sans).toEqual(["only.example.net"]);
   });
 
+  it("没有 subject、只有 SAN 的证书（如 Let's Encrypt 短期证书）：没有 commonName，覆盖域名取 SAN", () => {
+    const c = loadLocalCert(read("san-only-fullchain.pem"), read("san-only-key.pem"), NOW);
+    expect(c.commonName).toBeUndefined();
+    expect(c.sans).toEqual(["example.com", "*.example.com"]);
+    expect(c.issuer).toBe("sslbear test CA 2");
+  });
+
   it("自签证书不要求证书链", () => {
     const c = loadLocalCert(read("selfsigned.pem"), read("selfsigned-key.pem"), NOW);
     expect(c.sans).toEqual(["self.example.org"]);
