@@ -72,12 +72,27 @@ export function decide(record: DomainRecord, cert: LocalCert, o: DecideOptions):
 
   let confirm: [SkipReason, string] | undefined;
   if (Number.isFinite(oldMs) && near(oldMs, newMs)) {
-    // 到期时间相同还要看签发时间：同一天到期的重签证书不是同一张；查不到旧证书签发时间时只能按到期时间判断
+    // 到期时间相同还要看签发时间与算法：同一天到期的重签证书、同时签发的 RSA / ECC 两张都不是同一张。
+    // 查不到签发时间只能按到期时间判断；查不到算法时无法区分同时签发的两张，按同一张跳过，但用户坚持（--force）就换
     const oldStart = Date.parse(oldCert?.notBefore ?? "");
-    if (!Number.isFinite(oldStart) || near(oldStart, Date.parse(cert.notBefore))) {
-      return { ...skip("already_current", "已是该证书（到期时间相同）"), ...base };
+    const startNear = !Number.isFinite(oldStart) || near(oldStart, Date.parse(cert.notBefore));
+    const oldAlg = oldCert?.algorithm;
+    if (startNear && (!oldAlg || oldAlg === cert.algorithm)) {
+      if (oldAlg) return { ...skip("already_current", "已是该证书（到期时间相同）"), ...base };
+      if (!o.force) {
+        return {
+          ...skip("already_current", "已是该证书（到期时间相同）；若其实是同期签发的另一张证书（如 RSA / ECC 各一张），向用户确认后加 --force 可强制替换"),
+          ...base,
+        };
+      }
+    } else {
+      confirm = [
+        "same_expiry",
+        startNear
+          ? `当前证书（${oldAlg}）与新证书（${cert.algorithm}）到期时间相同但算法不同`
+          : "当前证书与新证书到期时间相同但签发时间不同（可能是重签的证书）",
+      ];
     }
-    confirm = ["same_expiry", "当前证书与新证书到期时间相同但签发时间不同（可能是重签的证书）"];
   } else if (!Number.isFinite(oldMs)) confirm = ["unknown_expiry", "查不到当前证书的到期时间"];
   else if (oldMs - newMs > SAME_CERT_TOLERANCE_MS) {
     confirm = ["newer_current", `当前证书 ${day(oldCert!.notAfter!)} 到期，比新证书（${day(cert.notAfter)}）还晚`];

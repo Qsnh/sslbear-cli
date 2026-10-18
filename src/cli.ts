@@ -252,11 +252,11 @@ skipped 的 reason 为跳过原因，needsConfirm: true 的须先问用户；fai
   platform_managed     平台默认域名，由云厂商提供证书
   unsupported          该服务 / 记录不支持通过 CLI 部署（message 写明原因）
   https_off            未开启 HTTPS 且未用 -d 点名
-  already_current      已是这张证书
+  already_current      已是这张证书（查不到当前证书的算法时无法区分同期签发的 RSA / ECC 两张，加 --force 可强制替换）
   unknown_expiry       查不到当前证书的到期时间（需确认）
   newer_current        当前证书比新证书到期还晚（需确认）
   not_due              当前证书还有 30 天以上才到期（需确认）
-  same_expiry          当前证书与新证书到期时间相同但签发时间不同，可能是重签的证书（需确认）
+  same_expiry          当前证书与新证书到期时间相同，但签发时间或算法不同（如重签的证书、RSA 换 ECC）（需确认）
   shared_cert_blocked  证书挂在共享的配置上，同组有记录挡住了更新；message 列出挡住的记录与放行方法
 需确认的跳过带 needsConfirm: true：须先向用户确认，用户同意后加 --force 重新执行。
 

@@ -38,16 +38,33 @@ describe("decide", () => {
     expect(d).toMatchObject({ kind: "deploy" });
   });
 
-  it("旧证书与新证书到期时间相差 48 小时内视为同一张（--force 也跳过）", () => {
+  it("旧证书与新证书到期时间相差 48 小时内、算法相同：视为同一张（--force 也跳过）", () => {
     for (const t of ["2027-01-01T00:00:00Z", "2026-12-31T16:00:00Z", "2027-01-02T23:00:00Z"]) {
-      expect(decide(on(t), CERT, { ...opts, force: true })).toMatchObject({ kind: "skip", reason: "already_current" });
+      const r = rec({ cert: { name: "old", notAfter: t, algorithm: "RSA" } });
+      expect(decide(r, CERT, { ...opts, force: true })).toMatchObject({ kind: "skip", reason: "already_current", message: "已是该证书（到期时间相同）" });
     }
   });
 
   it("旧证书签发时间也在 48 小时内（或查不到签发时间）才算同一张", () => {
-    const same = rec({ cert: { name: "old", notBefore: "2026-10-02T12:00:00Z", notAfter: "2027-01-01T00:00:00Z" } });
+    const same = rec({ cert: { name: "old", notBefore: "2026-10-02T12:00:00Z", notAfter: "2027-01-01T00:00:00Z", algorithm: "RSA" } });
     expect(decide(same, CERT, { ...opts, force: true })).toMatchObject({ kind: "skip", reason: "already_current" });
     expect(decide(on("2027-01-01T00:00:00Z"), CERT, opts)).toMatchObject({ kind: "skip", reason: "already_current" });
+  });
+
+  it("查不到旧证书算法时按同一张跳过，但提示可 --force；加 --force 后更新（同时签发的 RSA / ECC 两张无法靠时间区分）", () => {
+    const d = decide(on("2027-01-01T00:00:00Z"), CERT, opts);
+    expect(d).toMatchObject({ kind: "skip", reason: "already_current" });
+    expect(d.needsConfirm).toBeUndefined();
+    expect(d.message).toContain("--force");
+    expect(decide(on("2027-01-01T00:00:00Z"), CERT, { ...opts, force: true })).toMatchObject({ kind: "update", oldCert: { name: "old" } });
+  });
+
+  it("到期时间相同但算法不同：需确认，--force 后更新", () => {
+    const ecc = rec({ cert: { name: "old", notBefore: "2026-10-01T00:00:15Z", notAfter: "2027-01-01T00:00:15Z", algorithm: "ECC" } });
+    const d = decide(ecc, CERT, opts);
+    expect(d).toMatchObject({ kind: "skip", reason: "same_expiry", needsConfirm: true });
+    expect(d.message).toContain("当前证书（ECC）与新证书（RSA）到期时间相同但算法不同");
+    expect(decide(ecc, CERT, { ...opts, force: true })).toMatchObject({ kind: "update" });
   });
 
   it("到期时间相同但签发时间不同（重签的证书）：需确认，--force 后更新", () => {

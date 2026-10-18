@@ -141,8 +141,8 @@ sslbear-cli deploy --cert <fullchain.pem> --key <privkey.pem> [选项]
 | --- | --- |
 | 已开 HTTPS，当前证书 30 天内到期（含已过期） | 更新为新证书 |
 | 已开 HTTPS，当前证书还有 30 天以上才到期 | 跳过，`reason: "not_due"`，**需确认** |
-| 已开 HTTPS，查不到当前证书的到期时间 / 当前证书比新证书到期还晚 / 到期相同但签发时间不同（重签） | 跳过（`unknown_expiry` / `newer_current` / `same_expiry`），**需确认** |
-| 已开 HTTPS，已是这张证书 | 跳过（`already_current`），所以重复执行是安全的 |
+| 已开 HTTPS，查不到当前证书的到期时间 / 当前证书比新证书到期还晚 / 到期相同但签发时间或算法不同（重签、RSA 换 ECC） | 跳过（`unknown_expiry` / `newer_current` / `same_expiry`），**需确认** |
+| 已开 HTTPS，已是这张证书（到期、签发时间相同，算法相同或查不到） | 跳过（`already_current`），所以重复执行是安全的；查不到当前证书算法时，加 `--force` 可强制替换 |
 | 没开 HTTPS，没用 `-d` 点名 | 跳过（`https_off`） |
 | 没开 HTTPS，用 `-d` 点名 | 部署并开启 HTTPS |
 | 平台默认域名 / 服务不支持 | 跳过（`platform_managed` / `unsupported`，message 写明原因） |
