@@ -1,4 +1,4 @@
-import { X509Certificate, createPrivateKey, randomUUID } from "node:crypto";
+import { X509Certificate, createHash, createPrivateKey, randomUUID } from "node:crypto";
 import type { LocalCert } from "../../deploy/cert.js";
 import type { AliyunCredentials } from "../../lib/env.js";
 import { CloudApiError, withRetry, type QueryContext } from "../../lib/http.js";
@@ -26,8 +26,10 @@ interface CertOrder {
   Expired?: boolean;
   Upload?: boolean;
   Status?: string;
-  /** 证书 SHA-256 指纹，大写 hex */
+  /** 文档称「证书 Sha2 值」，实测是证书公钥（SubjectPublicKeyInfo DER）的 SHA-256，大写 hex，不是证书指纹：同一私钥续签的证书相同 */
   Sha2?: string;
+  /** 实测是叶子证书 DER 的 SHA-1，大写 hex，能唯一确定一张证书 */
+  Fingerprint?: string;
   /** 证书序列号，小写 hex */
   SerialNo?: string;
 }
@@ -86,7 +88,7 @@ export async function listCasCertificates(ctx: QueryContext, creds: AliyunCreden
   return out;
 }
 
-/** 上传时的证书名：sslbear-<CN，* 换成 _>-<到期日 YYYYMMDD>[-<后缀>]，超出 63 个字符时截断 CN 部分 */
+/** 上传时的证书名：sslbear-<CN（没有 CN 时取第一个 SAN），* 换成 _>-<到期日 YYYYMMDD>[-<后缀>]，超出 63 个字符时截断 CN 部分 */
 function uploadName(cert: LocalCert, suffix?: string): string {
   const tail = `-${cert.notAfter.slice(0, 10).replace(/-/g, "")}${suffix ? `-${suffix}` : ""}`;
   const cn = (cert.commonName ?? cert.sans[0] ?? "cert").replace(/\*/g, "_");
@@ -111,14 +113,29 @@ function issuerNames(cert: LocalCert): string[] {
 /** 精确的时间戳（毫秒）与本地证书的时间一致；只有日期的 StartDate / EndDate 无法确认，不算一致 */
 const sameTime = (ms: number | undefined, iso: string) => ms !== undefined && toIso(ms) === iso;
 
+/** 本地叶子证书的 SHA-1 指纹与公钥 SHA-256（小写 hex），对应证书服务列表的 Fingerprint 与 Sha2 */
+function localHashes(cert: LocalCert): { sha1?: string; spki?: string } {
+  try {
+    const x = new X509Certificate(cert.certPem);
+    return {
+      sha1: hex(x.fingerprint),
+      spki: createHash("sha256").update(x.publicKey.export({ type: "spki", format: "der" })).digest("hex"),
+    };
+  } catch {
+    return {};
+  }
+}
+
 /**
- * 证书服务里的这张是否就是要上传的证书，只认能确定的：给了 SHA-256 指纹就只看指纹；
- * 没给指纹时同序列号、同签发者且起止时间一致（序列号只在同一 CA 内唯一）。都确认不了时按不是同一张处理，
- * 宁可多传一份：同 CN、同 SAN、同到期的 RSA / ECC 两张证书不能互相复用
+ * 证书服务里的这张是否就是要上传的证书，只认能确定的：给了 Fingerprint（证书 SHA-1）就只看它；
+ * 否则要求同序列号（只在同一 CA 内唯一），再加上同公钥（Sha2），没给 Sha2 时同签发者且起止时间一致。
+ * 都确认不了时按不是同一张处理，宁可多传一份：同 CN、同 SAN、同到期的 RSA / ECC 两张证书不能互相复用，
+ * 同一私钥续签的证书 Sha2 相同也不能复用
  */
-function sameCert(o: CertOrder, cert: LocalCert): boolean {
-  if (o.Sha2) return hex(o.Sha2) === cert.fingerprint;
+function sameCert(o: CertOrder, cert: LocalCert, local: { sha1?: string; spki?: string }): boolean {
+  if (o.Fingerprint && local.sha1) return hex(o.Fingerprint) === local.sha1;
   if (!o.SerialNo || serial(o.SerialNo) !== serial(cert.serialNumber)) return false;
+  if (o.Sha2 && local.spki) return hex(o.Sha2) === local.spki;
   const issuer = o.Issuer?.trim().toLowerCase();
   return (
     !!issuer &&
@@ -126,6 +143,15 @@ function sameCert(o: CertOrder, cert: LocalCert): boolean {
     sameTime(o.CertStartTime, cert.notBefore) &&
     sameTime(o.CertEndTime, cert.notAfter)
   );
+}
+
+/** 证书名不能与账号下已有的重复：依次尝试不带后缀、带指纹前 8 位、再加序号 */
+function freeName(cert: LocalCert, taken: Set<string | undefined>): string {
+  const fp = cert.fingerprint.slice(0, 8);
+  for (let i = 0; ; i++) {
+    const name = uploadName(cert, i === 0 ? undefined : i === 1 ? fp : `${fp}-${i}`);
+    if (!taken.has(name)) return name;
+  }
 }
 
 /**
@@ -164,14 +190,14 @@ function hideKey(e: unknown, keyPem: string): unknown {
 export function uploadCasCertificate(ctx: QueryContext, creds: AliyunCredentials, cert: LocalCert): Promise<{ id: string; reused: boolean }> {
   const clientToken = randomUUID();
   const key = traditionalKey(cert.keyPem);
+  const local = localHashes(cert);
   return withRetry(ctx, async () => {
     // 不带 Status 只返回有效证书；要上传的证书在有效期内，同一张证书只会在这里
     const orders = await listOrders(ctx, creds);
-    const same = orders.find((o) => sameCert(o, cert));
+    const same = orders.find((o) => sameCert(o, cert, local));
     if (same) return { id: String(same.CertificateId), reused: true };
-    // 同一账号下证书名不能重复：同名的是另一张证书（如同域名同日到期、换了私钥）时加指纹后缀
-    const taken = new Set(orders.map((o) => o.Name));
-    const name = taken.has(uploadName(cert)) ? uploadName(cert, cert.fingerprint.slice(0, 8)) : uploadName(cert);
+    // 同一账号下证书名不能重复：同名的是另一张证书（如同域名同日到期、换了私钥）时加后缀
+    const name = freeName(cert, new Set(orders.map((o) => o.Name)));
     const res = await callRpcOnce<{ CertId?: number | string }>(ctx, creds, {
       ...CAS,
       action: "UploadUserCertificate",

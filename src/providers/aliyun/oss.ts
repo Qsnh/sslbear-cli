@@ -163,6 +163,12 @@ export const oss: DomainService<AliyunCredentials> = {
             `<BucketCnameConfiguration><Cname><Domain>${escapeXml(r.domain)}</Domain>` +
             `<CertificateConfiguration><CertId>${escapeXml(certId)}</CertId><Force>true</Force></CertificateConfiguration>` +
             "</Cname></BucketCnameConfiguration>",
+        }).catch((e: unknown) => {
+          // 实测 OSS 不接受 Subject 为空、只有 SAN 的证书（直接传 PEM 也一样），只回一句格式错误，补上原因
+          if (e instanceof CloudApiError && e.code === "MalformedCertificate" && !input.cert.commonName) {
+            e.message = `${e.message}（OSS 不接受没有通用名 CN、只有 SAN 的证书，如 Let's Encrypt 短期证书；请换用带通用名的证书）`;
+          }
+          throw e;
         });
       }
       return { certId };
