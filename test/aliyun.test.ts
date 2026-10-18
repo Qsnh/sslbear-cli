@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ALIYUN_ENV, fakeFetch, runCli, type FakeRequest } from "./helpers.js";
+import { ALIYUN_ENV, fakeFetch, runCli, type FakeReply, type FakeRequest } from "./helpers.js";
 
 const rpcError = (status: number, Code: string, Message: string) => ({
   status,
@@ -198,6 +198,58 @@ describe("aliyun domains", () => {
     });
     const r = await runCli(["domains", "-s", "live", "--json"], { env: ALIYUN_ENV, fetch });
     expect(r.json.data.items[0]).toMatchObject({ domain: "play.example.com", status: "online", https: true, daysLeft: -6 });
+  });
+
+  it("直播没有 HTTPS 开关字段：HTTPS 列表查询失败时记 issue，记录标 httpsUnknown；NoHttpsDomain 不算失败", async () => {
+    const liveRoutes =
+      (httpsReply: FakeReply) =>
+      (req: FakeRequest): FakeReply => {
+        if (req.action === "DescribeLiveUserDomains") {
+          return {
+            body: {
+              TotalCount: 2,
+              Domains: {
+                PageData: [
+                  { DomainName: "play.example.com", LiveDomainStatus: "online", LiveDomainType: "liveVideo" },
+                  { DomainName: "push.example.com", LiveDomainStatus: "online", LiveDomainType: "liveEdge" },
+                ],
+              },
+            },
+          };
+        }
+        if (req.action === "DescribeLiveHttpsDomainList") return httpsReply;
+        return undefined;
+      };
+    const failed = await runCli(["domains", "-s", "live", "--json"], {
+      env: ALIYUN_ENV,
+      fetch: fakeFetch(liveRoutes(rpcError(403, "Forbidden.RAM", "User not authorized to operate on the specified resource."))),
+    });
+    expect(failed.code).toBe(0);
+    const byDomain = Object.fromEntries(failed.json.data.items.map((d: any) => [d.domain, d]));
+    // https 仍填最佳猜测（不在 HTTPS 列表里即 false），但标明无法判断
+    expect(byDomain["play.example.com"]).toEqual({
+      provider: "aliyun",
+      service: "live",
+      domain: "play.example.com",
+      status: "online",
+      https: false,
+      extra: { liveDomainType: "liveVideo", httpsUnknown: "true" },
+    });
+    expect(byDomain["push.example.com"]).toMatchObject({ https: false, extra: { liveDomainType: "liveEdge", httpsUnknown: "true" } });
+    expect(failed.json.data.issues).toEqual([
+      expect.objectContaining({ service: "live", kind: "error", code: "Forbidden.RAM", target: "HTTPS 证书列表（用于补全证书信息）" }),
+    ]);
+
+    const none = await runCli(["domains", "-s", "live", "--json"], {
+      env: ALIYUN_ENV,
+      fetch: fakeFetch(liveRoutes(rpcError(400, "NoHttpsDomain", "no https domain"))),
+    });
+    expect(none.json.data.issues).toEqual([]);
+    expect(none.json.data.items).toHaveLength(2);
+    for (const d of none.json.data.items) {
+      expect(d.https).toBe(false);
+      expect(d.extra.httpsUnknown).toBeUndefined();
+    }
   });
 
   it("点播：只对开启 HTTPS 的域名查证书，单个域名失败只记 issue", async () => {
@@ -488,7 +540,7 @@ describe("aliyun esa", () => {
     });
   });
 
-  it("查不到 SSL/TLS 配置时只记 issue，记录仍按证书输出", async () => {
+  it("查不到 SSL/TLS 配置时记 issue，记录仍按证书输出；有证书的记录 HTTPS 无法判断，标 httpsUnknown", async () => {
     const fetch = fakeFetch((req) => {
       if (req.action === "ListHttpsBasicConfigurations" && req.url.searchParams.get("SiteId") === "1001") {
         return rpcError(403, "NoPermission", "You are not authorized to operate on the specified resource.");
@@ -497,9 +549,16 @@ describe("aliyun esa", () => {
     });
     const r = await runCli(["domains", "-s", "esa", "--json"], { env: ALIYUN_ENV, fetch });
     const byDomain = Object.fromEntries(r.json.data.items.map((d: any) => [d.domain, d]));
-    expect(byDomain["admin.example.com"]).toMatchObject({ https: true, cert: { id: "c-wild" } });
+    // 有匹配证书的记录：HTTPS 取决于查不到的开关（admin 实际被规则关闭），https 按证书猜测为开启并标 httpsUnknown
+    expect(byDomain["admin.example.com"]).toMatchObject({ https: true, cert: { id: "c-wild" }, extra: { httpsUnknown: "true" } });
     expect(byDomain["admin.example.com"].extra.httpsSwitch).toBeUndefined();
+    expect(byDomain["www.example.com"].extra.httpsUnknown).toBe("true");
+    // 没有匹配的已签发证书：开关怎样都不会提供 HTTPS，https:false 是确定的，不打标记
+    expect(byDomain["deep.a.example.com"]).toMatchObject({ https: false });
+    expect(byDomain["deep.a.example.com"].extra.httpsUnknown).toBeUndefined();
     expect(byDomain["shop.example.net"].extra.httpsSwitch).toBe("on");
+    expect(byDomain["shop.example.net"].extra.httpsUnknown).toBeUndefined();
+    expect(byDomain["shop.customer.com"].extra.httpsUnknown).toBeUndefined();
     expect(r.json.data.issues).toEqual([
       expect.objectContaining({ service: "esa", kind: "error", code: "NoPermission", target: "site example.com SSL/TLS 配置" }),
     ]);
