@@ -156,6 +156,8 @@ sslbear-cli deploy --cert <fullchain.pem> --key <privkey.pem> [选项]
 
 **生效时间**：云接口受理即算成功，不等待边缘节点生效（各云需要几秒到几分钟），可稍后用 `domains` 核对。
 
+**范围**：用了 `-d` 时，结果里只有被点名的域名；没用 `-d` 时列出所有被证书覆盖的域名（包括跳过的）。
+
 **JSON 输出**：
 
 ```json
@@ -163,7 +165,7 @@ sslbear-cli deploy --cert <fullchain.pem> --key <privkey.pem> [选项]
 ```
 
 - `action`：`deployed`（原先没开 HTTPS）、`updated`（替换旧证书）、`skipped`、`failed`；`--dry-run` 时为 `would_deploy` / `would_update` / `skipped` / `failed`。
-- `failed` 带 `code`、`message`、`requestId`（有的话）和 `retryable`（能否原样重试）。常见 code：`HttpsStateUnknown`（查询该域名的 HTTPS 配置失败，无法判断现状，未做修改，可稍后重试）、`DomainNotFound`（`-d` 点名的域名找不到）、`NotCovered`（`-d` 点名的域名不被证书覆盖）、`HttpsAlreadyEnabled`（写入前发现 HTTPS 已被开启，与查询时不同，重新执行即可），其余为云接口的错误码。
+- `failed` 带 `code`、`message`、`requestId`（有的话）和 `retryable`（能否原样重试）。常见 code：`HttpsStateUnknown`（查询该域名的 HTTPS 配置失败，无法判断现状，未做修改，可稍后重试）、`DomainNotFound`（`-d` 点名的域名找不到）、`NotCovered`（`-d` 点名的域名不被证书覆盖）、`HttpsAlreadyEnabled`（写入前发现 HTTPS 已被开启，与查询时不同，重新执行即可）、`CertWithoutCommonName`（该服务不接受没有 CN 的证书，见「已知限制」），其余为云接口的错误码。
 - `shared_cert_blocked`：证书挂在多个域名共享的配置上（目前是阿里云 ESA 站点），同组有记录不能一起更换时整组跳过，message 列出挡住的记录与放行方法。
 - 退出码：`0` 没有失败（全部成功或跳过，包括什么都没改）；`1` 有域名部署失败或所有查询都失败，stderr 输出 `{"ok":false,"status":"DeployFailed","message":…}`，同一个对象里带完整的 `results`、`uploads`、`issues`；`2` 参数、证书文件或凭证配置错误（未做任何修改）。
 
@@ -204,9 +206,9 @@ sslbear-cli deploy --cert <fullchain.pem> --key <privkey.pem> [选项]
 
 - 阿里云：数字证书管理服务 `yundun-cert:UploadUserCertificate`、`ListUserCertificateOrder`、`GetUserCertificateDetail`（或 `AliyunYundunCertFullAccess`）；CDN `cdn:SetCdnDomainSSLCertificate`；DCDN `dcdn:SetDcdnDomainSSLCertificate`；直播 `live:SetLiveDomainCertificate`；点播 `vod:SetVodDomainSSLCertificate`；OSS `oss:PutCname`，另需 OSS 读取证书服务里证书的权限（`yundun-cert:DescribeSSLCertificatePrivateKey`、`DescribeSSLCertificatePublicKeyDetail`、`CreateSSLCertificate`）；ESA `esa:SetCertificate`、`esa:UpdateCustomHostname`。也可以直接授予各产品的 FullAccess 系统策略。
 - 腾讯云：`ssl:UploadCertificate`、`cdn:ModifyDomainConfig`、`cdn:UpdateDomainConfig`、`teo:ModifyHostsCertificate`、`cos:PutBucketDomainCertificate`、`live:ModifyLiveDomainCertBindings`、`vod:SetVodDomainCertificate`。
-- 火山引擎：证书中心 `ImportCertificate`；CDN `BatchDeployCert`；DCDN `CreateCertBind`、`DescribeDomainDetail`、`UpdateDomainConfig`；TOS `GetBucketCustomDomain`、`PutBucketCustomDomain`；点播 `DescribeVodDomainConfig`、`UpdateVodDomainConfig`；直播 `ListCertV2`、`DescribeCertDetailSecretV2`、`CreateCert`、`BindCert`；veImageX `GetDomainConfig`、`UpdateImageBatchDomainCert`、`UpdateHttps`。也可以授予对应产品的 FullAccess 策略。
+- 火山引擎：证书中心 `ImportCertificate`；CDN `BatchDeployCert`；DCDN `CreateCertBind`、`DescribeDomainDetail`、`UpdateDomainConfig`；TOS `GetBucketCustomDomain`、`PutBucketCustomDomain`；点播 `DescribeVodDomainConfig`、`UpdateVodDomainConfig`；直播 `ListCertV2`、`DescribeCertDetailSecretV2`、`CreateCert`、`BindCert`；veImageX `GetDomainConfig`、`UpdateHttps`。也可以授予对应产品的 FullAccess 策略。
 - 华为云：CDN `CDN DomainConfiguration`；视频直播 `Live FullAccess`（授权到直播所在地域的项目）；云证书管理 `SCM FullAccess`，或包含 `scm:cert:import`、`scm:cert:get`、`scm:cert:list` 的自定义策略（只部署 CDN 时不需要）；OBS 包含 `obs:bucket:PutBucketCustomDomainConfiguration` 的自定义策略。
-- 百度智能云：证书管理的创建证书权限、CDN 域名配置的写权限。
+- 百度智能云：证书管理的创建证书、查看证书详情（查重用）权限，CDN 域名配置的写权限。
 - 七牛云：主账号 AK，或有 CDN 域名配置写权限与 SSL 证书上传权限的 IAM 子账号。
 
 ## 已知限制
@@ -227,25 +229,32 @@ sslbear-cli deploy --cert <fullchain.pem> --key <privkey.pem> [选项]
 
 ### `deploy` 的已知限制
 
+以下行为已在 2026-10 用各云真实账号验证（腾讯云 EdgeOne 除外：账号未开通，只经过模拟测试），部署后用 TLS 握手核对了边缘实际下发的证书。
+
+- **没有通用名（CN）的证书**：Let's Encrypt 的 shortlived / tlsserver 配置文件签发的证书只有 SAN、没有 CN。阿里云 OSS，腾讯云 CDN、COS、点播，火山引擎 CDN、点播、视频直播、veImageX，百度智能云 CDN，七牛云 CDN 不接受（或收下却不生效）这类证书，这些域名记为失败（`CertWithoutCommonName`），不上传、不修改，`--dry-run` 也会提前报出。华为云云证书管理也拒收这类证书，直播、OBS 会改为直接传证书内容（这张证书在 `certs` 里看不到）。需要部署到这些服务时，请用带 CN 的证书（如 Let's Encrypt classic 配置文件）。
+- **生效时间**：云接口受理即算成功，实测边缘生效从十几秒到几分钟不等（华为 OBS、直播约 1 分钟内，CDN 类 1–7 分钟）；关闭 HTTPS 后个别边缘节点可能还会下发原证书一段时间。
 - 阿里云：
-  - 证书上传到数字证书管理服务（中国站，地域 cn-hangzhou），私钥会先转成 PKCS#1（RSA）/ SEC1（ECC）格式再上传，这是阿里云的要求。
+  - 证书上传到数字证书管理服务（中国站，地域 cn-hangzhou），私钥会先转成 PKCS#1（RSA）/ SEC1（ECC）格式再上传，这是阿里云的要求；按证书指纹查重，同一张证书不会重复上传。
   - 直播推流域名不能配 HTTPS。直播的 HTTPS 证书列表查询失败时，无法判断直播域名是否开着 HTTPS，记为 `HttpsStateUnknown`。
-  - ESA 普通记录的证书是往站点上**追加**的，旧证书不删除，站点证书数受套餐配额限制，配额满了要到控制台清理过期证书。站点上加入一种算法的证书不会替换另一算法的证书：域名上原有 ECC 证书时部署 RSA 证书，ECC 证书在到期前仍可能下发给支持 ECC 的客户端。站点下被新证书覆盖的记录要全部满足更新条件才会上传，否则整站跳过（`shared_cert_blocked`）。没开 HTTPS 的普通记录不能通过 CLI 部署（要改站点的 SSL/TLS 规则，影响面超出单个域名）。ESA 的 SSL/TLS 配置查询失败时，该站点有证书的记录记为 `HttpsStateUnknown`。
+  - ESA 普通记录的证书挂在站点上：更新时，站点上同算法、且域名都被新证书覆盖的旧证书会被原地替换（不占站点证书配额，免费版只有 2 张），否则往站点追加新证书，旧证书不删除。站点上加入一种算法的证书不会替换另一算法的证书：域名上原有 ECC 证书时部署 RSA 证书，ECC 证书在到期前仍可能下发给支持 ECC 的客户端（结果里会提示）。站点下被新证书覆盖的记录要全部满足更新条件才会上传，否则整站跳过（`shared_cert_blocked`）。没开 HTTPS 的普通记录不能通过 CLI 部署（要改站点的 SSL/TLS 规则，影响面超出单个域名）。ESA 的 SSL/TLS 配置查询失败时，该站点有证书的记录记为 `HttpsStateUnknown`。
   - OSS 泛域名 CNAME 没有专门适配。
 - 腾讯云：
-  - EdgeOne 只经过模拟测试，尚未用真实账号验证。挂了多张证书但查不到算法的 EdgeOne 域名不处理；原来用免费证书的 EdgeOne 域名，更新后改为托管证书。
+  - EdgeOne 只经过模拟测试。挂了多张证书但查不到算法的 EdgeOne 域名不处理；原来用免费证书的 EdgeOne 域名，更新后改为托管证书。
   - CDN 部署不会替你打开 HTTPS 计费开关（HttpsBilling）；它关着时证书照常部署，结果里会提示 HTTPS 请求会被拦截。
-  - 直播推流域名、点播里由 EdgeOne 分发的域名、锁定中的点播域名不支持。COS 已停用的自定义域名只换证书，不会启用域名。
+  - 直播推流域名、点播里由 EdgeOne 分发的域名、锁定中的点播域名不支持。COS 已停用的自定义域名只换证书，不会启用域名（边缘照常下发新证书）。
+  - 上传结果里的 `reused` 依赖 SSL 证书列表的读权限，没有时一律报 `false`（不会重复创建证书）。
 - 火山引擎：
-  - 视频直播拉流域名不能自动更新证书：`BindCert` 不传 HTTP/2、TLS 版本就会恢复默认值，而直播没有接口能读出当前设置，只能在控制台更换；推流域名不受影响。拉流域名点名部署时 HTTP/2 关闭、最低 TLS 1.2。直播证书上传到直播自己的证书管理，`certs` 看不到。
-  - veImageX 只经过模拟测试，尚未用真实账号验证；部署（开启 HTTPS）时 TLS 版本取 1.1–1.3、不开 OCSP。
-  - DCDN 部署后会读回确认 HTTPS 已开启，必要时再单独打开开关。TOS 证书状态为 `RoleNotExist` 时不处理，需先在 TOS 控制台完成访问证书中心的授权。
-  - CDN、点播的双证书（RSA + ECC）是平台白名单功能，只替换同算法那张；双证书域名查不到算法时不处理。
+  - 视频直播拉流域名不能自动更新证书：换证书的 `BindCert` 会按请求参数重设 TLS 版本等配置，而直播的读接口读不出当前的 TLS 版本，只能在控制台更换；推流域名不受影响。拉流域名点名部署时最低 TLS 1.2。直播证书上传到直播自己的证书管理，`certs` 看不到。
+  - veImageX 读出全部 HTTPS 配置后整块写回、只换证书；从没开过 HTTPS 的域名部署时 TLS 版本取 1.1–1.3、不开 OCSP。
+  - DCDN 部署后会读回确认 HTTPS 已开启，绑了证书但关着 HTTPS 的域名会单独打开开关。TOS 证书状态为 `RoleNotExist` 时不处理，需先在 TOS 控制台完成访问证书中心的授权。
+  - CDN、点播的双证书（RSA + ECC）是平台白名单功能，只替换同算法那张；双证书域名查不到算法时不处理。证书中心与直播不接受自建 CA 签发、链不完整的证书。
 - 华为云：
   - CDN 直接传证书内容，不经过云证书管理（用云证书管理的证书绑定 CDN 需要先在控制台授权），所以 CDN 部署的证书在 `certs` 里看不到；直播、OBS 会先上传到云证书管理再绑定。
   - CDN、直播的国密证书只有由云证书管理托管时才能保留；自己上传的国密证书读不到私钥，这类域名跳过，需在控制台更换。直播推流域名不能配证书。OBS 只设置国际证书，国密证书和客户端 CA 证书不动；OBS 列表不给国际证书的算法。
-- 百度智能云：只支持境内 CDN，只替换国际证书（RSA / ECC 二选一），国密 HTTPS 证书不处理。证书管理的查重依赖接口返回的证书指纹，拿不到时会多上传一份。
-- 七牛云：泛子域名的 HTTPS 继承泛域名，不能单独部署（请对泛域名部署）。上一次配置还在处理中的域名七牛会拒绝修改，需稍后重新执行。部署（开启 HTTPS）时 HTTP/2 默认打开、不强制跳转。
+- 百度智能云：只支持境内 CDN，只替换国际证书（RSA / ECC 二选一），国密 HTTPS 证书不处理。证书管理按证书详情里的 SHA-1 指纹查重，同名同到期的 RSA / ECC 两张证书不会互相复用。
+- 七牛云：
+  - 泛子域名的 HTTPS 继承泛域名，不能单独部署（请对泛域名部署）。上一次配置还在处理中的域名七牛会拒绝修改，需稍后重新执行。部署（开启 HTTPS）时 HTTP/2 默认打开、不强制跳转；更新时强制跳转、HTTP/2、TLS 版本原样保留。
+  - 七牛拒收有效期太短的证书（实测 6 天的 Let's Encrypt 短期证书被拒，错误码 400322）。
 
 ## 开发
 

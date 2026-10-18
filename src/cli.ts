@@ -261,7 +261,9 @@ skipped 的 reason 为跳过原因，needsConfirm: true 的须先问用户；fai
 需确认的跳过带 needsConfirm: true：须先向用户确认，用户同意后加 --force 重新执行。
 
 failed 的常见 code：HttpsStateUnknown（查询该域名的 HTTPS 配置失败，无法判断现状，未做修改，可稍后重试）、
-DomainNotFound（-d 点名的域名在所选云厂商 / 服务上找不到）、NotCovered（-d 点名的域名不被证书覆盖），其余为云接口的错误码。
+DomainNotFound（-d 点名的域名在所选云厂商 / 服务上找不到）、NotCovered（-d 点名的域名不被证书覆盖）、
+CertWithoutCommonName（该服务不接受没有 CN 的证书，如 Let's Encrypt shortlived / tlsserver 证书，请改用带 CN 的证书）、
+HttpsAlreadyEnabled（写入前发现 HTTPS 已开启，与查询时不同，重新执行即可），其余为云接口的错误码。
 
 退出码：
   0  没有失败（全部成功或跳过，包括什么都没改）
