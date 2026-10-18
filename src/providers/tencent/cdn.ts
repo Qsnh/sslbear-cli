@@ -7,6 +7,7 @@ import type { DomainRecord } from "../../types.js";
 import type { Deployer, DomainService } from "../registry.js";
 import { callTencent } from "./client.js";
 import { asPlatformDomain, isPlatformDomain } from "./platform.js";
+import { explainMissingCn, listSslCertificates } from "./ssl.js";
 
 interface CdnHttps {
   Switch?: string;
@@ -14,7 +15,7 @@ interface CdnHttps {
   OcspStapling?: string | null;
   VerifyClient?: string | null;
   Spdy?: string | null;
-  /** 实测 CertName 是证书的主域名（托管时自动生成），Message 才是证书备注（即 SSL 证书列表里的备注名） */
+  /** 实测 CertName 是证书的主域名（托管时自动生成），Message 才是证书备注（绑定时 SSL 证书列表里的备注名，只换 CertId 时不更新） */
   CertInfo?: { CertId?: string; CertName?: string; Message?: string; ExpireTime?: string; DeployTime?: string; From?: string } | null;
   ClientCertInfo?: { Certificate?: string | null; CertName?: string | null } | null;
   Hsts?: { Switch?: string; MaxAge?: number | null; IncludeSubDomains?: string | null } | null;
@@ -71,6 +72,9 @@ function httpsWith(current: CdnHttps | null | undefined, certId: string): Record
   });
 }
 
+/** 证书没有 CN 时 CDN 的报错（见 explainMissingCn） */
+const NO_CN_CODES = ["FailedOperation.CdnConfigError"];
+
 const HTTPS_BILLING_OFF =
   "已开启 HTTPS，但该域名的 HTTPS 服务（HttpsBilling）处于关闭状态，HTTPS 请求会被拦截；如需对外提供 HTTPS，请在 CDN 控制台开启 HTTPS 服务（按 HTTPS 请求数计费）";
 
@@ -83,9 +87,11 @@ const HTTPS_BILLING_OFF =
 const deployer: Deployer<TencentCredentials> = {
   async apply(ctx, creds, target, input) {
     const domain = target.records[0]!.domain;
+    const write = (action: string, payload: Record<string, unknown>) =>
+      explainMissingCn(input.cert, " CDN ", NO_CN_CODES, () => call(ctx, creds, action, payload));
     if (target.mode === "update") {
       const certId = await input.certId();
-      await call(ctx, creds, "ModifyDomainConfig", { Domain: domain, Route: "Https.CertInfo.CertId", Value: JSON.stringify({ update: certId }) });
+      await write("ModifyDomainConfig", { Domain: domain, Route: "Https.CertInfo.CertId", Value: JSON.stringify({ update: certId }) });
       return { certId };
     }
     const current = await describeDomain(ctx, creds, domain);
@@ -93,7 +99,7 @@ const deployer: Deployer<TencentCredentials> = {
       throw new CloudApiError("tencent", "HttpsAlreadyEnabled", "该域名的 HTTPS 已开启（与查询时不同），未做修改；请重新执行，按更新规则判断");
     }
     const certId = await input.certId();
-    await call(ctx, creds, "UpdateDomainConfig", { Domain: domain, Https: httpsWith(current.Https, certId) });
+    await write("UpdateDomainConfig", { Domain: domain, Https: httpsWith(current.Https, certId) });
     // HTTPS 服务是计费开关，不替用户打开，只提示
     return { certId, ...(current.HttpsBilling?.Switch === "off" && { note: HTTPS_BILLING_OFF }) };
   },
@@ -110,16 +116,25 @@ export const cdn: DomainService<TencentCredentials> = {
       });
       return { items: res.Domains ?? [], total: res.TotalNumber };
     });
+    // 实测用 ModifyDomainConfig 只换 CertId 后，CertInfo.Message（证书备注）仍是旧证书的，所以证书名以 SSL 证书列表里
+    // 该 ID 的备注名为准；列表拉不到（如没有 SSL 只读权限）时退回 Message，不记 issue（到期时间 CDN 自己就给了）
+    const sslAlias = domains.some((d) => d.Https?.Switch === "on" && d.Https.CertInfo?.CertId)
+      ? await listSslCertificates(ctx, creds).then(
+          (certs) => new Map(certs.map((c) => [c.id, c.name])),
+          () => undefined,
+        )
+      : undefined;
     return domains.map((d) => {
       const cert = d.Https?.CertInfo;
       const https = d.Https?.Switch === "on";
+      const name = (cert?.CertId && sslAlias?.get(cert.CertId)) || cert?.Message || cert?.CertName;
       const record = compact({
         provider: "tencent" as const,
         service: "cdn",
         domain: d.Domain,
         status: d.Status,
         https,
-        cert: https && cert ? compact({ id: cert.CertId, name: cert.Message || cert.CertName, notAfter: toIso(cert.ExpireTime) }) : undefined,
+        cert: https && cert ? compact({ id: cert.CertId, name, notAfter: toIso(cert.ExpireTime) }) : undefined,
         extra: d.Area ? { area: d.Area } : undefined,
       });
       // 平台域名（如 *.video.myqcloud.com）有 HTTPS 开关但没有用户证书，HTTPS 以开关为准

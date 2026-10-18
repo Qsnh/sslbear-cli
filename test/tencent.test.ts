@@ -131,6 +131,35 @@ describe("tencent domains", () => {
     ]);
   });
 
+  it("CDN：只换了 CertId 时 CertInfo.Message 仍是旧证书的备注（实测），证书名以 SSL 证书列表里该 ID 的备注名为准", async () => {
+    const cdnDomain = {
+      Domain: "www.example.com",
+      Status: "online",
+      Area: "mainland",
+      Https: { Switch: "on", CertInfo: { CertId: "ssl-1", CertName: "example.com", Message: "old-alias", ExpireTime: "2026-10-30 07:59:59" } },
+    };
+    const run = (ssl: (req: FakeRequest) => ReturnType<typeof ok> | undefined) => {
+      const fetch = fakeFetch((req) => (req.url.host === "cdn.tencentcloudapi.com" ? ok({ TotalNumber: 1, Domains: [cdnDomain] }) : ssl(req)));
+      return runCli(["domains", "-s", "cdn", "--json"], { env: TENCENT_ENV, fetch });
+    };
+    const r = await run(sslRoute);
+    expect(r.json.data.items[0].cert).toEqual({ id: "ssl-1", name: "wild", notAfter: "2026-10-29T23:59:59.000Z" });
+    expect(r.json.data.issues).toEqual([]);
+
+    // SSL 列表拉不到（如没有只读权限）时退回 Message，不记 issue（到期时间 CDN 自己就有）
+    const denied = await run((req) => (req.url.host === "ssl.tencentcloudapi.com" ? tcError("UnauthorizedOperation", "no permission") : undefined));
+    expect(denied.json.data.items[0].cert).toEqual({ id: "ssl-1", name: "old-alias", notAfter: "2026-10-29T23:59:59.000Z" });
+    expect(denied.json.data.issues).toEqual([]);
+  });
+
+  it("CDN：没有开启 HTTPS 的域名时不拉 SSL 证书列表", async () => {
+    const fetch = fakeFetch((req) =>
+      req.url.host === "cdn.tencentcloudapi.com" ? ok({ TotalNumber: 1, Domains: [{ Domain: "dl.example.cn", Status: "online", Https: { Switch: "off" } }] }) : sslRoute(req),
+    );
+    await runCli(["domains", "-s", "cdn", "--json"], { env: TENCENT_ENV, fetch });
+    expect(fetch.calls.filter((c) => c.url.host === "ssl.tencentcloudapi.com")).toEqual([]);
+  });
+
   it("EdgeOne：逐站点查加速域名，多张证书取最早到期", async () => {
     const fetch = fakeFetch((req) => {
       if (req.action === "DescribeZones") return ok({ TotalCount: 2, Zones: [{ ZoneId: "zone-1", ZoneName: "example.io" }, { ZoneId: "zone-2", ZoneName: "broken.io" }] });

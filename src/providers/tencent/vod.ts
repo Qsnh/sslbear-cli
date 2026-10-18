@@ -8,7 +8,7 @@ import type { DomainRecord } from "../../types.js";
 import type { Deployer, DomainService, Warn } from "../registry.js";
 import { callTencent } from "./client.js";
 import { asPlatformDomain, isPlatformDomain } from "./platform.js";
-import { enrichFromSsl } from "./ssl.js";
+import { enrichFromSsl, explainMissingCn } from "./ssl.js";
 
 interface SubApp {
   SubAppId: number;
@@ -69,12 +69,14 @@ const deployer: Deployer<TencentCredentials> = {
     const record = target.records[0]!;
     const certId = await input.certId();
     const subAppId = record.extra?.subAppId;
-    await call(ctx, creds, "SetVodDomainCertificate", {
-      Domain: record.domain,
-      Operation: "Set",
-      CertID: certId,
-      ...(subAppId && { SubAppId: Number(subAppId) }),
-    });
+    await explainMissingCn(input.cert, "点播", ["FailedOperation"], () =>
+      call(ctx, creds, "SetVodDomainCertificate", {
+        Domain: record.domain,
+        Operation: "Set",
+        CertID: certId,
+        ...(subAppId && { SubAppId: Number(subAppId) }),
+      }),
+    );
     return { certId };
   },
 };

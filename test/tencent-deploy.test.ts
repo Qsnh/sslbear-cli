@@ -34,11 +34,17 @@ const apply = (key: string, route: (req: FakeRequest) => FakeReply, target: Depl
 const upload = (fetch: Fetch, cert: LocalCert = RSA) => tencent.uploadCertificate!(ctxOf(fetch), CREDS, cert);
 
 describe("tencent uploadCertificate（SSL 证书）", () => {
+  const sslList = (...ids: string[]) =>
+    ok({ TotalCount: ids.length, Certificates: ids.map((id) => ({ CertificateId: id, Alias: id, Domain: "example.com", CertEndTime: "2027-01-01 08:00:00" })) });
+
   it("UploadCertificate 带完整证书链与私钥，Repeatable=false 让服务端按指纹查重；未重复时返回新证书 ID", async () => {
-    const fetch = fakeFetch((req) => (req.action === "UploadCertificate" ? ok({ CertificateId: "new-1", RepeatCertId: "" }) : undefined));
+    const fetch = fakeFetch((req) => {
+      if (req.action === "DescribeCertificates") return sslList("other-1");
+      return req.action === "UploadCertificate" ? ok({ CertificateId: "new-1", RepeatCertId: "" }) : undefined;
+    });
     expect(await upload(fetch)).toEqual({ id: "new-1", reused: false });
-    expect(fetch.calls).toHaveLength(1);
-    const call = fetch.calls[0]!;
+    expect(fetch.calls.map((c) => c.action)).toEqual(["DescribeCertificates", "UploadCertificate"]);
+    const call = fetch.calls[1]!;
     expect(call.url.href).toBe("https://ssl.tencentcloudapi.com/");
     expect(call.method).toBe("POST");
     expect(call.headers["x-tc-version"]).toBe("2019-12-05");
@@ -52,36 +58,71 @@ describe("tencent uploadCertificate（SSL 证书）", () => {
   });
 
   it("同指纹证书已存在：返回 RepeatCertId 并标记 reused", async () => {
-    const fetch = fakeFetch((req) => (req.action === "UploadCertificate" ? ok({ CertificateId: "", RepeatCertId: "old-9" }) : undefined));
+    const fetch = fakeFetch((req) => {
+      if (req.action === "DescribeCertificates") return sslList("old-9");
+      return req.action === "UploadCertificate" ? ok({ CertificateId: "", RepeatCertId: "old-9" }) : undefined;
+    });
     expect(await upload(fetch)).toEqual({ id: "old-9", reused: true });
   });
 
-  it("超时后自动重试不会重复建证书：重发的仍是 Repeatable=false，首次已建成时服务端按指纹返回 RepeatCertId", async () => {
-    // 模拟首个请求在服务端已建成证书、客户端却超时：之后同指纹的上传都命中 RepeatCertId
+  it("实测查重命中时 RepeatCertId 为空、CertificateId 直接是已有证书的 ID：按上传前的证书列表判断为复用", async () => {
+    const fetch = fakeFetch((req) => {
+      if (req.action === "DescribeCertificates") return sslList("other-1", "old-9");
+      return req.action === "UploadCertificate" ? ok({ CertificateId: "old-9", RepeatCertId: "" }) : undefined;
+    });
+    expect(await upload(fetch)).toEqual({ id: "old-9", reused: true });
+  });
+
+  it("查询阶段已拉过 SSL 证书列表时直接用它判断，不再重复拉取", async () => {
+    const fetch = fakeFetch((req) => {
+      if (req.action === "DescribeCertificates") return sslList("old-9");
+      return req.action === "UploadCertificate" ? ok({ CertificateId: "old-9", RepeatCertId: "" }) : undefined;
+    });
+    const ctx = ctxOf(fetch);
+    await tencent.listCertificates!(ctx, CREDS);
+    expect(await tencent.uploadCertificate!(ctx, CREDS, RSA)).toEqual({ id: "old-9", reused: true });
+    expect(fetch.calls.map((c) => c.action)).toEqual(["DescribeCertificates", "UploadCertificate"]);
+  });
+
+  it("SSL 证书列表拉取失败（如没有只读权限）时照常上传，无法判断是否复用，按新上传报告", async () => {
+    const fetch = fakeFetch((req) => {
+      if (req.action === "DescribeCertificates") return tcError("UnauthorizedOperation", "no permission");
+      return req.action === "UploadCertificate" ? ok({ CertificateId: "old-9", RepeatCertId: "" }) : undefined;
+    });
+    expect(await upload(fetch)).toEqual({ id: "old-9", reused: false });
+    expect(fetch.calls.map((c) => c.action)).toEqual(["DescribeCertificates", "UploadCertificate"]);
+  });
+
+  it("超时后自动重试不会重复建证书：重发的仍是 Repeatable=false，首次已建成时按指纹命中同一张，仍报告为新上传", async () => {
+    // 模拟首个上传请求在服务端已建成证书、客户端却超时：重发时服务端查重命中刚建成的那张（实测 CertificateId 即其 ID）
     let created = false;
     const inner = fakeFetch((req) => {
+      if (req.action === "DescribeCertificates") return sslList("other-1");
       if (req.action !== "UploadCertificate") return undefined;
-      if (created) return ok({ CertificateId: "", RepeatCertId: "new-1" });
+      if (created) return ok({ CertificateId: "new-1", RepeatCertId: "" });
       created = true;
       return ok({ CertificateId: "new-1", RepeatCertId: "" });
     });
-    let n = 0;
+    let uploads = 0;
     const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       const res = await inner(input, init);
-      if (n++ === 0) throw Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
+      const isUpload = (init?.headers as Record<string, string> | undefined)?.["X-TC-Action"] === "UploadCertificate";
+      if (isUpload && uploads++ === 0) throw Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
       return res;
     }) as Fetch;
-    expect(await upload(fetch)).toEqual({ id: "new-1", reused: true });
-    expect(inner.calls).toHaveLength(2);
-    expect(inner.calls.map((c) => c.json?.Repeatable)).toEqual([false, false]);
-    expect(inner.calls[1]!.body).toBe(inner.calls[0]!.body);
+    expect(await upload(fetch)).toEqual({ id: "new-1", reused: false });
+    const sent = inner.calls.filter((c) => c.action === "UploadCertificate");
+    expect(sent).toHaveLength(2);
+    expect(sent.map((c) => c.json?.Repeatable)).toEqual([false, false]);
+    expect(sent[1]!.body).toBe(sent[0]!.body);
   });
 
   it("证书名里的 * 换成 _；没有 CN 时用第一个 SAN", async () => {
     const fetch = fakeFetch(() => ok({ CertificateId: "x" }));
     await upload(fetch, { ...RSA, commonName: "*.example.com" });
     await upload(fetch, { ...RSA, commonName: undefined, sans: ["*.a.example.com", "a.example.com"] });
-    expect(fetch.calls.map((c) => c.json?.Alias)).toEqual(["sslbear-_.example.com-20270101", "sslbear-_.a.example.com-20270101"]);
+    const aliases = fetch.calls.filter((c) => c.action === "UploadCertificate").map((c) => c.json?.Alias);
+    expect(aliases).toEqual(["sslbear-_.example.com-20270101", "sslbear-_.a.example.com-20270101"]);
   });
 
   it("上传失败抛 CloudApiError，带错误码与 RequestId", async () => {
@@ -406,6 +447,60 @@ describe("tencent vod 部署", () => {
     expect(d.unsupported?.(rec("vod", "eo.example.com", { extra: { type: "EdgeOne" } }), "update")).toContain("EdgeOne");
     expect(d.unsupported?.(rec("vod", "v.example.com", { status: "Locked", extra: { type: "VOD" } }), "update")).toContain("锁定");
     expect(d.unsupported?.(rec("vod", "v.example.com", { status: "Online", extra: { type: "VOD" } }), "update")).toBeUndefined();
+  });
+});
+
+describe("tencent 没有通用名（CN）的证书被 CDN / COS / 点播拒绝时说明原因", () => {
+  // 实测（2026-10）Let's Encrypt 短期证书（subject 为空、只有 SAN）：CDN 报「Https证书内容非法」，
+  // COS 报 InvalidDomainCertificate，点播只报 FailedOperation；直播照常接受
+  const NO_CN: LocalCert = { ...ECC, commonName: undefined };
+  const COS_EXTRA = { bucket: "static-1250000000", region: "ap-shanghai", type: "REST" };
+  const COS_ERR =
+    "<Error><Code>InvalidDomainCertificate</Code><Message>The certificate you provided could not parse common name, please check the certificate content</Message><RequestId>req-1</RequestId></Error>";
+  const cdnUpdate = (cert: LocalCert, reply: FakeReply) =>
+    apply("cdn", (req) => (req.action === "ModifyDomainConfig" ? reply : undefined), { mode: "update", records: [rec("cdn", "www.example.com")] }, inputOf(cert));
+
+  it("cdn update：FailedOperation.CdnConfigError 时补上原因，错误码与 RequestId 不变", async () => {
+    const { result } = cdnUpdate(NO_CN, tcError("FailedOperation.CdnConfigError", "Https证书内容非法"));
+    const err = await result.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CloudApiError);
+    expect(err).toMatchObject({ provider: "tencent", code: "FailedOperation.CdnConfigError", requestId: "rid-err" });
+    expect((err as Error).message).toMatch(/^Https证书内容非法（.*通用名.*CN.*CDN.*）$/);
+  });
+
+  it("cdn deploy：UpdateDomainConfig 被拒时同样补上原因", async () => {
+    const { result } = apply(
+      "cdn",
+      (req) => {
+        if (req.action === "DescribeDomainsConfig") return ok({ TotalNumber: 1, Domains: [{ Domain: "www.example.com", Https: { Switch: "off" } }] });
+        return req.action === "UpdateDomainConfig" ? tcError("FailedOperation.CdnConfigError", "Https证书内容非法") : undefined;
+      },
+      { mode: "deploy", records: [rec("cdn", "www.example.com", { https: false })] },
+      inputOf(NO_CN),
+    );
+    await expect(result).rejects.toMatchObject({ code: "FailedOperation.CdnConfigError", message: expect.stringContaining("通用名") });
+  });
+
+  it("cos：InvalidDomainCertificate 时补上原因", async () => {
+    const { result } = apply("cos", () => ({ status: 400, body: COS_ERR }), { mode: "update", records: [rec("cos", "img.example.com", { extra: COS_EXTRA })] }, inputOf(NO_CN));
+    await expect(result).rejects.toMatchObject({ code: "InvalidDomainCertificate", requestId: "req-1", httpStatus: 400, message: expect.stringContaining("通用名") });
+  });
+
+  it("vod：FailedOperation 时补上原因", async () => {
+    const { result } = apply(
+      "vod",
+      (req) => (req.action === "SetVodDomainCertificate" ? tcError("FailedOperation", "failed operation") : undefined),
+      { mode: "deploy", records: [rec("vod", "v.example.com", { https: false, extra: { type: "VOD", subAppId: "1500000002" } })] },
+      inputOf(NO_CN),
+    );
+    await expect(result).rejects.toMatchObject({ code: "FailedOperation", message: expect.stringMatching(/^failed operation（.*通用名.*点播.*）$/) });
+  });
+
+  it("证书有 CN、或是其他错误码时原样抛出", async () => {
+    const withCn = await cdnUpdate(ECC, tcError("FailedOperation.CdnConfigError", "Https证书内容非法")).result.catch((e: unknown) => e);
+    expect(withCn).toMatchObject({ code: "FailedOperation.CdnConfigError", message: "Https证书内容非法" });
+    const other = await cdnUpdate(NO_CN, tcError("UnauthorizedOperation.CdnCamUnauthorized", "no permission")).result.catch((e: unknown) => e);
+    expect(other).toMatchObject({ code: "UnauthorizedOperation.CdnCamUnauthorized", message: "no permission" });
   });
 });
 
