@@ -10,6 +10,8 @@ export interface BceRequest {
   method?: "GET" | "PUT" | "POST";
   /** JSON 请求体（证书、私钥只能放在这里，不能放在 URL 上） */
   body?: unknown;
+  /** 默认对限流、超时等自动重试；非幂等的写接口（上传证书）传 false，由调用方查重后自行重试 */
+  retry?: boolean;
 }
 
 interface BceErrorBody {
@@ -27,7 +29,7 @@ const THROTTLE = /RateLimit|TooManyRequests/i;
  * 错误以 HTTP 状态码表示，响应体为 {code, message, requestId}。
  */
 export async function callBce<T>(ctx: QueryContext, creds: AccessKeyCredentials, req: BceRequest): Promise<T> {
-  return withRetry(ctx, async () => {
+  const once = async (): Promise<T> => {
     const query = req.query ?? {};
     const method = req.method ?? "GET";
     const timestamp = bceTimestamp(new Date());
@@ -76,5 +78,6 @@ export async function callBce<T>(ctx: QueryContext, creds: AccessKeyCredentials,
       throw new CloudApiError("baidu", code, message, err.requestId, raw.status);
     }
     return body as T;
-  });
+  };
+  return req.retry === false ? once() : withRetry(ctx, once);
 }

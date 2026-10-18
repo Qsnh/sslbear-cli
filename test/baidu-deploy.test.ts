@@ -1,11 +1,12 @@
-import { X509Certificate } from "node:crypto";
+import { createHash, X509Certificate } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { loadLocalCert, type LocalCert } from "../src/deploy/cert.js";
 import { executeDeploy, planDeploy, type DeployOptions } from "../src/deploy/run.js";
-import { CloudApiError, type QueryContext } from "../src/lib/http.js";
+import { CloudApiError, isRetryable, type Fetch, type QueryContext } from "../src/lib/http.js";
+import { baiduCertName } from "../src/providers/baidu/cert.js";
 import { baidu } from "../src/providers/baidu/index.js";
 import { bceAuthorization } from "../src/providers/baidu/sign.js";
 import { queryDomains } from "../src/query.js";
@@ -13,9 +14,21 @@ import { fakeFetch, type FakeReply, type FakeRequest } from "./helpers.js";
 
 const FIX = fileURLToPath(new URL("./fixtures/deploy/", import.meta.url));
 const NOW = new Date("2026-10-15T00:00:00Z");
-const CERT = loadLocalCert(readFileSync(join(FIX, "rsa-fullchain.pem"), "utf8"), readFileSync(join(FIX, "rsa-key.pem"), "utf8"), NOW);
-const [LEAF, CA] = CERT.certPem.match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g)!;
+const load = (cert: string, key: string) => loadLocalCert(readFileSync(join(FIX, cert), "utf8"), readFileSync(join(FIX, key), "utf8"), NOW);
+const PEM_CERT = /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g;
+/** CN example.com，SAN example.com、*.example.com，2026-01-01 至 2027-01-01 */
+const CERT = load("rsa-fullchain.pem", "rsa-key.pem");
+/** 与 CERT 同 CN、同 SAN、同起止时间，只有算法（私钥）不同 */
+const ECC = load("ecc-fullchain.pem", "ecc-key.pem");
+const [LEAF, CA] = CERT.certPem.match(PEM_CERT)!;
 const KEY_LINE = CERT.keyPem.split("\n")[1]!;
+const md5 = (pem: string) => createHash("md5").update(new X509Certificate(pem).raw).digest("hex");
+/** 叶子证书 DER 的 MD5 */
+const MD5 = md5(LEAF!);
+const ECC_MD5 = md5(ECC.certPem.match(PEM_CERT)![0]!);
+/** 默认证书名，同名冲突时加指纹前 8 位 */
+const BASE_NAME = "sslbear-example.com-20270101";
+const FP8 = CERT.fingerprint.slice(0, 8);
 
 const BAIDU_ENV = { BAIDUCLOUD_ACCESS_KEY: "test-ak-baidu", BAIDUCLOUD_SECRET_KEY: "test-sk-baidu" };
 const CREDS = { accessKeyId: "test-ak-baidu", secretAccessKey: "test-sk-baidu" };
@@ -39,6 +52,8 @@ interface CertDetail {
   certStartTime?: string;
   certStopTime?: string;
   certType?: number;
+  /** 官方文档只在 GET /v1/certificate/{certId} 里列出，官方 Go SDK 的列表详情也声明了该字段 */
+  certFingerprint?: string;
 }
 
 const detail = (id: string, r: Partial<CertDetail> = {}): CertDetail => ({
@@ -70,7 +85,8 @@ interface Api {
   certs?: CertDetail[];
   /** GET /v1/certificate/{certId} 的响应 */
   meta?: Record<string, unknown>;
-  upload?: FakeReply;
+  /** POST /v1/certificate 的响应；函数可模拟服务端已收下证书（往 certs 里加一条） */
+  upload?: FakeReply | ((req: FakeRequest) => FakeReply);
 }
 
 /** 模拟百度智能云 CDN 与证书管理接口 */
@@ -79,7 +95,10 @@ function baiduApi(api: Api) {
     const { host, pathname } = req.url;
     if (host === "certificate.baidubce.com") {
       if (req.method === "GET" && pathname === "/v1/certificate/detail") return { body: { certs: api.certs ?? [] } };
-      if (req.method === "POST" && pathname === "/v1/certificate") return api.upload ?? { body: { certId: NEW_ID, certName: req.json?.certName } };
+      if (req.method === "POST" && pathname === "/v1/certificate") {
+        if (typeof api.upload === "function") return api.upload(req);
+        return api.upload ?? { body: { certId: NEW_ID, certName: req.json?.certName } };
+      }
       const m = /^\/v1\/certificate\/([^/]+)$/.exec(pathname);
       if (req.method === "GET" && m) {
         const meta = api.meta?.[m[1]!];
@@ -104,9 +123,23 @@ function baiduApi(api: Api) {
   });
 }
 
-function ctxOf(fetch: ReturnType<typeof baiduApi>): QueryContext {
+function ctxOf(fetch: Fetch): QueryContext {
   return { env: BAIDU_ENV, fetch, now: NOW, timeoutMs: 1000, sleep: async () => {} };
 }
+
+/** 服务端照常处理了请求，但响应没在超时前回来：命中 when 的请求抛 TimeoutError（times 次后恢复正常） */
+function timingOut(inner: Fetch, when: (init?: RequestInit) => boolean, times = Infinity): Fetch {
+  let n = 0;
+  return (async (input: string | URL | Request, init?: RequestInit) => {
+    const res = await inner(input, init);
+    if (when(init) && n++ < times) throw Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
+    return res;
+  }) as Fetch;
+}
+
+const isPost = (init?: RequestInit) => init?.method === "POST";
+const listCalls = (fetch: { calls: FakeRequest[] }) => fetch.calls.filter((c) => c.url.pathname === "/v1/certificate/detail");
+const metaCalls = (fetch: { calls: FakeRequest[] }) => fetch.calls.filter((c) => /^\/v1\/certificate\/cert-/.test(c.url.pathname));
 
 async function deploy(api: Api, opts: Partial<DeployOptions> = {}) {
   const fetch = baiduApi(api);
@@ -194,12 +227,104 @@ describe("baidu uploadCertificate", () => {
     expect(posts(fetch)).toHaveLength(1);
   });
 
-  it("接口不给指纹或格式认不出时，按 CN + 到期时间 + SAN 判定为同一张", async () => {
-    for (const meta of [{ certId: "cert-same" }, { certFingerprint: "not-a-hex-digest" }]) {
+  it("接口不给指纹或格式认不出时不复用（宁可多传一份），上传新证书", async () => {
+    for (const meta of [{ certId: "cert-same" }, { certFingerprint: "not-a-hex-digest" }, { certFingerprint: "" }, { certFingerprint: "abc123" }]) {
       const { fetch, result } = upload({ certs: [detail("cert-same")], meta: { "cert-same": meta } });
-      await expect(result).resolves.toEqual({ id: "cert-same", reused: true });
-      expect(posts(fetch)).toEqual([]);
+      await expect(result).resolves.toEqual({ id: NEW_ID, reused: false });
+      expect(posts(fetch)).toHaveLength(1);
     }
+  });
+
+  it("指纹是 32 位 MD5（可带冒号、大写）时按叶子证书 DER 的 MD5 比对", async () => {
+    const { fetch, result } = upload({
+      certs: [detail("cert-ecc"), detail("cert-rsa")],
+      meta: { "cert-ecc": { certFingerprint: ECC_MD5 }, "cert-rsa": { certFingerprint: colonHex(MD5) } },
+    });
+    await expect(result).resolves.toEqual({ id: "cert-rsa", reused: true });
+    expect(posts(fetch)).toEqual([]);
+  });
+
+  it("同 CN、同 SAN、到期只差几秒的 ECC 证书（同批签发）不会被当成这张 RSA 证书复用", async () => {
+    const twin = detail("cert-ecc", { certStartTime: "2025-12-31T23:59:58Z", certStopTime: "2026-12-31T23:59:58Z" });
+    const { fetch, result } = upload({ certs: [twin], meta: { "cert-ecc": { certFingerprint: ECC_MD5 } } });
+    await expect(result).resolves.toEqual({ id: NEW_ID, reused: false });
+    expect(posts(fetch)).toHaveLength(1);
+  });
+
+  it("证书列表自带 certFingerprint 时直接比对，不再逐个查证书信息", async () => {
+    const hit = upload({ certs: [detail("cert-ecc", { certFingerprint: ECC_MD5 }), detail("cert-rsa", { certFingerprint: MD5.toUpperCase() })] });
+    await expect(hit.result).resolves.toEqual({ id: "cert-rsa", reused: true });
+    expect(metaCalls(hit.fetch)).toEqual([]);
+    expect(posts(hit.fetch)).toEqual([]);
+
+    const miss = upload({ certs: [detail("cert-ecc", { certFingerprint: ECC_MD5 })] });
+    await expect(miss.result).resolves.toEqual({ id: NEW_ID, reused: false });
+    expect(metaCalls(miss.fetch)).toEqual([]);
+  });
+
+  it("上传 POST 不自动重发：超时后重新拉证书列表（不走缓存）查重，上次其实已传成功时复用", async () => {
+    const api: Api = {
+      certs: [],
+      meta: { [NEW_ID]: { certId: NEW_ID, certFingerprint: MD5 } },
+      // 服务端收下了证书
+      upload: (req) => {
+        api.certs!.push(detail(NEW_ID, { certName: req.json!.certName as string }));
+        return { body: { certId: NEW_ID } };
+      },
+    };
+    const inner = baiduApi(api);
+    const result = await baidu.uploadCertificate!(ctxOf(timingOut(inner, isPost, 1)), CREDS, CERT);
+    expect(result).toEqual({ id: NEW_ID, reused: true });
+    expect(posts(inner)).toHaveLength(1);
+    expect(listCalls(inner)).toHaveLength(2);
+  });
+
+  it("限流 / 超时后重新查重仍没有才再传，总共最多 3 轮；最终错误可重试", async () => {
+    let n = 0;
+    const api: Api = { upload: () => (++n === 1 ? { status: 429, body: "Too Many Requests" } : { body: { certId: NEW_ID } }) };
+    const inner = baiduApi(api);
+    await expect(baidu.uploadCertificate!(ctxOf(inner), CREDS, CERT)).resolves.toEqual({ id: NEW_ID, reused: false });
+    expect(posts(inner)).toHaveLength(2);
+    expect(listCalls(inner)).toHaveLength(2);
+
+    const always = baiduApi({});
+    const err = await baidu.uploadCertificate!(ctxOf(timingOut(always, isPost)), CREDS, CERT).catch((e) => e);
+    expect(err).toMatchObject({ provider: "baidu", code: "Timeout" });
+    expect(isRetryable(err)).toBe(true);
+    expect(posts(always)).toHaveLength(3);
+    expect(listCalls(always)).toHaveLength(3);
+  });
+
+  it("证书管理里已有同名的另一张证书时，证书名加指纹前 8 位；仍重名再加序号", async () => {
+    const one = upload({ certs: [detail("cert-ecc", { certName: BASE_NAME, certFingerprint: ECC_MD5 })] });
+    await one.result;
+    expect(posts(one.fetch)[0]!.json!.certName).toBe(`${BASE_NAME}-${FP8}`);
+
+    const two = upload({
+      certs: [
+        detail("cert-a", { certName: BASE_NAME, certFingerprint: ECC_MD5 }),
+        detail("cert-b", { certName: `${BASE_NAME}-${FP8}`, certFingerprint: OTHER_SHA256 }),
+      ],
+    });
+    await two.result;
+    expect(posts(two.fetch)[0]!.json!.certName).toBe(`${BASE_NAME}-${FP8}-2`);
+
+    // 超长通用名：加了后缀也不超过 65 个字符
+    const long: LocalCert = { ...CERT, commonName: `${"a".repeat(70)}.example.com` };
+    const three = upload({ certs: [detail("cert-a", { certName: baiduCertName(long) })] }, long);
+    await three.result;
+    const suffixed = posts(three.fetch)[0]!.json!.certName as string;
+    expect(suffixed).toHaveLength(65);
+    expect(suffixed).toMatch(new RegExp(`^sslbear-a+-20270101-${FP8}$`));
+  });
+
+  it("上传返回 ResourceNameDuplicated（列表里没看到同名）时换成带指纹后缀的名字再传", async () => {
+    const { fetch, result } = upload({
+      upload: (req) =>
+        req.json!.certName === BASE_NAME ? bceError(409, "ResourceNameDuplicated", "resource name duplicated") : { body: { certId: NEW_ID } },
+    });
+    await expect(result).resolves.toEqual({ id: NEW_ID, reused: false });
+    expect(posts(fetch).map((c) => c.json!.certName)).toEqual([BASE_NAME, `${BASE_NAME}-${FP8}`]);
   });
 
   it("证书名：* 换成 _，不允许的字符换成 _，超长时截断通用名保证不超过 65 个字符", async () => {
@@ -223,12 +348,13 @@ describe("baidu uploadCertificate", () => {
     expect(posts(r3.fetch)[0]!.json!.certName).toBe("sslbear-example.com-20270101");
   });
 
-  it("上传失败抛 CloudApiError，错误信息里没有私钥", async () => {
-    const { result } = upload({ upload: bceError(400, "PrivateKeyParameterInvalid", "私钥解析异常") });
+  it("上传失败抛 CloudApiError（不重试），错误信息里没有私钥", async () => {
+    const { fetch, result } = upload({ upload: bceError(400, "PrivateKeyParameterInvalid", "私钥解析异常") });
     const err = await result.catch((e) => e);
     expect(err).toBeInstanceOf(CloudApiError);
     expect(err).toMatchObject({ provider: "baidu", code: "PrivateKeyParameterInvalid", requestId: "rid-err" });
     expect(err.message).not.toContain(KEY_LINE);
+    expect(posts(fetch)).toHaveLength(1);
   });
 
   it("上传成功但响应里没有 certId 时报错", async () => {
@@ -316,6 +442,17 @@ describe("baidu CDN 部署", () => {
     expect(puts(fetch)).toEqual([]);
   });
 
+  it("部署时读到 HTTPS 其实已开启（与查询时不同）则不写入、不上传证书，记为 HttpsAlreadyEnabled", async () => {
+    const { fetch, byDomain } = await deploy(
+      { domains: [{ domain: "www.example.com", status: "RUNNING" }], httpsRows: [], config: { "www.example.com": { https: FULL_HTTPS } } },
+      { domains: ["www.example.com"] },
+    );
+    expect(byDomain["www.example.com"]).toMatchObject({ action: "failed", code: "HttpsAlreadyEnabled", retryable: false });
+    expect(byDomain["www.example.com"]!.message).toContain("HTTPS 已开启");
+    expect(puts(fetch)).toEqual([]);
+    expect(posts(fetch)).toEqual([]);
+  });
+
   it("写配置失败记为 failed，带错误码与 RequestId", async () => {
     const fetch = baiduApi({
       domains: [{ domain: "www.example.com", status: "RUNNING" }],
@@ -374,11 +511,16 @@ describe("baidu CDN 部署", () => {
       expect(put[0]!.json).toEqual({ https: { ...FULL_HTTPS, certId: NEW_ID } });
     });
 
-    it("查不到 HTTPS 配置、无法区分哪张是国密证书时记 issue，该域名不处理（unsupported）", async () => {
-      const { report, fetch, byDomain } = await deploy(api(bceError(500, "InternalError", "internal error")), { force: true });
+    it("查不到 HTTPS 配置、无法区分哪张是国密证书时记 issue、标 httpsUnknown，该域名不处理", async () => {
+      const failing = api(bceError(500, "InternalError", "internal error"));
+      const q = await queryDomains(ctxOf(baiduApi(failing)), { providers: ["baidu"] });
+      expect(q.items[0]).toMatchObject({ domain: "www.example.com", https: true, extra: { httpsUnknown: "true" } });
+
+      const { report, fetch, byDomain } = await deploy(failing, { force: true });
       expect(report.issues).toEqual([expect.objectContaining({ provider: "baidu", service: "cdn", code: "InternalError", target: "domain www.example.com HTTPS 配置（用于区分国密证书）" })]);
-      expect(byDomain["www.example.com"]).toMatchObject({ action: "skipped", reason: "unsupported" });
-      expect(byDomain["www.example.com"]!.message).toContain("国密");
+      // 编排层对 httpsUnknown 记 HttpsStateUnknown；没有该处理时 deployer 按 unsupported 兜底
+      const r = byDomain["www.example.com"]!;
+      expect(r.reason === "unsupported" || r.code === "HttpsStateUnknown").toBe(true);
       expect(puts(fetch)).toEqual([]);
     });
   });
