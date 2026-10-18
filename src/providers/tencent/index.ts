@@ -3,7 +3,7 @@ import { defineProvider } from "../registry.js";
 import { cdn } from "./cdn.js";
 import { cos } from "./cos.js";
 import { live } from "./live.js";
-import { listSslCertificates } from "./ssl.js";
+import { listSslCertificates, uploadSslCertificate } from "./ssl.js";
 import { teo } from "./teo.js";
 import { vod } from "./vod.js";
 
@@ -22,5 +22,6 @@ export const tencent = defineProvider<TencentCredentials>({
   readCredentials: readTencent,
   services: [cdn, teo, cos, live, vod],
   listCertificates: listSslCertificates,
+  uploadCertificate: uploadSslCertificate,
   isInactive: (code) => INACTIVE_CODES.has(code),
 });

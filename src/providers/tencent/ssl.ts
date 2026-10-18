@@ -1,5 +1,6 @@
+import type { LocalCert } from "../../deploy/cert.js";
 import type { TencentCredentials } from "../../lib/env.js";
-import type { QueryContext } from "../../lib/http.js";
+import { CloudApiError, type QueryContext } from "../../lib/http.js";
 import { compact } from "../../lib/compact.js";
 import { memo, paginate } from "../../lib/paginate.js";
 import { toIso } from "../../lib/time.js";
@@ -110,4 +111,36 @@ export async function enrichFromSsl(
     });
   }
   return records;
+}
+
+/** 上传后在 SSL 证书列表里的备注名：sslbear-<CN，* 换成 _>-<到期日 YYYYMMDD（UTC）> */
+export function certAlias(cert: LocalCert): string {
+  const name = (cert.commonName ?? cert.sans[0] ?? "cert").replace(/\*/g, "_");
+  return `sslbear-${name}-${cert.notAfter.slice(0, 10).replace(/-/g, "")}`;
+}
+
+/**
+ * 上传证书到 SSL 证书服务。Repeatable=false 时服务端按指纹查重：已有同一张证书则不新建，
+ * 在 RepeatCertId 里返回已有证书的 ID（CertificateId 为空），所以不必先拉证书列表比对。
+ */
+export async function uploadSslCertificate(
+  ctx: QueryContext,
+  creds: TencentCredentials,
+  cert: LocalCert,
+): Promise<{ id: string; reused: boolean }> {
+  const res = await callTencent<{ CertificateId?: string | null; RepeatCertId?: string | null; RequestId?: string }>(ctx, creds, {
+    service: "ssl",
+    version: "2019-12-05",
+    action: "UploadCertificate",
+    payload: {
+      CertificatePublicKey: cert.certPem,
+      CertificatePrivateKey: cert.keyPem,
+      CertificateType: "SVR",
+      Alias: certAlias(cert),
+      Repeatable: false,
+    },
+  });
+  if (res.RepeatCertId) return { id: res.RepeatCertId, reused: true };
+  if (res.CertificateId) return { id: res.CertificateId, reused: false };
+  throw new CloudApiError("tencent", "InvalidResponse", "上传证书的响应里没有证书 ID", res.RequestId);
 }
