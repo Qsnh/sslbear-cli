@@ -1,9 +1,10 @@
+import { DNS_DEFS, type DnsDefs } from "./dns/index.js";
 import { mask, type Env } from "./lib/env.js";
 import { renderTable } from "./lib/table.js";
 import { formatDate } from "./lib/time.js";
-import { envKeyStatus } from "./providers/registry.js";
+import { envKeyStatus, type EnvKeyStatus } from "./providers/registry.js";
 import { PROVIDER_DEFS } from "./query.js";
-import { PROVIDER_LABEL, type CertificateRecord, type DomainRecord, type Provider } from "./types.js";
+import { DNS_VENDORS, PROVIDER_LABEL, PROVIDERS, type CertificateRecord, type DomainRecord, type Provider } from "./types.js";
 
 function serviceLabel(provider: Provider, key: string): string {
   return PROVIDER_DEFS[provider].services.find((s) => s.key === key)?.label ?? key;
@@ -72,17 +73,30 @@ export function envStatus(env: Env) {
   });
 }
 
+/** issue 命令可用的 DNS 服务商；前 5 家与云厂商共用凭证，状态与上面的云厂商一致 */
+export function dnsEnvStatus(env: Env, defs: DnsDefs = DNS_DEFS) {
+  return DNS_VENDORS.map((v) => ({ provider: v, state: defs[v].readCredentials(env).state, keys: defs[v].envKeys(env) }));
+}
+
 const STATE_LABEL = { ok: "已配置", missing: "未配置", incomplete: "配置不完整" } as const;
 
-export function renderEnv(env: Env, envFile?: string): string {
+function keyLine(k: EnvKeyStatus): string {
+  const value = k.set ? (k.masked ? `= ${k.masked}` : "已设置") : k.required ? "未设置（必填）" : "未设置（可选）";
+  return `  ${k.name} ${value}`;
+}
+
+export function renderEnv(env: Env, envFile?: string, dnsDefs: DnsDefs = DNS_DEFS): string {
   const lines = [`.env 文件：${envFile ?? "未加载（当前目录不存在 .env）"}`, ""];
   for (const s of envStatus(env)) {
     lines.push(`${PROVIDER_LABEL[s.provider]}（${s.provider}）：${STATE_LABEL[s.state]}`);
-    for (const k of s.keys) {
-      const value = k.set ? (k.masked ? `= ${k.masked}` : "已设置") : k.required ? "未设置（必填）" : "未设置（可选）";
-      lines.push(`  ${k.name} ${value}`);
-    }
-    lines.push(`  可查询服务：${s.services.join(", ")}`, "");
+    lines.push(...s.keys.map(keyLine), `  可查询服务：${s.services.join(", ")}`, "");
+  }
+  lines.push("DNS 服务商（issue 用）：", "");
+  for (const s of dnsEnvStatus(env, dnsDefs)) {
+    const label = `${dnsDefs[s.provider].label}（${s.provider}）：${STATE_LABEL[s.state]}`;
+    // 与云厂商共用凭证的不再重复列变量
+    if ((PROVIDERS as readonly string[]).includes(s.provider)) lines.push(`${label}（与${PROVIDER_LABEL[s.provider as Provider]}共用凭证）`);
+    else lines.push(label, ...s.keys.map(keyLine));
   }
   return lines.join("\n").trimEnd();
 }

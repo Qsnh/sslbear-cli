@@ -1,10 +1,21 @@
+import type { KeyObject } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { Command, Option } from "commander";
 import { loadLocalCert } from "./deploy/cert.js";
 import { renderConfirm, renderDeploy } from "./deploy/render.js";
 import { buildPlan, executeDeploy, queryForDeploy, type DeployOptions, type DeployPlan, type DeployReport } from "./deploy/run.js";
-import { envStatus, renderCerts, renderDomains, renderEnv } from "./render.js";
+import { DNS_DEFS, type DnsDefs } from "./dns/index.js";
+import { createAcmeClient } from "./issue/acme.js";
+import { generateCertKey } from "./issue/csr.js";
+import { parseDomains } from "./issue/domains.js";
+import { systemDnsLookup, type DnsLookup } from "./issue/propagation.js";
+import { issueNotes, leftoverNotes, printProgress, renderIssue } from "./issue/render.js";
+import { IssueError, runIssue, type AcmeFactory, type DnsResult, type IssueReport } from "./issue/run.js";
+import type { KeyType } from "./issue/types.js";
+import type { DnsIssue } from "./issue/zones.js";
+import { dnsEnvStatus, envStatus, renderCerts, renderDomains, renderEnv } from "./render.js";
 import { familyNames, loadEnvFile, type Env } from "./lib/env.js";
 import type { Fetch, QueryContext } from "./lib/http.js";
 import { ExitError, fail, outJson, type OutputOptions } from "./lib/output.js";
@@ -18,7 +29,7 @@ import {
   type ProviderDefs,
   type QueryIssue,
 } from "./query.js";
-import { PROVIDERS, type Provider } from "./types.js";
+import { DNS_VENDORS, PROVIDERS, type DnsVendor, type Provider } from "./types.js";
 import { VERSION } from "./version.js";
 
 export interface Deps {
@@ -33,6 +44,13 @@ export interface Deps {
   confirm?: (question: string) => Promise<boolean>;
   /** 只供测试注入假的云厂商定义（deploy 用）；缺省为 PROVIDER_DEFS */
   defs?: ProviderDefs;
+  /** 用户主目录：issue 的状态目录默认在 <主目录>/.sslbear-cli；缺省为 os.homedir()，测试注入临时目录 */
+  home?: string;
+  /** 以下只供测试注入（issue 用）：DNS 服务商定义（缺省 DNS_DEFS）、权威 DNS 查询（缺省 node:dns）、ACME 客户端、证书私钥生成 */
+  dnsDefs?: DnsDefs;
+  dnsLookup?: DnsLookup;
+  acme?: AcmeFactory;
+  generateKey?: (type: KeyType) => KeyObject;
 }
 
 interface CommonOpts {
@@ -57,6 +75,20 @@ interface DeployCliOpts extends CommonOpts {
   domain?: string[];
   force?: boolean;
   dryRun?: boolean;
+  timeout: number;
+}
+
+interface IssueCliOpts extends CommonOpts {
+  domain?: string[];
+  keyType: KeyType;
+  out?: string;
+  dns?: string[];
+  email?: string;
+  staging?: boolean;
+  force?: boolean;
+  dryRun?: boolean;
+  /** 秒 */
+  dnsTimeout: number;
   timeout: number;
 }
 
@@ -95,8 +127,31 @@ function validateServices(list: string[] | undefined): string[] | undefined {
   return list && [...new Set(list)];
 }
 
-/** 每家云厂商的全部凭证变量为一组：shell 里设置了其中任何一个，就不再从 .env 读这家的凭证 */
-const CREDENTIAL_GROUPS = Object.values(PROVIDER_DEFS).map((d) => familyNames(d.envFamilies));
+function validateDnsVendors(list: string[] | undefined): DnsVendor[] | undefined {
+  if (list?.length === 0) throw new UsageError("--dns 不能为空");
+  for (const v of list ?? []) {
+    if (!DNS_VENDORS.includes(v as DnsVendor)) throw new UsageError(`不支持的 DNS 服务商 "${v}"，可选：${DNS_VENDORS.join(", ")}`);
+  }
+  return list && ([...new Set(list)] as DnsVendor[]);
+}
+
+function keyTypeArg(value: string): KeyType {
+  const v = value.trim().toLowerCase();
+  if (v !== "rsa" && v !== "ecc") throw new UsageError(`--key-type 只能是 rsa 或 ecc，收到 "${value}"`);
+  return v;
+}
+
+/** 只挡明显写错的：ACME 账号邮箱由 CA 最终校验 */
+const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/**
+ * 每家的全部凭证变量为一组：shell 里设置了其中任何一个，就不再从 .env 读这家的凭证。
+ * 云厂商一家一组；DNS 专用服务商（Cloudflare、AWS 等）各一组，与云厂商共用凭证的 5 家已包含在云厂商里
+ */
+const CREDENTIAL_GROUPS = [
+  ...Object.values(PROVIDER_DEFS).map((d) => familyNames(d.envFamilies)),
+  ...DNS_VENDORS.filter((v) => !(PROVIDERS as readonly string[]).includes(v)).map((v) => [...DNS_DEFS[v].envNames]),
+];
 
 /** 环境变量快照 + .env 文件：显式 --env-file 不存在时报错，默认的 ./.env 不存在则忽略 */
 function loadEnv(deps: Deps, opts: CommonOpts): { env: Env; envFile?: string } {
@@ -275,9 +330,74 @@ HttpsAlreadyEnabled / HttpsDisabled（写入前发现 HTTPS 已开启 / 关闭�
   sslbear-cli deploy --cert fullchain.pem --key privkey.pem --json
   sslbear-cli deploy --cert fullchain.pem --key privkey.pem -d www.example.com,api.example.com --force --json`;
 
+/** 输出给调用方的数据：只有 --dry-run 带 dryRun；cert 在复用或签发成功时才有 */
+function issueData(r: IssueReport) {
+  const head = { reused: r.reused, staging: r.staging, files: r.files };
+  const tail = { ...(r.cert && { cert: r.cert }), dns: r.dns, issues: r.issues };
+  return r.dryRun ? { dryRun: true, ...head, ...tail } : { ...head, ...tail };
+}
+
+/** 失败时：表格模式先在 stderr 列出被跳过 / 出错的服务商和需要手动删除的记录，再给出错误；JSON 模式全部平铺在错误对象里 */
+function failIssue(opts: OutputOptions, e: IssueError): never {
+  if (!opts.json) {
+    const notes = [...issueNotes((e.extra.issues as DnsIssue[] | undefined) ?? []), ...leftoverNotes((e.extra.dns as DnsResult[] | undefined) ?? [])];
+    for (const line of notes) console.error(line);
+  }
+  fail(opts, e.status, e.message, 1, e.extra);
+}
+
+const ISSUE_DESCRIPTION = `向 Let's Encrypt 申请证书（ACME DNS-01 验证），产出 fullchain.pem + privkey.pem，可直接用于 deploy --cert / --key。
+自动在域名所在的 DNS 服务商添加 _acme-challenge TXT 记录，验证完自动删除。签发通常需要 1~2 分钟。
+首次运行会自动注册 Let's Encrypt 账号，即视为同意 Let's Encrypt 订阅协议（https://letsencrypt.org/repository/）。
+
+签发规则：
+  - -d 逗号分隔、可重复，最多 100 个；*.example.com 只覆盖一级子域，不含 example.com 本身（需要的话两个都写）
+  - 自动找出每个域名由哪家 DNS 服务商解析：取最长后缀匹配的 zone（子域单独托管时以子域为准）；
+    多家都托管了同一个 zone 时按域名实际的 NS 记录判定，判定不了须用 --dns 指定
+  - 证书默认保存在 ~/.sslbear-cli/certs/<第一个域名>_<rsa|ecc>/（* 换成 _，测试环境再加 _staging），--out 可改；
+    目录 700、privkey.pem 600、fullchain.pem 644（环境变量 SSLBEAR_CLI_HOME 可改 ~/.sslbear-cli 的位置）
+  - 保存位置已有同一组域名（不计顺序）、同算法、同为正式 / 测试环境且剩余 30 天以上的证书时直接复用（reused: true），
+    不申请新证书，重复执行是安全的（--dry-run 也一样）；--force 才重新签发
+  - 续签（保存位置有旧证书）时带 ARI 续签标识；证书带 CN（Let's Encrypt classic 配置文件），国内云服务都能用
+  - 只增删 _acme-challenge 下本次添加的 TXT 值，不动其他记录；删除失败的记录在结果里列出，须手动删除
+  - 不支持 _acme-challenge 已 CNAME 到其他域名的 DNS 别名模式
+  - DNS 服务商凭证：sslbear-cli env 的「DNS 服务商」部分；默认使用所有已配置凭证的，配置不完整的跳过并记进 issues`;
+
+const ISSUE_HELP_AFTER = `
+--json 结果：
+  data.files.cert / data.files.key  证书与私钥的绝对路径，直接用作 deploy --cert / --key
+  data.cert                         证书信息：commonName、sans、notBefore、notAfter、algorithm、fingerprint、issuer（字段含义同 deploy 输出的 cert）
+  data.dns[]                        每个需要验证的域名一项（CA 复用了近期验证的不列，复用证书时为空）；
+                                    cleaned: false 表示该记录删除失败（message 写明原因），须转告用户手动删除
+  data.issues[]                     列 zone 失败、凭证不完整被跳过的 DNS 服务商
+  --dry-run 时 data.dryRun: true，dns 列出每个域名用哪家、哪个 zone、要加的记录名；复用时带 cert
+
+失败时 stderr 输出一行 {"ok":false,"status","message","retryable",…,"dns","issues"}，retryable: true 表示可稍后原样重试；
+本次添加的 TXT 记录失败时也已删除，删除失败的在 dns 里 cleaned: false。status：
+  ZoneNotFound           域名不在任何所选服务商的 zone 里（domains 列出这些域名，issues 带上列 zone 失败的服务商，多半是缺权限）
+  ZoneAmbiguous          多家服务商都托管了这个 zone，按 NS 无法判定（domain、providers），请用 --dns 指定
+  DnsRecordFailed        添加 TXT 记录失败，多半是缺写权限（provider、code、requestId）
+  DnsPropagationTimeout  超过 --dns-timeout 仍未在权威 DNS 上看到 TXT 记录（message 说明域名实际的 NS 是否指向该服务商）
+  AcmeChallengeFailed    CA 验证失败（domain、acmeType、detail）
+  AcmeRateLimited        触发 Let's Encrypt 频率限制（retryAfter：多少秒后可重试，有的话）
+  AcmeError              其他 ACME 错误，含网络错误（acmeType）
+
+退出码：
+  0  签发成功，或复用了现有证书
+  1  签发失败（status 见上）
+  2  参数或凭证配置错误（status 为 UsageError，未调用任何接口、未修改 DNS）
+
+示例：
+  sslbear-cli issue -d example.com,*.example.com --dry-run --json
+  sslbear-cli issue -d example.com,*.example.com --json
+  sslbear-cli issue -d www.example.com --key-type ecc --dns cloudflare --json
+  sslbear-cli issue -d example.com --staging            # 演练：测试环境的证书不受浏览器信任`;
+
 export function buildProgram(deps: Deps, output: OutputOptions = { json: false }): Command {
   const program = new Command("sslbear-cli")
-    .description("证书熊 CLI：查询阿里云、腾讯云、火山引擎、华为云、百度智能云、七牛云等云服务上的域名及其 SSL 证书，并可把本地证书部署 / 更新到这些域名（凭证从环境变量读取）")
+    .description(
+      "证书熊 CLI：查询阿里云、腾讯云、火山引擎、华为云、百度智能云、七牛云等云服务上的域名及其 SSL 证书，向 Let's Encrypt 申请证书（自动设置 DNS 验证记录），并可把证书部署 / 更新到这些域名（凭证从环境变量读取）",
+    )
     .version(VERSION)
     .exitOverride();
   // JSON 模式下参数错误由 run() 统一输出为 JSON，屏蔽 commander 自带的文本报错与帮助
@@ -349,15 +469,76 @@ export function buildProgram(deps: Deps, output: OutputOptions = { json: false }
       emitDeploy(out, sel.dryRun ? plan.report : await executeDeploy(ctx, cert, plan));
     });
 
+  withCommon(
+    program
+      .command("issue")
+      .summary("向 Let's Encrypt 申请证书，自动添加 / 删除 DNS 验证记录（会临时修改 DNS 解析）")
+      .description(ISSUE_DESCRIPTION)
+      .requiredOption("-d, --domain <list>", "要签发的域名，逗号分隔、可重复；支持泛域名 *.example.com（只覆盖一级子域，不含 example.com 本身）。最多 100 个", csv)
+      .addOption(new Option("--key-type <type>", "rsa（RSA 2048）或 ecc（ECDSA P-256）").default("rsa").argParser(keyTypeArg))
+      .option("--out <dir>", "证书保存目录（写 fullchain.pem、privkey.pem）；默认 ~/.sslbear-cli/certs/<目录名>/")
+      .option("--dns <list>", `只在这些 DNS 服务商里查找域名，逗号分隔（${DNS_VENDORS.join(", ")}）；默认所有已配置凭证的`, csv)
+      .option("--email <email>", "ACME 账号联系邮箱（可选；Let's Encrypt 已不发到期提醒邮件）")
+      .option("--staging", "使用 Let's Encrypt 测试环境（证书不受浏览器信任，用于演练；保存目录名带 _staging，不会覆盖正式证书）")
+      .option("--force", "已有可复用的证书也重新签发（会占用 Let's Encrypt 配额）")
+      .option("--dry-run", "只检查凭证、找出每个域名由哪家 DNS 解析，不申请证书、不改 DNS")
+      .addOption(
+        new Option("--dns-timeout <秒>", "等待 TXT 记录在权威 DNS 上生效的最长时间").default(300).argParser(intArg("--dns-timeout", 10, 3600)),
+      ),
+  )
+    .addHelpText("after", ISSUE_HELP_AFTER)
+    .action(async (opts: IssueCliOpts) => {
+      const out = { json: !!opts.json };
+      const domains = parseDomains(opts.domain ?? []);
+      const dns = validateDnsVendors(opts.dns);
+      if (opts.email !== undefined && !EMAIL.test(opts.email.trim())) throw new UsageError(`--email 不是合法的邮箱地址："${opts.email}"`);
+      const ctx = createContext(deps, opts);
+      let report: IssueReport;
+      try {
+        report = await runIssue(
+          ctx,
+          {
+            domains,
+            keyType: opts.keyType,
+            ...(opts.out && { out: resolve(deps.cwd, opts.out) }),
+            ...(dns && { dns }),
+            ...(opts.email && { email: opts.email.trim() }),
+            staging: !!opts.staging,
+            force: !!opts.force,
+            dryRun: !!opts.dryRun,
+            dnsTimeoutMs: opts.dnsTimeout * 1000,
+          },
+          {
+            home: deps.home ?? homedir(),
+            cwd: deps.cwd,
+            dnsDefs: deps.dnsDefs ?? DNS_DEFS,
+            dnsLookup: deps.dnsLookup ?? systemDnsLookup,
+            acme: deps.acme ?? createAcmeClient,
+            generateKey: deps.generateKey ?? generateCertKey,
+            ...(!out.json && { progress: printProgress }),
+          },
+        );
+      } catch (e) {
+        if (e instanceof IssueError) failIssue(out, e);
+        throw e;
+      }
+      if (out.json) outJson(issueData(report));
+      else {
+        console.log(renderIssue(report, ctx.now));
+        for (const line of issueNotes(report.issues)) console.error(line);
+      }
+    });
+
   program
     .command("env")
-    .description("检查环境变量里的云厂商凭证配置（脱敏显示）")
+    .description("检查环境变量里的云厂商与 DNS 服务商凭证配置（脱敏显示）")
     .option("--json", "输出单行 JSON")
     .option("--env-file <path>", "从指定文件加载环境变量（默认加载当前目录的 .env，若存在）")
     .action((opts: CommonOpts) => {
       const { env, envFile } = loadEnv(deps, opts);
-      if (opts.json) outJson({ envFile: envFile ?? null, providers: envStatus(env) });
-      else console.log(renderEnv(env, envFile));
+      const dnsDefs = deps.dnsDefs ?? DNS_DEFS;
+      if (opts.json) outJson({ envFile: envFile ?? null, providers: envStatus(env), dns: dnsEnvStatus(env, dnsDefs) });
+      else console.log(renderEnv(env, envFile, dnsDefs));
     });
 
   return program;

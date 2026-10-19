@@ -6,8 +6,8 @@ export interface BceRequest {
   host: string;
   path: string;
   query?: Record<string, string>;
-  /** 默认 GET */
-  method?: "GET" | "PUT" | "POST";
+  /** 默认 GET；DELETE 没有请求体，不带 Content-Type */
+  method?: "GET" | "PUT" | "POST" | "DELETE";
   /** JSON 请求体（证书、私钥只能放在这里，不能放在 URL 上） */
   body?: unknown;
   /** 默认对限流、超时等自动重试；非幂等的写接口（上传证书）传 false，由调用方查重后自行重试 */

@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
 import { run } from "./cli.js";
 
@@ -25,6 +26,7 @@ const code = await run(process.argv.slice(2), {
   fetch: globalThis.fetch,
   now: () => new Date(),
   cwd: process.cwd(),
+  home: homedir(),
   // 只有人在终端直接运行时才交互；AI / 脚本调用（管道、重定向）不询问
   ...(process.stdin.isTTY && process.stdout.isTTY && { confirm }),
 });

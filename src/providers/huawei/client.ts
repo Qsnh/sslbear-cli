@@ -6,8 +6,8 @@ import { apigAuthorization, canonicalQuery, hwEscape, sdkDate } from "./sign.js"
 export interface HuaweiRequest {
   host: string;
   path: string;
-  /** 缺省 GET */
-  method?: "GET" | "POST" | "PUT";
+  /** 缺省 GET；DELETE 与 GET 一样没有请求体，签名时按空串的哈希计算 */
+  method?: "GET" | "POST" | "PUT" | "DELETE";
   query?: Record<string, string | number | undefined>;
   /** JSON 请求体，参与签名；证书私钥等敏感内容只能放在这里，不能放在 query 上 */
   body?: unknown;

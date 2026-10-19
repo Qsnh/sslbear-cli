@@ -1,5 +1,5 @@
 import { vi } from "vitest";
-import { run } from "../src/cli.js";
+import { run, type Deps } from "../src/cli.js";
 import type { Fetch } from "../src/lib/http.js";
 import type { ProviderDefs } from "../src/query.js";
 
@@ -58,6 +58,12 @@ export interface RunCliOptions {
   defs?: ProviderDefs;
   confirm?: (question: string) => Promise<boolean>;
   readFile?: (path: string) => string;
+  /** issue 用：用户主目录（缺省为不存在的路径，避免测试写进真实的 ~/.sslbear-cli）、假的 DNS 服务商 / 权威 DNS / ACME 客户端 / 证书私钥 */
+  home?: string;
+  dnsDefs?: Deps["dnsDefs"];
+  dnsLookup?: Deps["dnsLookup"];
+  acme?: Deps["acme"];
+  generateKey?: Deps["generateKey"];
 }
 
 export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<CliResult> {
@@ -77,6 +83,11 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
       ...(opts.defs && { defs: opts.defs }),
       ...(opts.confirm && { confirm: opts.confirm }),
       ...(opts.readFile && { readFile: opts.readFile }),
+      home: opts.home ?? "/nonexistent-sslbear-home",
+      ...(opts.dnsDefs && { dnsDefs: opts.dnsDefs }),
+      ...(opts.dnsLookup && { dnsLookup: opts.dnsLookup }),
+      ...(opts.acme && { acme: opts.acme }),
+      ...(opts.generateKey && { generateKey: opts.generateKey }),
     });
     const stdout = out.join("\n");
     let json: unknown;
