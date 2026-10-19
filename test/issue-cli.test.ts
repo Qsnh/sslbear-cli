@@ -497,7 +497,8 @@ describe("issue 失败（exit 1）：stderr 一行错误 JSON，带 dns / issues
   });
 
   it("DnsPropagationTimeout：可重试，message 说明 NS 情况，记录已清理", async () => {
-    const s = setup({ ns: { "example.com": ["ada.ns.cloudflare.com"] } });
+    // NS 认不出是谁家的（自定义 NS）：照常加记录，等不到生效时超时
+    const s = setup({ ns: { "example.com": ["ns1.vanity-dns.net"] } });
     s.dnsLookup.queryTxt = vi.fn(async () => []);
     const r = await s.issue(["-d", DOMAINS, "--dns-timeout", "10", "--json"]);
     expect(r.code).toBe(1);
@@ -760,5 +761,15 @@ describe("验证因 DNS 查不到记录失败时重试一次", () => {
     const dns = setup({ acme: { waitAuthorization: async () => Promise.reject(invalidAuthz("dns", "DNS problem: NXDOMAIN")) } });
     expect(errOf(await dns.issue(["-d", DOMAINS, "--json"]))).toMatchObject({ status: "AcmeChallengeFailed", acmeType: "dns" });
     expect(dns.ca.client.newOrder).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("域名的 NS 已换到别家", () => {
+  it("只有 DNSPod 托管、实际 NS 属于火山引擎：ZoneNotFound，不加任何记录", async () => {
+    const s = setup({ zones: { tencent: [{ name: "example.com", id: "1" }] }, ns: { "example.com": ["ns1.volcengine-dns.com", "ns2.volcengine-dns.com"] }, env: TENCENT_ENV });
+    const r = await s.issue(["-d", DOMAINS, "--json"]);
+    expect(r.code).toBe(1);
+    expect(errOf(r)).toMatchObject({ status: "ZoneNotFound", nameServerOwner: "volcengine" });
+    expect(s.world.log.filter((l) => l.startsWith("add"))).toEqual([]);
   });
 });

@@ -39,8 +39,24 @@ describe("findZones", () => {
       ["a.b.example.com", "aliyun", "example.com", "_acme-challenge.a.b.example.com"],
     ]);
     expect(r.issues).toEqual([]);
-    // 只有一家托管时不查 NS
-    expect(lookup.resolveNs).not.toHaveBeenCalled();
+    // 只有一家托管时也查一次 NS（同一个 zone 只查一次），用来发现 NS 已经换到别家的情况；查不到 NS 照常用这家
+    expect(lookup.resolveNs).toHaveBeenCalledTimes(1);
+  });
+
+  it("只有一家托管、但实际 NS 明确属于另一家：ZoneNotFound，说明 NS 归属；认不出归属（自定义 NS）时照常用", async () => {
+    // DNSPod 里有 zone（注册时自动加的），NS 已换到火山引擎，火山那边还没接入
+    const moved = targetsFor({ tencent: [zone("example.com", { nameServers: ["gladys.dnspod.net", "island.dnspod.net"] })], volcengine: [] }, { "example.com": ["ns1.volcengine-dns.com", "ns2.volcengine-dns.com"] });
+    const e = await zoneError(findZones(ctx, moved.lookup, moved.targets, ["example.com"]));
+    expect(e.status).toBe("ZoneNotFound");
+    expect(e.extra).toMatchObject({ domains: ["example.com"], nameServerOwner: "volcengine" });
+    expect(e.message).toContain("属于火山引擎云解析");
+    expect(e.message).toContain("还没检测到 NS 变更");
+    // 没配火山凭证时说明缺凭证
+    const noCreds = targetsFor({ tencent: [zone("example.com")] }, { "example.com": ["ns1.volcengine-dns.com"] });
+    expect((await zoneError(findZones(ctx, noCreds.lookup, noCreds.targets, ["example.com"]))).message).toContain("没有配置 volcengine");
+    // 白标 NS 认不出是谁家的：照常用唯一托管它的这家
+    const vanity = targetsFor({ aliyun: [zone("example.com")] }, { "example.com": ["ns1.example-dns.net"] });
+    expect(picked(await findZones(ctx, vanity.lookup, vanity.targets, ["example.com"]))[0]?.[1]).toBe("aliyun");
   });
 
   it("后缀必须按 label 匹配：notexample.com 不属于 example.com", async () => {

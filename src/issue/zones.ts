@@ -1,4 +1,4 @@
-import type { DnsDefs } from "../dns/index.js";
+import { DNS_DEFS, type DnsDefs } from "../dns/index.js";
 import { normalizeName, type DnsProviderDef, type DnsZone } from "../dns/types.js";
 import type { Env } from "../lib/env.js";
 import { CloudApiError, type QueryContext } from "../lib/http.js";
@@ -123,6 +123,8 @@ export async function findZones(
 
   const matches: ZoneMatch[] = [];
   const notFound: string[] = [];
+  /** 只有一家托管、但实际 NS 明确属于另一家（换了 DNS 服务商，新的那家没配凭证或还没接入）：加了记录也不会生效 */
+  const elsewhere: { domain: string; zone: string; ns: string[]; hostedBy: DnsVendor; owner: DnsVendor }[] = [];
   const ambiguous: { domain: string; zone: string; candidates: Hosted[]; ns?: string[] }[] = [];
   for (const domain of domains) {
     const base = domain.replace(/^\*\./, "");
@@ -142,6 +144,17 @@ export async function findZones(
         continue;
       }
       chosen = serving[0]!;
+    } else {
+      const ns = await actualNs(chosen.zone.name);
+      const self = chosen.target.def;
+      if (ns?.length && !ns.some((host) => nsBelongsTo(host, chosen.zone, self.nameServerPattern))) {
+        // 只认能确定归属的 NS：自定义（白标）NS 认不出是谁家的，照常用唯一托管它的这家
+        const owner = DNS_VENDORS.find((v) => v !== self.vendor && ns.some((host) => DNS_DEFS[v].nameServerPattern.test(host)));
+        if (owner) {
+          elsewhere.push({ domain, zone: chosen.zone.name, ns, hostedBy: self.vendor, owner });
+          continue;
+        }
+      }
     }
     matches.push({ domain, target: chosen.target, zone: chosen.zone, record: challengeName(domain) });
   }
@@ -154,6 +167,20 @@ export async function findZones(
       "ZoneNotFound",
       `以下域名不在所选 DNS 服务商（${checked}）的任何 zone 里：${notFound.join(", ")}${failed}。请确认域名由这些服务商解析，或配置实际托管该域名的服务商的凭证`,
       { domains: notFound },
+      issues,
+    );
+  }
+  const moved = elsewhere[0];
+  if (moved) {
+    const ownerLabel = DNS_DEFS[moved.owner].label;
+    const hostedLabel = DNS_DEFS[moved.hostedBy].label;
+    const why = targets.some((t) => t.def.vendor === moved.owner)
+      ? `${ownerLabel}里没有可用的 ${moved.zone}（域名还没加进去，或还没检测到 NS 变更、未生效）`
+      : `没有配置 ${moved.owner}（${ownerLabel}）的凭证`;
+    throw new ZoneError(
+      "ZoneNotFound",
+      `${moved.zone} 实际的 NS（${moved.ns.join(", ")}）属于${ownerLabel}，但${why}；${hostedLabel}里虽然也有这个 zone，记录加在那里不会生效`,
+      { domains: elsewhere.map((e) => e.domain), nameServerOwner: moved.owner },
       issues,
     );
   }

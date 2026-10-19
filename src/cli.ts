@@ -399,7 +399,8 @@ const ISSUE_HELP_AFTER = `
 
 失败时 stderr 输出一行 {"ok":false,"status","message","retryable",…,"dns","issues"}，retryable: true 表示可稍后原样重试；
 本次添加的 TXT 记录失败时也已删除，删除失败的在 dns 里 cleaned: false。status：
-  ZoneNotFound           域名不在任何所选服务商的 zone 里（domains 列出这些域名，issues 带上列 zone 失败的服务商，多半是缺权限）
+  ZoneNotFound           域名不在任何所选服务商的 zone 里（domains 列出这些域名，issues 带上列 zone 失败的服务商，多半是缺权限）；
+                         带 nameServerOwner 时表示域名实际的 NS 属于这家，但这家没配凭证或还没接入该域名
   ZoneAmbiguous          多家服务商都托管了这个 zone，按 NS 无法判定（domain、providers），请用 --dns 指定
   DnsRecordFailed        添加 TXT 记录失败，多半是缺写权限（provider、code、requestId）
   DnsPropagationTimeout  超过 --dns-timeout 仍未在权威 DNS 上看到 TXT 记录（message 说明域名实际的 NS 是否指向该服务商）

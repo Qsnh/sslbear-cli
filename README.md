@@ -76,7 +76,7 @@ agent 调用一律加 `--json`，这样遇到需要确认的情况也不会停�
 
 | `status` | 含义 | agent 怎么做 |
 | --- | --- | --- |
-| `ZoneNotFound` | 这些域名（`domains`）不在任何已配置的 DNS 服务商里 | 问用户域名在哪家解析，请用户配好那家的凭证。`issues` 里有列 zone 失败的，先看[所需权限](docs/permissions.md) |
+| `ZoneNotFound` | 这些域名（`domains`）不在任何已配置的 DNS 服务商里；带 `nameServerOwner` 时表示域名实际的 NS 属于这家，但这家没配凭证或还没接入该域名 | 问用户域名在哪家解析，请用户配好那家的凭证、在那家添加域名。`issues` 里有列 zone 失败的，先看[所需权限](docs/permissions.md) |
 | `ZoneAmbiguous` | 多家服务商（`providers`）都托管了这个 zone，按 NS 判断不出实际用哪家 | 问用户实际用哪家，加 `--dns <那家>` 重跑 |
 | `DnsRecordFailed` | 在 `provider` 添加 TXT 记录失败（`code`、`requestId`），多半缺写权限 | `retryable: true` 先重跑一次；否则报给用户，见[所需权限](docs/permissions.md) |
 | `DnsPropagationTimeout` | 超时仍没在权威 DNS 上看到记录。`message` 会说明域名的 NS 是否指向该服务商 | NS 没指向该服务商时告诉用户；否则加大 `--dns-timeout` 重跑 |
