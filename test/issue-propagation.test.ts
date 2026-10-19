@@ -2,7 +2,7 @@ import { createSocket, type Socket } from "node:dgram";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   FALLBACK_MS,
-  INTERCEPTED_DELAY_MS,
+  INTERCEPTED_WAIT_MS,
   isFakeIp,
   POLL_INTERVAL_MS,
   PropagationTimeout,
@@ -56,20 +56,21 @@ const FQDN = "_acme-challenge.example.com";
 const NS = { "example.com": ["dns1.hichina.com", "dns2.hichina.com"] };
 
 describe("waitForTxt", () => {
-  it("本机 DNS 被代理接管（NS 解析到 fake-ip）：先等 20 秒再查，超时提示里说明", async () => {
+  it("本机 DNS 被代理接管（NS 解析到 fake-ip）：不查询（免得代理缓存「不存在」），固定等待后返回", async () => {
     expect([isFakeIp("198.18.0.105"), isFakeIp("198.19.255.1"), isFakeIp("198.20.0.1"), isFakeIp("10.198.18.1")]).toEqual([true, true, false, false]);
-    const fake = (visible: boolean): DnsLookup => ({
+    const lookup: DnsLookup = {
       resolveNs: async () => ["dns1.hichina.com"],
       resolveIp: async () => ["198.18.0.105"],
-      queryTxt: async () => (visible ? ["a"] : []),
-    });
+      queryTxt: vi.fn(async () => []),
+    };
     const sleeps: number[] = [];
     const sleep = async (ms: number) => void sleeps.push(ms);
-    expect(await waitForTxt(fake(true), [aliyunZone([{ fqdn: FQDN, values: ["a"] }])], { timeoutMs: 300_000, sleep })).toBe("visible");
-    expect(sleeps).toEqual([INTERCEPTED_DELAY_MS, SETTLE_MS]);
-    const e = await waitForTxt(fake(false), [aliyunZone([{ fqdn: FQDN, values: ["a"] }])], { timeoutMs: 30_000, sleep }).catch((err: unknown) => err);
-    expect(e).toBeInstanceOf(PropagationTimeout);
-    expect((e as Error).message).toContain("本机 DNS 被代理接管");
+    expect(await waitForTxt(lookup, [aliyunZone([{ fqdn: FQDN, values: ["a"] }])], { timeoutMs: 300_000, sleep })).toBe("intercepted");
+    expect(sleeps).toEqual([INTERCEPTED_WAIT_MS + SETTLE_MS]);
+    expect(lookup.queryTxt).not.toHaveBeenCalled();
+    // 重试时加长的 settle、比固定等待还短的 --dns-timeout 都算进去
+    expect(await waitForTxt(lookup, [aliyunZone([{ fqdn: FQDN, values: ["a"] }])], { timeoutMs: 20_000, settleMs: 90_000, sleep })).toBe("intercepted");
+    expect(sleeps[1]).toBe(20_000 + 90_000);
   });
 
   it("每 5 秒查一轮，全部权威服务器都看到全部值后再等 10 秒；看到了的服务器不再重复查", async () => {

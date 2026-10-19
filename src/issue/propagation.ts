@@ -67,10 +67,12 @@ export const SETTLE_MS = 30_000;
 export const FALLBACK_MS = 30_000;
 const QUERY_TIMEOUT_MS = 3_000;
 /**
- * 本机 DNS 被代理接管时第一次查询前的等待：NS 解析到 fake-ip（198.18.0.0/15），UDP 53 也被代理截走，
- * 应答来自代理的上游递归解析器。记录还没同步时查一次，「没有记录」会被缓存几分钟（SOA 最小 TTL），之后一直查不到
+ * 本机 DNS 被代理接管时的固定等待（不查询）：NS 解析到 fake-ip（198.18.0.0/15），53 端口（UDP、TCP）都被代理截走，
+ * 应答来自代理的上游递归解析器。记录还没同步时查一次，「没有记录」就会被缓存几分钟（SOA 最小 TTL），之后一直查不到——
+ * 实测火山引擎加完记录 20~30 秒才可见，第 20 秒查过一次后 5 分钟都查不到。所以干脆不查，固定等待后交给 CA 验证
+ * （CA 查不到时编排层会重新下单重试一次）
  */
-export const INTERCEPTED_DELAY_MS = 20_000;
+export const INTERCEPTED_WAIT_MS = 60_000;
 
 /** Clash / Surge 等代理 fake-ip 模式用的保留地址段（RFC 2544 的 198.18.0.0/15） */
 export function isFakeIp(ip: string): boolean {
@@ -181,16 +183,15 @@ function describePending(st: ZoneState): string {
  * - 部分 zone 的服务器连不上时，其余 zone 照常确认，并保证总等待不少于 30 秒；
  * - 累计等待超过 timeoutMs 仍未全部生效 → PropagationTimeout。
  */
-export async function waitForTxt(lookup: DnsLookup, zones: PropagationZone[], opts: WaitOptions): Promise<"visible" | "unreachable"> {
+export async function waitForTxt(lookup: DnsLookup, zones: PropagationZone[], opts: WaitOptions): Promise<"visible" | "unreachable" | "intercepted"> {
   const say = opts.progress ?? (() => {});
   const states = await Promise.all(zones.map((z) => prepare(lookup, z)));
   let waited = 0;
-  const intercepted = states.some((st) => st.servers.some((s) => isFakeIp(s.ip)));
-  const hint = intercepted ? "（本机 DNS 被代理接管，查到的是代理上游解析器的结果，可能有缓存；可关闭代理的 DNS 劫持后重试）" : "";
-  if (intercepted) {
-    say(`本机 DNS 被代理接管（权威 NS 解析到 fake-ip 地址），先等 ${INTERCEPTED_DELAY_MS / 1000} 秒再查，减少缓存的影响`);
-    await opts.sleep(INTERCEPTED_DELAY_MS);
-    waited += INTERCEPTED_DELAY_MS;
+  if (states.some((st) => st.servers.some((s) => isFakeIp(s.ip)))) {
+    const wait = Math.min(INTERCEPTED_WAIT_MS, opts.timeoutMs) + (opts.settleMs ?? SETTLE_MS);
+    say(`本机 DNS 被代理接管（权威 NS 解析到 fake-ip 地址），查不到权威 DNS，查代理又会缓存「不存在」，改为固定等待 ${wait / 1000} 秒后验证`);
+    await opts.sleep(wait);
+    return "intercepted";
   }
   for (;;) {
     // 查询本身的耗时也计入：连不上的服务器每轮要等满查询超时，只按 sleep 计时会远超 --dns-timeout
@@ -214,7 +215,7 @@ export async function waitForTxt(lookup: DnsLookup, zones: PropagationZone[], op
     if (waited >= opts.timeoutMs) {
       // 从没连上过的 zone 不在提示之列：它们不是没生效，而是查不了
       const pending = reachable.filter((st) => !zoneDone(st)).map(describePending);
-      throw new PropagationTimeout(`等待 ${Math.round(waited / 1000)} 秒后仍未在权威 DNS 上看到全部 TXT 记录：${pending.join("；")}${hint}。可加大 --dns-timeout 后重试`);
+      throw new PropagationTimeout(`等待 ${Math.round(waited / 1000)} 秒后仍未在权威 DNS 上看到全部 TXT 记录：${pending.join("；")}。可加大 --dns-timeout 后重试`);
     }
     await opts.sleep(POLL_INTERVAL_MS);
     waited += POLL_INTERVAL_MS;
