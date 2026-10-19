@@ -211,33 +211,76 @@ describe("百度智能云 DNS addTxt", () => {
 });
 
 describe("百度智能云 DNS removeTxt", () => {
-  it("按值查出这次加的记录，DELETE（带 clientToken、签名按无请求体计算）；同名下其他值不动", async () => {
+  it("有句柄：直接按 ID DELETE（带 clientToken、签名按无请求体计算），不先查列表", async () => {
+    // 列表有延迟、还查不到这条记录时也照样按 ID 删
     const fetch = bce((req) => {
-      if (req.method === "GET") return records([txt("r-other", "_acme-challenge", OTHER), txt("r-mine", "_acme-challenge", VALUE)]);
+      if (req.method === "GET") return records([txt("r-other", "_acme-challenge", OTHER)]);
       if (req.method === "DELETE") return { body: "" };
       return undefined;
     });
     await baiduDns.removeTxt(ctxOf(fetch), CREDS, rec("_acme-challenge.example.com"), "r-mine");
-    expect(fetch.calls.map(brief)).toEqual([`GET ${RECORDS}`, `DELETE ${RECORDS}/r-mine`]);
-    const del = fetch.calls[1]!;
+    expect(fetch.calls.map(brief)).toEqual([`DELETE ${RECORDS}/r-mine`]);
+    const del = fetch.calls[0]!;
+    expect([...del.url.searchParams.keys()]).toEqual(["clientToken"]);
     expect(del.url.searchParams.get("clientToken")).toMatch(/^[0-9a-f-]{36}$/);
     expect(del.body).toBe("");
     expect(del.headers["content-type"]).toBeUndefined();
     expectSigned(del);
   });
 
-  it("添加后没拿到 ID（句柄为空）时同样按值删除；已经不在了视为成功", async () => {
-    const fetch = bce((req) => (req.method === "GET" ? records([txt("r-mine", "_acme-challenge", VALUE)]) : { body: "" }));
-    await baiduDns.removeTxt(ctxOf(fetch), CREDS, rec("_acme-challenge.example.com"), "");
-    expect(fetch.calls.map(brief)).toEqual([`GET ${RECORDS}`, `DELETE ${RECORDS}/r-mine`]);
-
-    const gone = bce((req) => (req.method === "GET" ? records([txt("r-other", "_acme-challenge", OTHER)]) : undefined));
-    await baiduDns.removeTxt(ctxOf(gone), CREDS, rec("_acme-challenge.example.com"), "r-mine");
-    expect(gone.calls.map((c) => c.method)).toEqual(["GET"]);
+  it("按 ID 删除报错、按值再查已经不在：视为已删除", async () => {
+    const fetch = bce((req) => {
+      if (req.method === "DELETE") return bceError(404, "NotFound", "record not found");
+      if (req.method === "GET") return records([txt("r-other", "_acme-challenge", OTHER)]);
+      return undefined;
+    });
+    await baiduDns.removeTxt(ctxOf(fetch), CREDS, rec("_acme-challenge.example.com"), "r-mine");
+    expect(fetch.calls.map(brief)).toEqual([`DELETE ${RECORDS}/r-mine`, `GET ${RECORDS}`]);
   });
 
-  it("删除失败照常抛出", async () => {
-    const fetch = bce((req) => (req.method === "GET" ? records([txt("r-mine", "_acme-challenge", VALUE)]) : bceError(403, "AccessDenied")));
-    await expect(baiduDns.removeTxt(ctxOf(fetch), CREDS, rec("_acme-challenge.example.com"), "r-mine")).rejects.toMatchObject({ code: "AccessDenied" });
+  it("按 ID 删除报错、按值再查还在（或查询也失败）：抛出删除的原错误", async () => {
+    const still = bce((req) => (req.method === "GET" ? records([txt("r-mine", "_acme-challenge", VALUE)]) : bceError(403, "AccessDenied")));
+    await expect(baiduDns.removeTxt(ctxOf(still), CREDS, rec("_acme-challenge.example.com"), "r-mine")).rejects.toMatchObject({ code: "AccessDenied", requestId: "rid-err" });
+    expect(still.calls.map((c) => c.method)).toEqual(["DELETE", "GET"]);
+
+    const blind = bce((req) => (req.method === "GET" ? bceError(500, "InternalError") : bceError(403, "AccessDenied")));
+    await expect(baiduDns.removeTxt(ctxOf(blind), CREDS, rec("_acme-challenge.example.com"), "r-mine")).rejects.toMatchObject({ code: "AccessDenied" });
+  });
+
+  it("句柄为空（添加后没拿到 ID）：按值查出来删除，同名下其他值不动", async () => {
+    const fetch = bce((req) => {
+      if (req.method === "GET") return records([txt("r-other", "_acme-challenge", OTHER), txt("r-mine", "_acme-challenge", VALUE)]);
+      if (req.method === "DELETE") return { body: "" };
+      return undefined;
+    });
+    const sleeps: number[] = [];
+    await baiduDns.removeTxt(ctxOf(fetch, sleeps), CREDS, rec("_acme-challenge.example.com"), "");
+    expect(fetch.calls.map(brief)).toEqual([`GET ${RECORDS}`, `DELETE ${RECORDS}/r-mine`]);
+    expect(fetch.calls[1]!.url.searchParams.get("clientToken")).toMatch(/^[0-9a-f-]{36}$/);
+    expect(sleeps).toEqual([]);
+  });
+
+  it("句柄为空且一时查不到（列表延迟）：隔 2、3 秒再查，查到后删除", async () => {
+    let lookups = 0;
+    const fetch = bce((req) => {
+      if (req.method === "GET") return records(++lookups < 3 ? [] : [txt("r-late", "_acme-challenge", VALUE)]);
+      if (req.method === "DELETE") return { body: "" };
+      return undefined;
+    });
+    const sleeps: number[] = [];
+    await baiduDns.removeTxt(ctxOf(fetch, sleeps), CREDS, rec("_acme-challenge.example.com"), "");
+    expect(sleeps).toEqual([2000, 3000]);
+    expect(fetch.calls.map(brief)).toEqual([`GET ${RECORDS}`, `GET ${RECORDS}`, `GET ${RECORDS}`, `DELETE ${RECORDS}/r-late`]);
+  });
+
+  it("句柄为空且约 10 秒内一直查不到：报 RecordNotListed（不当成已删除），不发 DELETE", async () => {
+    const fetch = bce((req) => (req.method === "GET" ? records([txt("r-other", "_acme-challenge", OTHER)]) : undefined));
+    const sleeps: number[] = [];
+    const err = await baiduDns.removeTxt(ctxOf(fetch, sleeps), CREDS, rec("_acme-challenge.example.com"), "").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CloudApiError);
+    expect(err).toMatchObject({ provider: "baidu", code: "RecordNotListed" });
+    expect((err as Error).message).toMatch(/_acme-challenge\.example\.com.*控制台核对/);
+    expect(sleeps).toEqual([2000, 3000, 5000]);
+    expect(fetch.calls.map((c) => c.method)).toEqual(["GET", "GET", "GET", "GET"]);
   });
 });

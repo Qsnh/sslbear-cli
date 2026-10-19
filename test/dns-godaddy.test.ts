@@ -100,7 +100,9 @@ describe("GoDaddy addTxt", () => {
     });
     expect(await godaddyDns.addTxt(ctx(fetch), CREDS, RECORD)).toBe("TXT:_acme-challenge.www:value-www");
 
-    const [, patch] = fetch.calls;
+    const [list, patch] = fetch.calls;
+    // recordGet 的 limit 显式带上
+    expect(list!.url.href).toBe(`https://api.godaddy.com${NAME_PATH}?limit=100`);
     expect(patch!.url.href).toBe("https://api.godaddy.com/v1/domains/example.com/records");
     expect(patch!.headers.authorization).toBe("sso-key gd-test-key:gd-test-secret");
     expect(patch!.headers["content-type"]).toBe("application/json");
@@ -202,6 +204,54 @@ describe("GoDaddy removeTxt", () => {
       return { status: 404, body: { code: "NOT_FOUND", message: "Domain not found" } };
     });
     await godaddyDns.removeTxt(ctx(fetch), CREDS, RECORD, "h");
+  });
+
+  it("服务端忽略了名字（返回别的名字 / 类型的记录）：本地按名字（大小写不敏感）和类型过滤后再算要保留的值", async () => {
+    const fetch = fakeFetch((req) => {
+      if (!isName(req)) return undefined;
+      if (req.method === "GET") {
+        return {
+          body: [
+            { data: "value-root", name: "@", ttl: 600, type: "TXT" },
+            { data: "value-www", name: "_acme-challenge", ttl: 600, type: "TXT" },
+            { data: "value-cname", name: "_acme-challenge.www", ttl: 600, type: "CNAME" },
+            { data: "value-other", name: "_ACME-Challenge.WWW", ttl: 3600, type: "TXT" },
+            txt("value-www"),
+          ],
+        };
+      }
+      if (req.method === "PUT") return { body: "" };
+      return undefined;
+    });
+    await godaddyDns.removeTxt(ctx(fetch), CREDS, RECORD, "h");
+    expect(writes(fetch.calls)).toEqual([`PUT ${NAME_PATH}`]);
+    expect(JSON.parse(fetch.calls[1]!.body)).toEqual([{ data: "value-other", ttl: 3600 }]);
+
+    // 过滤后只剩自己的值：DELETE 这个名字，不把别的名字的记录写进来
+    const only = fakeFetch((req) => {
+      if (!isName(req)) return undefined;
+      if (req.method === "GET") return { body: [{ data: "value-root", name: "@", ttl: 600, type: "TXT" }, txt("value-www")] };
+      if (req.method === "DELETE") return { body: "" };
+      return undefined;
+    });
+    await godaddyDns.removeTxt(ctx(only), CREDS, RECORD, "h");
+    expect(writes(only.calls)).toEqual([`DELETE ${NAME_PATH}`]);
+  });
+
+  it("查询返回条数达到 limit（可能没取全）：不写回、不删除，报 TooManyRecords", async () => {
+    const many = [...Array.from({ length: 99 }, (_, i) => txt(`value-${i}`)), txt("value-www")];
+    const fetch = fakeFetch((req) => (isName(req) && req.method === "GET" ? { body: many } : undefined));
+    const err = await godaddyDns.removeTxt(ctx(fetch), CREDS, RECORD, "h").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CloudApiError);
+    expect(err).toMatchObject({ provider: "godaddy", code: "TooManyRecords" });
+    expect((err as Error).message).toMatch(/无法安全修改/);
+    expect(isRetryable(err)).toBe(false);
+    expect(writes(fetch.calls)).toEqual([]);
+    expect(fetch.calls[0]!.url.searchParams.get("limit")).toBe("100");
+
+    // 本次的值不在取到的这一页里也不能当成已删除
+    const unseen = fakeFetch((req) => (isName(req) && req.method === "GET" ? { body: Array.from({ length: 100 }, (_, i) => txt(`value-${i}`)) } : undefined));
+    await expect(godaddyDns.removeTxt(ctx(unseen), CREDS, RECORD, "h")).rejects.toMatchObject({ code: "TooManyRecords" });
   });
 
   it("根域名（@）的记录名在路径里原样保留", async () => {

@@ -12,6 +12,11 @@ const HOST = "dns.baidubce.com";
 const MAX_KEYS = "1000";
 /** 防止接口异常（如一直返回同一个 nextMarker）时死循环 */
 const MAX_PAGES = 1000;
+/**
+ * 删除时没有句柄（添加后没查到记录 ID）只能按值查：解析记录列表有延迟，查不到时依次隔 2、3、5 秒再查（总共约 10 秒），
+ * 仍查不到就报错，不能当成已经删掉
+ */
+const UNLISTED_WAITS_MS = [2000, 3000, 5000];
 
 /**
  * 各版本的最小 TTL（「产品定价」版本对比 https://cloud.baidu.com/doc/DNS/s/ojwvyx3em）：基础版（free）300 秒、普惠版（discount）120 秒、企业版（flagship）1 秒。
@@ -137,18 +142,49 @@ export const baiduDns = defineDns<AccessKeyCredentials>({
       if (id) return id;
       throw e;
     }
-    // 添加接口没有返回参数（拿不到记录 ID）：再查一次取 ID 当句柄；万一还查不到也不算失败，删除时按值查找
+    // 添加接口没有返回参数（拿不到记录 ID）：再查一次取 ID 当句柄；万一还查不到（列表有延迟）也不算失败，返回空句柄，
+    // removeTxt 遇到空句柄时按值查找、查不到会隔一会儿再查，仍查不到报错，不会静默当成已删除
     return (await find()) ?? "";
   },
 
   /**
-   * 按值查出这次加的记录再删：删除不存在的记录报什么错文档没写，查不到就是已经删掉了，视为成功；
-   * 只删值相同的那条（句柄就是它的 ID，但添加后可能没查到 ID，所以以值为准），同名下其他 TXT 记录不动
+   * 句柄（记录 ID）非空时直接按 ID 删除，不依赖列表：列表有延迟，按值查不到会误以为已经删掉、记录却残留。
+   * 删除报错时（删除不存在的记录报什么错文档没写）再按值查一次：查不到才视为已删除，还在就抛出原错误。
+   * 句柄为空（添加后没查到 ID）只能按值查，查不到时隔一会儿再查，仍查不到就报错，让编排层记为没清理、提示用户核对。
+   * 只删值相同的记录，同名下其他 TXT 记录不动；删除带 clientToken（幂等，callBce 自动重试时沿用同一个）
    */
-  async removeTxt(ctx, creds, record) {
-    const rr = relativeName(record.fqdn, record.zone.name);
-    for (const r of await sameTxt(ctx, creds, record.zone, rr, record.value)) {
-      await callBce(ctx, creds, { host: HOST, method: "DELETE", path: `${recordsPath(record.zone)}/${r.id}`, query: { clientToken: randomUUID() } });
+  async removeTxt(ctx, creds, record, handle) {
+    const { zone } = record;
+    const rr = relativeName(record.fqdn, zone.name);
+    const find = () => sameTxt(ctx, creds, zone, rr, record.value);
+    const remove = (id: string) => callBce(ctx, creds, { host: HOST, method: "DELETE", path: `${recordsPath(zone)}/${id}`, query: { clientToken: randomUUID() } });
+    if (handle) {
+      try {
+        await remove(handle);
+        return;
+      } catch (e) {
+        // 句柄是添加后在列表里查到的 ID，此时列表里已经有它：现在查不到就是真的不在了。查询也失败时报删除的原错误
+        const left = await find().catch(() => undefined);
+        if (left?.length === 0) return;
+        throw e;
+      }
+    }
+    const sleep = ctx.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+    for (let i = 0; ; i++) {
+      const found = await find();
+      if (found.length > 0) {
+        for (const r of found) await remove(r.id);
+        return;
+      }
+      if (i >= UNLISTED_WAITS_MS.length) {
+        const waited = UNLISTED_WAITS_MS.reduce((a, b) => a + b, 0) / 1000;
+        throw new CloudApiError(
+          "baidu",
+          "RecordNotListed",
+          `添加时没拿到记录 ID，按值查了 ${i + 1} 次（约 ${waited} 秒）仍查不到 ${record.fqdn} 的这条 TXT 记录：解析记录列表可能有延迟，记录可能还在，请到控制台核对，有就手动删除`,
+        );
+      }
+      await sleep(UNLISTED_WAITS_MS[i]!);
     }
   },
 });

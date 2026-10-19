@@ -172,6 +172,13 @@ async function createRecord(
     if (code === "InvalidParameter.DomainRecordExist") {
       const id = await findIndexed(ctx, find);
       if (id) return id;
+      // 隔 30 秒还查不到：没有句柄，交给编排层按「可能已添加」提示用户核对
+      throw new CloudApiError(
+        "tencent",
+        "RecordMayExist",
+        `DNSPod 报同名同值的 TXT 记录已存在（${code}），但隔了 ${(INDEX_DELAY_MS * INDEX_RETRIES) / 1000} 秒仍查不到这条记录的 ID（多半是索引延迟），记录可能已添加`,
+        (e as CloudApiError).requestId,
+      );
     }
     throw e;
   }

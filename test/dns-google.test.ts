@@ -165,6 +165,36 @@ describe("google 令牌", () => {
     expect(api.headers.authorization).toBe("Bearer ya29.fake-access-token");
   });
 
+  it("token_uri 只信任 https://oauth2.googleapis.com：指向别处（含 https）、明文、旧地址、写错时改用默认地址，aud 同步", async () => {
+    const audOf = (req: FakeRequest) => JSON.parse(Buffer.from(new URLSearchParams(req.body).get("assertion")!.split(".")[1]!, "base64url").toString()).aud;
+    for (const token_uri of [
+      "https://evil.example.com/token",
+      "https://oauth2.googleapis.com.evil.example/token",
+      "https://evil.example/oauth2.googleapis.com/token",
+      "https://oauth2.googleapis.com:8443/token",
+      "https://user@oauth2.googleapis.com/token",
+      "http://oauth2.googleapis.com/token",
+      "https://accounts.google.com/o/oauth2/token",
+      "not a url",
+      "",
+    ]) {
+      const fetch = fakeFetch((req) => (req.url.host === TOKEN_HOST ? TOKEN_REPLY : req.url.host.endsWith("googleapis.com") ? { body: { managedZones: [] } } : undefined));
+      await googleDns.listZones(ctx(fetch), creds({ token_uri }));
+      // 除 Cloud DNS 接口外只发往官方令牌端点，别的主机一个请求都没有
+      expect(fetch.calls.every((c) => c.url.host === TOKEN_HOST || c.url.host === "dns.googleapis.com")).toBe(true);
+      const tokenReq = tokenCalls(fetch)[0]!;
+      expect(tokenReq.url.href).toBe("https://oauth2.googleapis.com/token");
+      expect(audOf(tokenReq)).toBe("https://oauth2.googleapis.com/token");
+    }
+
+    // 官方端点（主机名大小写不同也算）原样使用，aud 与实际发往的地址一致
+    const fetch = fakeFetch((req) => (req.url.host === TOKEN_HOST ? TOKEN_REPLY : { body: { managedZones: [] } }));
+    await googleDns.listZones(ctx(fetch), creds({ token_uri: "https://OAUTH2.googleapis.com/token" }));
+    const tokenReq = tokenCalls(fetch)[0]!;
+    expect(tokenReq.url.href).toBe("https://oauth2.googleapis.com/token");
+    expect(audOf(tokenReq)).toBe("https://oauth2.googleapis.com/token");
+  });
+
   it("令牌在同一进程内按凭证缓存，过期前 60 秒才重新换", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-10-18T00:00:00Z"));

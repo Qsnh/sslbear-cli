@@ -103,7 +103,8 @@ function toError(raw: RawResponse, action: string): CloudApiError {
     message = `${message}（AWS_ACCESS_KEY_ID 无效；AWS 中国区的密钥不能用于全球区的 Route 53，中国区暂不支持）`;
   }
   // 5xx（InternalFailure、网关错误等）是服务端暂时故障，加 ServiceUnavailable. 前缀交给 withRetry 重试；
-  // 写操作重试是安全的：UPSERT 幂等，DELETE 重复提交由 removeTxt 重新读取后判定
+  // 写操作重试是安全的：变更批次里带着精确的旧记录集，上一次其实已生效时重复提交会对不上、整批被拒（InvalidChangeBatch），
+  // 由 addTxt / removeTxt 重新读取后判定
   const mapped = THROTTLE_CODES.has(code)
     ? `Throttling.${code}`
     : raw.status >= 500 && !isRetryableCode(code)
@@ -192,7 +193,7 @@ async function readTxtSet(ctx: QueryContext, creds: AwsCredentials, record: TxtR
   });
   const set = xmlBlocks(xml, "ResourceRecordSet")[0];
   if (!set || xmlText(set, "Type") !== "TXT" || normalizeName(unescapeName(xmlText(set, "Name") ?? "")) !== record.fqdn) return undefined;
-  // 别名、加权 / 地理等非简单路由（带 SetIdentifier）、流量策略生成的记录集不能按「读出来追加再 UPSERT」处理：
+  // 别名、加权 / 地理等非简单路由（带 SetIdentifier）、流量策略生成的记录集不能按「读出来追加再写回」处理：
   // 写成简单记录集会改掉用户的路由配置，或者被 Route 53 拒绝。不动它，让用户手动处理
   if (/<(AliasTarget|SetIdentifier|TrafficPolicyInstanceId)[\s>]/.test(set)) {
     throw new CloudApiError(
@@ -210,27 +211,70 @@ async function readTxtSet(ctx: QueryContext, creds: AwsCredentials, record: TxtR
 
 const escapeXml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
+/** 变更批次里的一项：DELETE 必须与现有记录集完全一致（TTL 与全部值），CREATE 要求记录集不存在 */
+export interface TxtChange {
+  action: "CREATE" | "DELETE";
+  set: TxtSet;
+}
+
 /** 元素顺序必须与文档的 Basic Syntax 一致（Name、Type、TTL、ResourceRecords），否则 Route 53 拒收 */
-export function changeBatchXml(action: "UPSERT" | "DELETE", fqdn: string, set: TxtSet): string {
-  const records = set.values.map((v) => `<ResourceRecord><Value>${escapeXml(v)}</Value></ResourceRecord>`).join("");
+export function changeBatchXml(fqdn: string, changes: TxtChange[]): string {
+  const change = ({ action, set }: TxtChange) => {
+    const records = set.values.map((v) => `<ResourceRecord><Value>${escapeXml(v)}</Value></ResourceRecord>`).join("");
+    return (
+      `<Change><Action>${action}</Action>` +
+      `<ResourceRecordSet><Name>${escapeXml(fqdn)}.</Name><Type>TXT</Type><TTL>${set.ttl}</TTL><ResourceRecords>${records}</ResourceRecords></ResourceRecordSet>` +
+      `</Change>`
+    );
+  };
   return (
     `<?xml version="1.0" encoding="UTF-8"?>\n` +
-    `<ChangeResourceRecordSetsRequest xmlns="${XMLNS}"><ChangeBatch><Changes><Change>` +
-    `<Action>${action}</Action>` +
-    `<ResourceRecordSet><Name>${escapeXml(fqdn)}.</Name><Type>TXT</Type><TTL>${set.ttl}</TTL><ResourceRecords>${records}</ResourceRecords></ResourceRecordSet>` +
-    `</Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>`
+    `<ChangeResourceRecordSetsRequest xmlns="${XMLNS}"><ChangeBatch><Changes>${changes.map(change).join("")}</Changes></ChangeBatch></ChangeResourceRecordSetsRequest>`
   );
 }
 
-async function changeTxt(ctx: QueryContext, creds: AwsCredentials, record: TxtRecord, action: "UPSERT" | "DELETE", set: TxtSet): Promise<void> {
+/**
+ * 不用 UPSERT：读改写之间别人（如同时运行的另一个 issue）改了记录集时，UPSERT 会用旧内容覆盖、把别人刚加的值丢掉。
+ * 改为在同一个变更批次里「DELETE 读到的旧记录集 + CREATE 新记录集」（原来没有记录集时只 CREATE）：批次是事务，全部生效或全部不生效
+ * （API_ChangeResourceRecordSets），旧记录集对不上（被改过）或要新建的已存在时整批被拒（InvalidChangeBatch），相当于比较后写入
+ */
+async function changeTxt(ctx: QueryContext, creds: AwsCredentials, record: TxtRecord, changes: TxtChange[]): Promise<void> {
   // 提交即返回，不轮询 GetChange 等 INSYNC：编排层会直接向权威 DNS 查询确认生效，省一项权限
   await call(ctx, creds, {
     action: "ChangeResourceRecordSets",
     method: "POST",
     path: `${API}/hostedzone/${record.zone.id}/rrset/`,
-    body: changeBatchXml(action, record.fqdn, set),
+    body: changeBatchXml(record.fqdn, changes),
     root: "ChangeResourceRecordSetsResponse",
   });
+}
+
+/** 把记录集从 before 换成 after：before 为空时只 CREATE，after 为空时只 DELETE */
+const replaceSet = (before: TxtSet | undefined, after: TxtSet | undefined): TxtChange[] => [
+  ...(before ? [{ action: "DELETE" as const, set: before }] : []),
+  ...(after ? [{ action: "CREATE" as const, set: after }] : []),
+];
+
+/**
+ * 读 → 算出新记录集 → 比较后写入；冲突（读完之后记录集被改了，或上一次提交其实已生效但响应丢失、被重试）时 Route 53 报 InvalidChangeBatch，
+ * 重读后再试一次。plan 返回 undefined 表示不用改
+ */
+async function readModifyWrite(
+  ctx: QueryContext,
+  creds: AwsCredentials,
+  record: TxtRecord,
+  plan: (set: TxtSet | undefined) => TxtChange[] | undefined,
+): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    const changes = plan(await readTxtSet(ctx, creds, record));
+    if (!changes) return;
+    try {
+      await changeTxt(ctx, creds, record, changes);
+      return;
+    } catch (e) {
+      if (attempt >= 2 || !isCode(e, "InvalidChangeBatch")) throw e;
+    }
+  }
 }
 
 const isCode = (e: unknown, code: string) => e instanceof CloudApiError && e.code === code;
@@ -258,33 +302,23 @@ export const awsDns = defineDns<AwsCredentials>({
     return zones;
   },
   async addTxt(ctx, creds, record) {
-    const set = await readTxtSet(ctx, creds, record);
-    if (set?.values.some((v) => isValue(v, record.value))) return handleOf(record);
-    // 记录集模型：同名的其他值（另一个域名的验证值、用户自己的 TXT）原样带上一起 UPSERT。
-    // 已有记录集时沿用它的 TTL，不改动用户原有记录的属性；新建时用 60 秒
-    await changeTxt(ctx, creds, record, "UPSERT", { ttl: set?.ttl ?? TTL, values: [...(set?.values ?? []), `"${record.value}"`] });
+    // 记录集模型：同名的其他值（另一个域名的验证值、用户自己的 TXT）原样带上一起写回。
+    // 已有记录集时沿用它的 TTL，不改动用户原有记录的属性；新建时用 60 秒。值已经在了（含上一次提交其实已生效）就不改
+    await readModifyWrite(ctx, creds, record, (set) =>
+      set?.values.some((v) => isValue(v, record.value))
+        ? undefined
+        : replaceSet(set, { ttl: set?.ttl ?? TTL, values: [...(set?.values ?? []), `"${record.value}"`] }),
+    );
     return handleOf(record);
   },
   async removeTxt(ctx, creds, record) {
     try {
-      for (let attempt = 1; ; attempt++) {
-        const set = await readTxtSet(ctx, creds, record);
+      // 去掉这次的值，剩余值写回（DELETE 旧 + CREATE 新）；只剩这一个值时只 DELETE 旧记录集。记录集或值已经不在了视为成功
+      await readModifyWrite(ctx, creds, record, (set) => {
         const rest = set?.values.filter((v) => !isValue(v, record.value)) ?? [];
-        if (!set || rest.length === set.values.length) return;
-        if (rest.length > 0) {
-          await changeTxt(ctx, creds, record, "UPSERT", { ttl: set.ttl, values: rest });
-          return;
-        }
-        try {
-          // 只剩这一个值：DELETE 要求 TTL 与全部值和当前记录集完全一致，用刚读到的
-          await changeTxt(ctx, creds, record, "DELETE", set);
-          return;
-        } catch (e) {
-          // 读完之后记录集被改了，或上一次 DELETE 其实已成功但响应丢失、被重试：Route 53 报 InvalidChangeBatch。
-          // 重新读一次再判断，已经不存在就算成功
-          if (attempt >= 2 || !isCode(e, "InvalidChangeBatch")) throw e;
-        }
-      }
+        if (!set || rest.length === set.values.length) return undefined;
+        return replaceSet(set, rest.length > 0 ? { ttl: set.ttl, values: rest } : undefined);
+      });
     } catch (e) {
       // zone 已被删除，记录自然也不在了
       if (isCode(e, "NoSuchHostedZone")) return;

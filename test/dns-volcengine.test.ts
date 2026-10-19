@@ -184,6 +184,18 @@ describe("火山引擎云解析 addTxt", () => {
     expect(fetch.calls.map((c) => c.action)).toEqual(["ListRecords", "CreateRecord", "ListRecords"]);
   });
 
+  it("ErrDBDuplicated 却查不到同值的记录：报 RecordMayExist（可能已添加），带 RequestId，不再重试", async () => {
+    const fetch = dns((action) => {
+      if (action === "ListRecords") return ok({ TotalCount: 1, Records: [txt("other", "_acme-challenge", OTHER)] });
+      if (action === "CreateRecord") return volcError(409, "ErrDBDuplicated", "duplicated: record");
+      return undefined;
+    });
+    const err = await volcengineDns.addTxt(ctxOf(fetch), CREDS, rec("_acme-challenge.example.com")).catch((e: unknown) => e);
+    expect(err).toMatchObject({ provider: "volcengine", code: "RecordMayExist", requestId: "rid-err" });
+    expect((err as Error).message).toMatch(/ErrDBDuplicated.*可能已添加/);
+    expect(fetch.calls.map((c) => c.action)).toEqual(["ListRecords", "CreateRecord", "ListRecords"]);
+  });
+
   it("TTL 不符合版本规格（ErrSpecNotValid）时退回 600 再加一次", async () => {
     const paid: DnsZone = { ...ZONE, extra: { ttl: "1" } };
     const fetch = dns((action, p) => {

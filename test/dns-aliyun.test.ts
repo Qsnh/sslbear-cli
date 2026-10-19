@@ -154,13 +154,17 @@ describe("阿里云云解析 addTxt", () => {
     });
   });
 
-  it("报已存在却查不到同值的记录：原样报错", async () => {
+  it("报已存在却查不到同值的记录：报 RecordMayExist（可能已添加），带 RequestId，不再重试", async () => {
     const fetch = alidns((action) =>
       action === "AddDomainRecord"
         ? rpcError(400, "DomainRecordDuplicate")
         : ok({ TotalCount: 1, DomainRecords: { Record: [{ RecordId: "100", RR: "_acme-challenge", Type: "TXT", Value: OTHER }] } }),
     );
-    await expect(aliyunDns.addTxt(ctxOf(fetch), CREDS, rec("_acme-challenge.example.com"))).rejects.toMatchObject({ code: "DomainRecordDuplicate" });
+    const err = await aliyunDns.addTxt(ctxOf(fetch), CREDS, rec("_acme-challenge.example.com")).catch((e: unknown) => e);
+    expect(err).toMatchObject({ provider: "aliyun", code: "RecordMayExist", requestId: "req-1" });
+    expect((err as Error).message).toMatch(/DomainRecordDuplicate.*可能已添加/);
+    expect(isRetryable(err)).toBe(false);
+    expect(fetch.calls.map((c) => c.action)).toEqual(["AddDomainRecord", "DescribeSubDomainRecords"]);
   });
 
   it("添加超时但其实已加上：重试前先查到它，不再重复添加", async () => {

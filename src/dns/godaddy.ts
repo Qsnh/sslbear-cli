@@ -15,6 +15,11 @@ const API = "https://api.godaddy.com";
 const TTL = 600;
 /** GET /v1/domains 的 limit 上限 */
 const DOMAIN_PAGE = 1000;
+/**
+ * GET /v1/domains/{domain}/records/{type}/{name}（recordGet）的 query 参数 limit（另有 offset），OpenAPI 没写缺省值与上限：
+ * 显式带上，不依赖服务端的默认条数。同名 TXT 正常只有几条；返回条数达到它时可能没取全，删除时不能整组写回（没取到的值会被丢掉）
+ */
+const RECORD_LIMIT = 100;
 const MAX_PAGES = 1000;
 /** GoDaddy 托管 DNS 的权威 NS（nsXX.domaincontrol.com） */
 const NS_PATTERN = /\.domaincontrol\.com$/;
@@ -98,18 +103,28 @@ const unquote = (s = "") => (s.length >= 2 && s.startsWith('"') && s.endsWith('"
 
 const recordsPath = (record: TxtRecord) => `/v1/domains/${enc(record.zone.id)}/records/TXT/${encName(relativeName(record.fqdn, record.zone.name))}`;
 
-/** 该名字下的全部 TXT 记录（原样返回，删除时要整组写回） */
-async function listTxt(ctx: QueryContext, creds: GoDaddyCredentials, record: TxtRecord, retry: boolean): Promise<GdRecord[]> {
+interface TxtList {
+  /** 该名字下的 TXT 记录（原样返回，删除时要整组写回） */
+  records: GdRecord[];
+  /** 返回条数达到 RECORD_LIMIT（按过滤前的条数算）：可能没取全 */
+  truncated: boolean;
+}
+
+/** 该名字下的全部 TXT 记录 */
+async function listTxt(ctx: QueryContext, creds: GoDaddyCredentials, record: TxtRecord, retry: boolean): Promise<TxtList> {
   let res: GdRecord[] | undefined;
   try {
-    res = await gdRequest<GdRecord[]>(ctx, creds, recordsPath(record), { retry });
+    res = await gdRequest<GdRecord[]>(ctx, creds, `${recordsPath(record)}?limit=${RECORD_LIMIT}`, { retry });
   } catch (e) {
     // 名字下没有记录或域名不存在：当作空（域名真不存在时，随后的 PATCH 会报出来）
-    if (e instanceof CloudApiError && e.httpStatus === 404) return [];
+    if (e instanceof CloudApiError && e.httpStatus === 404) return { records: [], truncated: false };
     throw e;
   }
   if (!Array.isArray(res)) throw new CloudApiError("godaddy", "InvalidResponse", "查询 TXT 记录的响应不是数组");
-  return res;
+  // 本地再按类型和名字核对一遍：万一服务端忽略了路径里的名字（返回整个 zone 的 TXT），删除时整组写回会把别的名字的记录复制到这个名字下
+  const name = relativeName(record.fqdn, record.zone.name).toLowerCase();
+  const records = res.filter((r) => r.type?.toUpperCase() === "TXT" && r.name?.toLowerCase() === name);
+  return { records, truncated: res.length >= RECORD_LIMIT };
 }
 
 /**
@@ -166,7 +181,7 @@ export const godaddyDns = defineDns<GoDaddyCredentials>({
     const has = (records: GdRecord[]) => records.some((r) => unquote(r.data) === record.value);
     // PATCH 追加不是幂等的（文档：重复调用会加出重复记录）：每次尝试（含自动重试）都先查，已有同名同值就直接用
     return withRetry(ctx, async () => {
-      if (has(await listTxt(ctx, creds, record, false))) return handle;
+      if (has((await listTxt(ctx, creds, record, false)).records)) return handle;
       try {
         // PATCH 只追加，同名下已有的其他 TXT 值保留
         await gdRequest(ctx, creds, `/v1/domains/${enc(record.zone.id)}/records`, {
@@ -177,14 +192,24 @@ export const godaddyDns = defineDns<GoDaddyCredentials>({
         return handle;
       } catch (e) {
         // 文档没写同名同值时 PATCH 是报错还是重复添加；报 409 / 422 时再查一次，已有就按已存在处理
-        if (e instanceof CloudApiError && (e.httpStatus === 409 || e.httpStatus === 422) && has(await listTxt(ctx, creds, record, false))) return handle;
+        if (e instanceof CloudApiError && (e.httpStatus === 409 || e.httpStatus === 422) && has((await listTxt(ctx, creds, record, false)).records)) {
+          return handle;
+        }
         throw e;
       }
     });
   },
 
   async removeTxt(ctx, creds, record) {
-    const records = await listTxt(ctx, creds, record, true);
+    const { records, truncated } = await listTxt(ctx, creds, record, true);
+    // 可能没取全：整组写回（PUT）或整组删除（DELETE）都会丢掉没取到的值，也无法确认本次的值是否还在，不动它
+    if (truncated) {
+      throw new CloudApiError(
+        "godaddy",
+        "TooManyRecords",
+        `${record.fqdn} 的 TXT 记录查询返回了 ${RECORD_LIMIT} 条（单次查询上限），可能没有取全；整组写回会丢掉没取到的值，记录太多无法安全修改，请到 GoDaddy 控制台手动删除值 ${record.value}`,
+      );
+    }
     // 去掉本次的值（重复添加出的多条一并去掉），其余原样保留（含各自的 TTL）
     const keep = records.filter((r) => unquote(r.data) !== record.value);
     if (keep.length === records.length) return;

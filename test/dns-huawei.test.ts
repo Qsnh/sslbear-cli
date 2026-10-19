@@ -119,11 +119,20 @@ describe("华为云云解析 listZones", () => {
     expect(err).toMatchObject({ provider: "huawei", code: "APIGW.0302", requestId: "rid-APIGW.0302", httpStatus: 403 });
   });
 
-  it("NS 主机名规则覆盖 .com / .cn / .net / .org", () => {
-    for (const ns of ["ns1.huaweicloud-dns.com", "ns1.huaweicloud-dns.cn", "ns1.huaweicloud-dns.net", "ns1.huaweicloud-dns.org"]) {
+  it("NS 主机名规则覆盖 .com / .cn / .net / .org，以及历史域名的 hwclouds-dns.com / .net", () => {
+    for (const ns of [
+      "ns1.huaweicloud-dns.com",
+      "ns1.huaweicloud-dns.cn",
+      "ns1.huaweicloud-dns.net",
+      "ns1.huaweicloud-dns.org",
+      "ns1.hwclouds-dns.com",
+      "ns1.hwclouds-dns.net",
+    ]) {
       expect(huaweiDns.nameServerPattern.test(ns)).toBe(true);
     }
-    expect(huaweiDns.nameServerPattern.test("ns1.huaweicloud.com")).toBe(false);
+    for (const ns of ["ns1.huaweicloud.com", "ns1.hwclouds-dns.org", "ns1.hwclouds-dns.cn", "ns1.myhwclouds-dns.com"]) {
+      expect(huaweiDns.nameServerPattern.test(ns)).toBe(false);
+    }
   });
 });
 
@@ -216,12 +225,83 @@ describe("华为云云解析 addTxt", () => {
     expect((err as Error).message).toMatch(/CNAME/);
   });
 
-  it("记录集名称已存在（DNS.0312）却查不到：原样报错", async () => {
-    const fetch = hw((req) => (req.method === "GET" ? listed([]) : dnsError(400, "DNS.0312", "This record set name already exists.")));
-    await expect(huaweiDns.addTxt(ctxOf(fetch), CREDS, rec("_acme-challenge.example.com"))).rejects.toMatchObject({
-      code: "DNS.0312",
-      message: "This record set name already exists.",
+  it("记录集名称已存在（DNS.0312 / DNS.0335）却查不到：报 RecordMayExist（可能已添加），带原错误码与 RequestId", async () => {
+    for (const code of ["DNS.0312", "DNS.0335"]) {
+      const fetch = hw((req) => (req.method === "GET" ? listed([]) : apigError(400, code, "This record set name already exists.")));
+      const err = await huaweiDns.addTxt(ctxOf(fetch), CREDS, rec("_acme-challenge.example.com")).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(CloudApiError);
+      expect(err).toMatchObject({ provider: "huawei", code: "RecordMayExist", requestId: `rid-${code}` });
+      expect((err as Error).message).toContain(code);
+      expect((err as Error).message).toMatch(/可能已添加/);
+      expect(dnsCalls(fetch).map((c) => c.method)).toEqual(["GET", "POST", "GET"]);
+    }
+  });
+
+  it("同一线路有多个同名记录集（权重解析）：值在后面的记录集里也算已存在，不写", async () => {
+    const fetch = hw((req) =>
+      req.method === "GET" ? listed([set("rs1", [`"${OTHER}"`], { weight: 1 }), set("rs2", [`"${VALUE}"`], { weight: 1 })]) : undefined,
+    );
+    expect(await huaweiDns.addTxt(ctxOf(fetch), CREDS, rec("_acme-challenge.example.com"))).toBe("rs2");
+    expect(dnsCalls(fetch).map(brief)).toEqual([`GET ${SETS}`]);
+  });
+
+  it("追加时跳过权重为 0 的记录集（不返回解析结果），加到权重不为 0 的那个", async () => {
+    const fetch = hw((req) => {
+      if (req.method === "GET") return listed([set("rs0", [`"${OTHER}"`], { weight: 0 }), set("rs5", ['"v=spf1 -all"'], { weight: 5 })]);
+      if (req.method === "PUT") return { status: 202, body: { id: "rs5" } };
+      return undefined;
     });
+    expect(await huaweiDns.addTxt(ctxOf(fetch), CREDS, rec("_acme-challenge.example.com"))).toBe("rs5");
+    const put = dnsCalls(fetch).find((c) => c.method === "PUT")!;
+    expect(put.url.pathname).toBe(`${SETS}/rs5`);
+    expect(put.json).toEqual({ name: "_acme-challenge.example.com.", type: "TXT", records: ['"v=spf1 -all"', `"${VALUE}"`] });
+  });
+
+  it("只有权重为 0 的同名记录集：不往里加，新建一个", async () => {
+    const fetch = hw((req) => {
+      if (req.method === "GET") return listed([set("rs0", [`"${OTHER}"`], { weight: 0 })]);
+      if (req.method === "POST") return { status: 202, body: { id: "rs-new" } };
+      return undefined;
+    });
+    expect(await huaweiDns.addTxt(ctxOf(fetch), CREDS, rec("_acme-challenge.example.com"))).toBe("rs-new");
+    expect(dnsCalls(fetch).map(brief)).toEqual([`GET ${SETS}`, `POST ${SETS}`]);
+  });
+
+  it("只有权重为 0 的记录集、新建又报已存在：报错说明权重问题，不往权重 0 的记录集里加", async () => {
+    const fetch = hw((req) => (req.method === "GET" ? listed([set("rs0", [`"${OTHER}"`], { weight: 0 })]) : dnsError(400, "DNS.0335", "duplicate record set")));
+    const err = await huaweiDns.addTxt(ctxOf(fetch), CREDS, rec("_acme-challenge.example.com")).catch((e: unknown) => e);
+    expect(err).toMatchObject({ provider: "huawei", code: "DNS.0335" });
+    expect((err as Error).message).toMatch(/权重都为 0/);
+    expect(dnsCalls(fetch).map((c) => c.method)).toEqual(["GET", "POST", "GET"]);
+  });
+
+  it("多个同名记录集里有一个还在 PENDING_*：等全部稳定再写", async () => {
+    let reads = 0;
+    const sleeps: number[] = [];
+    const fetch = hw((req) => {
+      if (req.method === "GET") {
+        return listed([set("rs1", [`"${OTHER}"`], { weight: 1 }), set("rs2", ['"x"'], { weight: 1, status: ++reads < 2 ? "PENDING_UPDATE" : "ACTIVE" })]);
+      }
+      if (req.method === "PUT") return { status: 202, body: { id: "rs1" } };
+      return undefined;
+    });
+    expect(await huaweiDns.addTxt(ctxOf(fetch, sleeps), CREDS, rec("_acme-challenge.example.com"))).toBe("rs1");
+    expect(sleeps).toEqual([2000]);
+    expect(dnsCalls(fetch).map(brief)).toEqual([`GET ${SETS}`, `GET ${SETS}`, `PUT ${SETS}/rs1`]);
+  });
+
+  it("重试用完仍超时：最后再查一次全部同名记录集，值已在后面的记录集里就返回它", async () => {
+    let puts = 0;
+    const fetch = hw((req) => {
+      if (req.method === "GET") return listed([set("rs0", [`"${OTHER}"`], { weight: 0 }), set("rs2", puts >= 3 ? ['"x"', `"${VALUE}"`] : ['"x"'], { weight: 2 })]);
+      if (req.method === "PUT") {
+        puts++;
+        throw Object.assign(new Error("aborted"), { name: "TimeoutError" });
+      }
+      return undefined;
+    });
+    expect(await huaweiDns.addTxt(ctxOf(fetch), CREDS, rec("_acme-challenge.example.com"))).toBe("rs2");
+    expect(dnsCalls(fetch).map((c) => c.method)).toEqual(["GET", "PUT", "GET", "PUT", "GET", "PUT", "GET"]);
   });
 
   it("同名记录集已暂停（DISABLE）：报 RecordSetNotActive，不写", async () => {
@@ -317,6 +397,34 @@ describe("华为云云解析 removeTxt", () => {
 
     const gone = hw((req) => (req.method === "GET" ? listed([set("rs1", [`"${VALUE}"`])]) : dnsError(404, "DNS.0313", "This record set does not exist.")));
     await expect(huaweiDns.removeTxt(ctxOf(gone), CREDS, rec("_acme-challenge.example.com"), "rs1")).resolves.toBeUndefined();
+  });
+
+  it("多个同名记录集（权重解析）：先处理句柄指向的，其他含这个值的也去掉，不含的不动", async () => {
+    const fetch = hw((req) => {
+      if (req.method === "GET") {
+        return listed([
+          set("rs-a", [`"${OTHER}"`, `"${VALUE}"`], { weight: 1 }),
+          set("rs-x", [`"${OTHER}"`], { weight: 1 }),
+          set("rs-h", [`"${VALUE}"`], { weight: 1 }),
+        ]);
+      }
+      if (req.method === "PUT" || req.method === "DELETE") return { status: 202, body: {} };
+      return undefined;
+    });
+    await huaweiDns.removeTxt(ctxOf(fetch), CREDS, rec("_acme-challenge.example.com"), "rs-h");
+    expect(dnsCalls(fetch).map(brief)).toEqual([`GET ${SETS}`, `DELETE ${SETS}/rs-h`, `PUT ${SETS}/rs-a`]);
+    expect(dnsCalls(fetch)[2]!.json).toEqual({ name: "_acme-challenge.example.com.", type: "TXT", records: [`"${OTHER}"`] });
+  });
+
+  it("句柄指向的记录集里没有这个值、在另一个同名记录集里：从那个里去掉，不算已删除", async () => {
+    const fetch = hw((req) => {
+      if (req.method === "GET") return listed([set("rs-h", [`"${OTHER}"`], { weight: 1 }), set("rs-b", ['"x"', `"${VALUE}"`], { weight: 3 })]);
+      if (req.method === "PUT") return { status: 202, body: { id: "rs-b" } };
+      return undefined;
+    });
+    await huaweiDns.removeTxt(ctxOf(fetch), CREDS, rec("_acme-challenge.example.com"), "rs-h");
+    expect(dnsCalls(fetch).map(brief)).toEqual([`GET ${SETS}`, `PUT ${SETS}/rs-b`]);
+    expect(dnsCalls(fetch)[1]!.json).toEqual({ name: "_acme-challenge.example.com.", type: "TXT", records: ['"x"'] });
   });
 
   it("其他错误照常抛出", async () => {

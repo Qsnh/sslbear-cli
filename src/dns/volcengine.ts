@@ -126,6 +126,13 @@ async function addRecord(
     if (code === "ErrDBDuplicated") {
       const id = await find();
       if (id) return id;
+      // 报已存在却查不到：多半是上一次超时的添加其实已成功、查询还没跟上。没有句柄，交给编排层按「可能已添加」提示用户核对
+      throw new CloudApiError(
+        "volcengine",
+        "RecordMayExist",
+        `火山引擎报同名同值的 TXT 记录已存在（${code}），但查不到这条记录的 ID（多半是索引延迟），记录可能已添加`,
+        (e as CloudApiError).requestId,
+      );
     }
     throw e;
   }

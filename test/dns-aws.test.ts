@@ -165,17 +165,20 @@ const CHANGE_OK = xml(
 const isList = (r: FakeRequest) => r.method === "GET" && r.url.pathname === RRSET_PATH;
 const isChange = (r: FakeRequest) => r.method === "POST" && r.url.pathname === `${RRSET_PATH}/`;
 
-/** 解析提交的变更：动作、TTL、全部值（已反转义） */
-function parseChange(body: string) {
-  const set = xmlBlocks(body, "ResourceRecordSet")[0]!;
-  return {
-    action: xmlText(body, "Action"),
-    name: xmlText(set, "Name"),
-    type: xmlText(set, "Type"),
-    ttl: Number(xmlText(set, "TTL")),
-    values: xmlBlocks(set, "ResourceRecord").map((r) => xmlText(r, "Value")),
-  };
+/** 解析提交的变更批次：每一项的动作、名字、类型、TTL、全部值（已反转义） */
+function parseChanges(body: string) {
+  return xmlBlocks(body, "Change").map((change) => {
+    const set = xmlBlocks(change, "ResourceRecordSet")[0]!;
+    return {
+      action: xmlText(change, "Action"),
+      name: xmlText(set, "Name"),
+      type: xmlText(set, "Type"),
+      ttl: Number(xmlText(set, "TTL")),
+      values: xmlBlocks(set, "ResourceRecord").map((r) => xmlText(r, "Value")),
+    };
+  });
 }
+const NAME = `${FQDN}.`;
 
 /** 按请求依次返回固定响应的路由：ListResourceRecordSets 按 lists 顺序返回（用完后重复最后一个），变更按 changes 顺序 */
 function r53(lists: FakeReply[], changes: FakeReply[] = [CHANGE_OK]) {
@@ -270,7 +273,7 @@ describe("AWS Route 53 listZones", () => {
 });
 
 describe("AWS Route 53 addTxt", () => {
-  it("新建记录集：先按 name/type/maxitems=1 查询，再 UPSERT 带引号的值，TTL 60", async () => {
+  it("新建记录集：先按 name/type/maxitems=1 查询，再 CREATE 带引号的值（不用 UPSERT），TTL 60", async () => {
     const fetch = r53([rrsets({ name: "www.example.com.", type: "A", ttl: 300, values: ["192.0.2.1"] })]);
     const handle = await awsDns.addTxt(ctxOf(fetch), CREDS, RECORD);
     expect(handle).toBe(`${ZONE.id}/${FQDN}`);
@@ -281,7 +284,7 @@ describe("AWS Route 53 addTxt", () => {
     expect(change!.headers["content-type"]).toBe("application/xml");
     expect(change!.headers.authorization).toContain("SignedHeaders=content-type;host;x-amz-date,");
     expect(change!.body).toBe(
-      `<?xml version="1.0" encoding="UTF-8"?>\n<ChangeResourceRecordSetsRequest xmlns="${XMLNS}"><ChangeBatch><Changes><Change><Action>UPSERT</Action>` +
+      `<?xml version="1.0" encoding="UTF-8"?>\n<ChangeResourceRecordSetsRequest xmlns="${XMLNS}"><ChangeBatch><Changes><Change><Action>CREATE</Action>` +
         `<ResourceRecordSet><Name>_acme-challenge.example.com.</Name><Type>TXT</Type><TTL>60</TTL><ResourceRecords><ResourceRecord><Value>"${V1}"</Value></ResourceRecord></ResourceRecords></ResourceRecordSet>` +
         `</Change></Changes></ChangeBatch></ChangeResourceRecordSetsRequest>`,
     );
@@ -290,16 +293,58 @@ describe("AWS Route 53 addTxt", () => {
   it("zone 里没有排在它之后的记录（返回空列表）也是新建", async () => {
     const fetch = r53([rrsets()]);
     await awsDns.addTxt(ctxOf(fetch), CREDS, RECORD);
-    expect(parseChange(fetch.calls[1]!.body)).toMatchObject({ action: "UPSERT", ttl: 60, values: [`"${V1}"`] });
+    expect(parseChanges(fetch.calls[1]!.body)).toEqual([{ action: "CREATE", name: NAME, type: "TXT", ttl: 60, values: [`"${V1}"`] }]);
   });
 
-  it("追加到已有记录集：其他值原样保留（含引号转义与 XML 实体），沿用原 TTL", async () => {
+  it("追加到已有记录集：同一批次 DELETE 读到的旧记录集 + CREATE 新记录集，其他值原样保留（含引号转义与 XML 实体），沿用原 TTL", async () => {
     const fetch = r53([rrsets({ name: `${FQDN}.`, type: "TXT", ttl: 300, values: [`"${V2}"`, `"say \\"hi\\" &amp; bye"`] })]);
     await awsDns.addTxt(ctxOf(fetch), CREDS, RECORD);
     const change = fetch.calls[1]!;
-    expect(parseChange(change.body)).toEqual({ action: "UPSERT", name: `${FQDN}.`, type: "TXT", ttl: 300, values: [`"${V2}"`, `"say \\"hi\\" & bye"`, `"${V1}"`] });
-    // 写回时重新转义 &
-    expect(change.body).toContain(`<Value>"say \\"hi\\" &amp; bye"</Value>`);
+    expect(parseChanges(change.body)).toEqual([
+      { action: "DELETE", name: NAME, type: "TXT", ttl: 300, values: [`"${V2}"`, `"say \\"hi\\" & bye"`] },
+      { action: "CREATE", name: NAME, type: "TXT", ttl: 300, values: [`"${V2}"`, `"say \\"hi\\" & bye"`, `"${V1}"`] },
+    ]);
+    // 写回时重新转义 &（DELETE 与 CREATE 各一次）
+    expect(change.body.split(`<Value>"say \\"hi\\" &amp; bye"</Value>`)).toHaveLength(3);
+    expect(change.body).not.toContain("UPSERT");
+  });
+
+  it("读完之后被别人加了值（并发运行，DELETE 对不上报 InvalidChangeBatch）：重读后带上别人的值再写，不丢值", async () => {
+    const V3 = "c".repeat(43);
+    const fetch = r53(
+      [rrsets({ name: NAME, type: "TXT", ttl: 60, values: [`"${V2}"`] }), rrsets({ name: NAME, type: "TXT", ttl: 60, values: [`"${V2}"`, `"${V3}"`] })],
+      [invalidBatch("Tried to delete resource record set [name='_acme-challenge.example.com.', type='TXT'] but the values provided do not match the current values"), CHANGE_OK],
+    );
+    expect(await awsDns.addTxt(ctxOf(fetch), CREDS, RECORD)).toBe(`${ZONE.id}/${FQDN}`);
+    expect(fetch.calls.map((c) => c.method)).toEqual(["GET", "POST", "GET", "POST"]);
+    expect(parseChanges(fetch.calls[3]!.body)).toEqual([
+      { action: "DELETE", name: NAME, type: "TXT", ttl: 60, values: [`"${V2}"`, `"${V3}"`] },
+      { action: "CREATE", name: NAME, type: "TXT", ttl: 60, values: [`"${V2}"`, `"${V3}"`, `"${V1}"`] },
+    ]);
+  });
+
+  it("新建时记录集已被别人建出来（CREATE 报已存在）：重读后合并再写", async () => {
+    const fetch = r53(
+      [rrsets(), rrsets({ name: NAME, type: "TXT", ttl: 60, values: [`"${V2}"`] })],
+      [invalidBatch("Tried to create resource record set [name='_acme-challenge.example.com.', type='TXT'] but it already exists"), CHANGE_OK],
+    );
+    await awsDns.addTxt(ctxOf(fetch), CREDS, RECORD);
+    expect(parseChanges(fetch.calls[3]!.body)).toEqual([
+      { action: "DELETE", name: NAME, type: "TXT", ttl: 60, values: [`"${V2}"`] },
+      { action: "CREATE", name: NAME, type: "TXT", ttl: 60, values: [`"${V2}"`, `"${V1}"`] },
+    ]);
+  });
+
+  it("上一次提交其实已生效（重复提交被拒）：重读到值已在，不再提交", async () => {
+    const fetch = r53([rrsets(), rrsets({ name: NAME, type: "TXT", ttl: 60, values: [`"${V1}"`] })], [invalidBatch("Tried to create resource record set but it already exists")]);
+    expect(await awsDns.addTxt(ctxOf(fetch), CREDS, RECORD)).toBe(`${ZONE.id}/${FQDN}`);
+    expect(fetch.calls.map((c) => c.method)).toEqual(["GET", "POST", "GET"]);
+  });
+
+  it("连续冲突只重读重试一次，然后报 InvalidChangeBatch", async () => {
+    const fetch = r53([rrsets({ name: NAME, type: "TXT", ttl: 60, values: [`"${V2}"`] })], [invalidBatch("values provided do not match the current values")]);
+    await expect(awsDns.addTxt(ctxOf(fetch), CREDS, RECORD)).rejects.toMatchObject({ code: "InvalidChangeBatch", requestId: "rid-batch" });
+    expect(fetch.calls.map((c) => c.method)).toEqual(["GET", "POST", "GET", "POST"]);
   });
 
   it("同名同值已存在：不提交变更，返回句柄", async () => {
@@ -311,19 +356,22 @@ describe("AWS Route 53 addTxt", () => {
   it("返回的第一条是子名字（*._acme-challenge，八进制转义）：不是同一个记录集，新建", async () => {
     const fetch = r53([rrsets({ name: `\\052.${FQDN}.`, type: "TXT", ttl: 300, values: [`"${V2}"`] })]);
     await awsDns.addTxt(ctxOf(fetch), CREDS, RECORD);
-    expect(parseChange(fetch.calls[1]!.body)).toMatchObject({ ttl: 60, values: [`"${V1}"`] });
+    expect(parseChanges(fetch.calls[1]!.body)).toEqual([{ action: "CREATE", name: NAME, type: "TXT", ttl: 60, values: [`"${V1}"`] }]);
   });
 
   it("名字八进制转义还原后才比较（\\137 即 _）", async () => {
     const fetch = r53([rrsets({ name: "\\137acme-challenge.example.com.", type: "TXT", ttl: 120, values: [`"${V2}"`] })]);
     await awsDns.addTxt(ctxOf(fetch), CREDS, RECORD);
-    expect(parseChange(fetch.calls[1]!.body)).toMatchObject({ ttl: 120, values: [`"${V2}"`, `"${V1}"`] });
+    expect(parseChanges(fetch.calls[1]!.body)).toEqual([
+      { action: "DELETE", name: NAME, type: "TXT", ttl: 120, values: [`"${V2}"`] },
+      { action: "CREATE", name: NAME, type: "TXT", ttl: 120, values: [`"${V2}"`, `"${V1}"`] },
+    ]);
   });
 
   it("同名但类型不是 TXT：新建", async () => {
     const fetch = r53([rrsets({ name: `${FQDN}.`, type: "TYPE65534", ttl: 300, values: ["x"] })]);
     await awsDns.addTxt(ctxOf(fetch), CREDS, RECORD);
-    expect(parseChange(fetch.calls[1]!.body)).toMatchObject({ ttl: 60, values: [`"${V1}"`] });
+    expect(parseChanges(fetch.calls[1]!.body)).toEqual([{ action: "CREATE", name: NAME, type: "TXT", ttl: 60, values: [`"${V1}"`] }]);
   });
 
   it.each([
@@ -350,10 +398,27 @@ describe("AWS Route 53 addTxt", () => {
 describe("AWS Route 53 removeTxt", () => {
   const HANDLE = `${ZONE.id}/${FQDN}`;
 
-  it("同名下还有别的值：只去掉这一个，剩余值按原 TTL UPSERT", async () => {
+  it("同名下还有别的值：只去掉这一个，同一批次 DELETE 旧记录集 + CREATE 剩余值（原 TTL）", async () => {
     const fetch = r53([rrsets({ name: `${FQDN}.`, type: "TXT", ttl: 60, values: [`"${V2}"`, `"${V1}"`] })]);
     await awsDns.removeTxt(ctxOf(fetch), CREDS, RECORD, HANDLE);
-    expect(parseChange(fetch.calls[1]!.body)).toEqual({ action: "UPSERT", name: `${FQDN}.`, type: "TXT", ttl: 60, values: [`"${V2}"`] });
+    expect(parseChanges(fetch.calls[1]!.body)).toEqual([
+      { action: "DELETE", name: NAME, type: "TXT", ttl: 60, values: [`"${V2}"`, `"${V1}"`] },
+      { action: "CREATE", name: NAME, type: "TXT", ttl: 60, values: [`"${V2}"`] },
+    ]);
+  });
+
+  it("删除途中别人又加了值（DELETE 对不上）：重读后保留别人的值再写", async () => {
+    const V3 = "c".repeat(43);
+    const fetch = r53(
+      [rrsets({ name: NAME, type: "TXT", ttl: 60, values: [`"${V2}"`, `"${V1}"`] }), rrsets({ name: NAME, type: "TXT", ttl: 60, values: [`"${V2}"`, `"${V1}"`, `"${V3}"`] })],
+      [invalidBatch("values provided do not match the current values"), CHANGE_OK],
+    );
+    await awsDns.removeTxt(ctxOf(fetch), CREDS, RECORD, HANDLE);
+    expect(fetch.calls.map((c) => c.method)).toEqual(["GET", "POST", "GET", "POST"]);
+    expect(parseChanges(fetch.calls[3]!.body)).toEqual([
+      { action: "DELETE", name: NAME, type: "TXT", ttl: 60, values: [`"${V2}"`, `"${V1}"`, `"${V3}"`] },
+      { action: "CREATE", name: NAME, type: "TXT", ttl: 60, values: [`"${V2}"`, `"${V3}"`] },
+    ]);
   });
 
   it("最后一个值：DELETE，TTL 与值与当前记录集完全一致", async () => {

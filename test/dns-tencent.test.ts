@@ -155,12 +155,13 @@ describe("DNSPod addTxt", () => {
     expect(sleeps).toEqual([10_000]);
   });
 
-  it("报已存在却一直查不到：查 4 次后原样报错", async () => {
+  it("报已存在却一直查不到：查 4 次后报 RecordMayExist（可能已添加），带 RequestId", async () => {
     const fetch = dnspod((action) => (action === "CreateRecord" ? tcError("InvalidParameter.DomainRecordExist") : ok({ RecordList: [] })));
     const sleeps: number[] = [];
-    await expect(tencentDns.addTxt(ctxOf(fetch, sleeps), CREDS, rec("_acme-challenge.example.com"))).rejects.toMatchObject({
-      code: "InvalidParameter.DomainRecordExist",
-    });
+    const err = await tencentDns.addTxt(ctxOf(fetch, sleeps), CREDS, rec("_acme-challenge.example.com")).catch((e: unknown) => e);
+    expect(err).toMatchObject({ provider: "tencent", code: "RecordMayExist", requestId: "rid-err" });
+    expect((err as Error).message).toMatch(/InvalidParameter\.DomainRecordExist.*可能已添加/);
+    expect(fetch.calls.filter((c) => c.action === "CreateRecord")).toHaveLength(1);
     expect(fetch.calls.filter((c) => c.action === "DescribeRecordList")).toHaveLength(4);
     expect(sleeps).toEqual([10_000, 10_000, 10_000]);
   });
