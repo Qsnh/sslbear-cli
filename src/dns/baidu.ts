@@ -96,7 +96,9 @@ export const baiduDns = defineDns<AccessKeyCredentials>({
 
   /**
    * 公网 DNS 的域名列表（内网 DNS 是另一个服务 privatezone.baidubce.com，不会出现在这里）。
-   * 只返回 running：nsunchange（NS 尚未修改，即未接入）、torenew（未备案，百度只解析已备案的域名）、unregister、failed 时解析记录不会生效
+   * 返回 running 与 torenew：nsunchange（NS 尚未修改，即未接入）、unregister、failed 时解析记录不会生效。
+   * torenew（未备案）照常返回：百度文档写明「域名解析与备案并无直接关联……即使网站未备案或者备案中，这并不影响域名解析的设置和解析的生效」
+   * （https://cloud.baidu.com/doc/BCD/s/Yka2olkgy），备案只影响解析到境内服务器的网站能否访问；DNS-01 验证只查 TXT，与之无关
    */
   async listZones(ctx, creds) {
     const zones = await listAll<BceZone>(ctx, creds, "/v1/dns/zone", "zones").catch((e: unknown) => {
@@ -107,7 +109,7 @@ export const baiduDns = defineDns<AccessKeyCredentials>({
       throw e;
     });
     return zones
-      .filter((z): z is BceZone & { name: string } => !!z.name?.trim() && z.status === "running")
+      .filter((z): z is BceZone & { name: string } => !!z.name?.trim() && (z.status === "running" || z.status === "torenew"))
       .map((z) => ({
         // 中文域名：zone 名用 punycode（与 issue 规范化后的域名一致），路径上仍用接口里的原名
         name: ascii(z.name),

@@ -91,6 +91,8 @@ describe("百度智能云 DNS listZones", () => {
       { name: "example.com", id: "example.com", extra: { ttl: "300" } },
       { name: "xn--fsqu00a.xn--fiqs8s", id: "例子.中国", extra: { ttl: "1" } },
       { name: "cheap.com", id: "cheap.com", extra: { ttl: "120" } },
+      // 未备案不影响解析生效，照常返回
+      { name: "nobeian.com", id: "nobeian.com", extra: { ttl: "300" } },
       { name: "future.com", id: "future.com", extra: { ttl: "300" } },
     ]);
     expect(fetch.calls.map((c) => Object.fromEntries(c.url.searchParams))).toEqual([{ maxKeys: "1000" }, { maxKeys: "1000", marker: "m2" }]);
