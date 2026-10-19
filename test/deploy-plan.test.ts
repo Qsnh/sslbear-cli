@@ -62,6 +62,20 @@ describe("decide", () => {
     expect(decide(on("2027-01-01T00:00:00Z"), CERT, { ...opts, force: true, named: true })).toMatchObject({ kind: "update", oldCert: { name: "old" } });
   });
 
+  it("时间相近但当前证书覆盖了新证书没有的域名（两天内改域名重签）：不是同一张，需确认，--force 后更新", () => {
+    const other = rec({ cert: { name: "old", notBefore: "2026-10-01T00:00:00Z", notAfter: "2027-01-01T00:00:00Z", algorithm: "RSA", sans: ["example.com", "*.example.com"] } });
+    const d = decide(other, CERT, opts);
+    expect(d).toMatchObject({ kind: "skip", reason: "same_expiry", needsConfirm: true });
+    expect(d.message).toContain("当前证书还覆盖 *.example.com");
+    expect(decide(other, CERT, { ...opts, force: true })).toMatchObject({ kind: "update" });
+    // 多数服务只返回 CN：CN 不在新证书里同样不是同一张；不像域名的 CN（如证书名）不参与
+    expect(decide(rec({ cert: { notAfter: "2027-01-01T00:00:00Z", commonName: "www.example.com" } }), CERT, opts)).toMatchObject({ reason: "same_expiry" });
+    expect(decide(rec({ cert: { notAfter: "2027-01-01T00:00:00Z", commonName: "my cert" } }), CERT, opts)).toMatchObject({ reason: "already_current" });
+    // 服务返回的 SAN 比证书里的少（或大小写不同）不算不同：仍是同一张
+    const partial = rec({ cert: { name: "old", notAfter: "2027-01-01T00:00:00Z", algorithm: "RSA", sans: ["EXAMPLE.com"] } });
+    expect(decide(partial, CERT, opts)).toMatchObject({ kind: "skip", reason: "already_current" });
+  });
+
   it("到期时间相同但算法不同：需确认，--force 后更新", () => {
     const ecc = rec({ cert: { name: "old", notBefore: "2026-10-01T00:00:15Z", notAfter: "2027-01-01T00:00:15Z", algorithm: "ECC" } });
     const d = decide(ecc, CERT, opts);

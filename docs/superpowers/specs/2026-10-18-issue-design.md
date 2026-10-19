@@ -52,7 +52,8 @@ sslbear-cli issue -d <域名,...> [选项]
       --timeout <ms> --json --env-file <path>   同其他命令
 ```
 
-- 目录名：第一个域名（`*` 换成 `_`）+ `_rsa` / `_ecc`，测试环境再加 `_staging`。如 `*.example.com` 的 ECC 证书在 `~/.sslbear-cli/certs/_.example.com_ecc/`。
+- 主域名：层级最少的域名（泛域名按去掉 `*.` 后算），同级时非泛域名优先、再按字母序；与 `-d` 的顺序无关，作证书 CN，也决定目录名。
+- 目录名：主域名（`*` 换成 `_`）+ `_rsa` / `_ecc`，测试环境再加 `_staging`。如 `*.example.com` 的 ECC 证书在 `~/.sslbear-cli/certs/_.example.com_ecc/`。
 - 状态目录根：`~/.sslbear-cli`，环境变量 `SSLBEAR_CLI_HOME` 可改（CI / 测试用）。
 - 第一次运行自动注册 ACME 账号（等于同意 Let's Encrypt 订阅协议，README 写明），账号私钥（ECDSA P-256）存在 `<根>/acme/<CA 主机名>/account.pem`（600），以后复用。
 
@@ -69,7 +70,7 @@ sslbear-cli issue -d <域名,...> [选项]
 7. **等待生效**：查 zone 的权威 NS（系统解析器查 NS 记录，再解析 NS 的 IP），每 5 秒直接向每个权威服务器查询 TXT，全部权威服务器都看到全部值后，再等 10 秒（Let's Encrypt 多地验证，anycast 节点同步有延迟）。超过 `--dns-timeout` → `DnsPropagationTimeout`（可重试）；message 里说明域名实际的 NS 与服务商是否一致。所有权威服务器都连不上（网络环境限制）→ 退化为固定等待 30 秒后继续。
 8. **验证**：逐个通知质询，轮询授权直到 valid；invalid → `AcmeChallengeFailed`，带 CA 给的原因。
 9. **清理**：无论成功失败，第 6 步加过的记录都在退出前逐条删除（只删本次加的那个值）。删除失败不影响签发结果，但在 `dns[].cleaned: false` 和 `message` 里写明，让用户手动删。
-10. **签发**：生成证书私钥（RSA 2048 / P-256），CSR 的 CN 为第一个域名（超过 64 个字符则不设 CN），SAN 为全部域名；`finalize` 并轮询订单直到 valid；下载证书链，用 `loadLocalCert` 校验（链、私钥匹配、有效期），再写文件：目录 700，先写临时文件再改名，`privkey.pem` 600、`fullchain.pem` 644。
+10. **签发**：生成证书私钥（RSA 2048 / P-256），CSR 的 CN 为主域名（超过 64 个字符则不设 CN），SAN 为全部域名；`finalize` 并轮询订单直到 valid；下载证书链，用 `loadLocalCert` 校验（链、私钥匹配、有效期），再写文件：目录 700，先写临时文件再改名，`privkey.pem` 600、`fullchain.pem` 644。
 11. **输出**。
 
 人在终端运行（不加 `--json`）时，每一步在 stderr 打一行进度（「已在 阿里云云解析 添加 _acme-challenge.example.com」「等待 DNS 生效…」）；`--json` 时 stderr 不输出进度，只在失败时输出一行错误 JSON。

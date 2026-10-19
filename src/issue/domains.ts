@@ -37,20 +37,30 @@ export function normalizeIssueDomain(input: string): string {
   return domain;
 }
 
-/** -d 给的全部域名：逐个规范化、去重（保持首次出现的顺序，第一个域名决定 CN 与保存目录名）、不超过 100 个 */
+/** 主域名的排序：层级少的在前（泛域名按去掉 *. 后算），同级时非泛域名在前，再按字母序 */
+function primaryOrder(a: string, b: string): number {
+  const depth = (d: string) => d.replace(/^\*\./, "").split(".").length;
+  return depth(a) - depth(b) || Number(a.startsWith("*.")) - Number(b.startsWith("*.")) || (a < b ? -1 : a > b ? 1 : 0);
+}
+
+/**
+ * -d 给的全部域名：逐个规范化、去重、不超过 100 个。主域名（见 primaryOrder）排第一，决定 CN 与保存目录名，
+ * 其余保持首次出现的顺序：-d 写的顺序不同也落到同一个目录，重复执行才能复用
+ */
 export function parseDomains(inputs: readonly string[]): string[] {
   if (inputs.length === 0) throw new UsageError("--domain 不能为空");
   const domains = [...new Set(inputs.map(normalizeIssueDomain))];
   if (domains.length > MAX_DOMAINS) throw new UsageError(`一张证书最多 ${MAX_DOMAINS} 个域名，去重后收到 ${domains.length} 个`);
-  return domains;
+  const primary = [...domains].sort(primaryOrder)[0]!;
+  return [primary, ...domains.filter((d) => d !== primary)];
 }
 
 /**
- * 默认保存目录名：第一个域名（"*" 换成 "_"）+ 算法，测试环境再加 _staging。
+ * 默认保存目录名：主域名（"*" 换成 "_"）+ 算法，测试环境再加 _staging。
  * 算法、环境都进目录名：RSA / ECC 两张证书可以并存，--staging 的测试证书不会覆盖正式证书
  */
-export function certDirName(firstDomain: string, keyType: KeyType, staging: boolean): string {
-  return `${firstDomain.replace("*", "_")}_${keyType}${staging ? "_staging" : ""}`;
+export function certDirName(primary: string, keyType: KeyType, staging: boolean): string {
+  return `${primary.replace("*", "_")}_${keyType}${staging ? "_staging" : ""}`;
 }
 
 /** 验证记录所在的名字：泛域名去掉 "*."，与根域名共用同一个 _acme-challenge 名 */

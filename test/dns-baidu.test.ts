@@ -48,6 +48,14 @@ const txt = (id: string, rr: string, value: string, extra: Record<string, unknow
 const records = (list: unknown[]): FakeReply => ({ body: { marker: "", isTruncated: false, maxKeys: 1000, records: list } });
 
 describe("百度智能云 DNS listZones", () => {
+  it("没开通智能云解析（缺服务角色）时在报错里说明原因", async () => {
+    const fetch = bce(() => bceError(404, "NotFound", "could not found: role[BceServiceRole_console_dns]"));
+    const e = await baiduDns.listZones(ctxOf(fetch), CREDS).catch((err: unknown) => err);
+    expect(e).toBeInstanceOf(CloudApiError);
+    expect(e).toMatchObject({ code: "NotFound", requestId: "rid-err" });
+    expect((e as Error).message).toMatch(/智能云解析 DNS 未开通/);
+  });
+
   it("按 marker 翻页；只要 running 的，域名规范化，中文域名转 punycode、原名作 id，按版本定 TTL", async () => {
     const fetch = bce((req, q) => {
       if (req.url.pathname !== "/v1/dns/zone") return undefined;

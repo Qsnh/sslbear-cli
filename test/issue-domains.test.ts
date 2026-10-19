@@ -58,8 +58,17 @@ describe("normalizeIssueDomain", () => {
 });
 
 describe("parseDomains", () => {
-  it("去重并保持首次出现的顺序", () => {
-    expect(parseDomains(["b.example.com", "*.example.com", "B.example.com.", "example.com"])).toEqual(["b.example.com", "*.example.com", "example.com"]);
+  it("去重；主域名排第一，其余保持首次出现的顺序", () => {
+    expect(parseDomains(["b.example.com", "*.example.com", "B.example.com.", "example.com"])).toEqual(["example.com", "b.example.com", "*.example.com"]);
+  });
+
+  it("主域名与 -d 的顺序无关：层级少的优先，同级时非泛域名优先、再按字母序", () => {
+    expect(parseDomains(["*.example.com", "example.com"])[0]).toBe("example.com");
+    expect(parseDomains(["example.com", "*.example.com"])[0]).toBe("example.com");
+    expect(parseDomains(["www.example.com", "*.example.com"])[0]).toBe("*.example.com");
+    expect(parseDomains(["*.a.example.com", "b.example.com", "a.example.com"])[0]).toBe("a.example.com");
+    expect(parseDomains(["*.example.com"])[0]).toBe("*.example.com");
+    expect(parseDomains(["b.example.net", "a.example.org"])[0]).toBe("a.example.org");
   });
 
   it("空列表、超过 100 个（按去重后计）时报参数错误", () => {
@@ -71,7 +80,7 @@ describe("parseDomains", () => {
 });
 
 describe("保存目录名与验证记录名", () => {
-  it("第一个域名 + 算法，测试环境加 _staging；* 换成 _", () => {
+  it("主域名 + 算法，测试环境加 _staging；* 换成 _", () => {
     expect(certDirName("example.com", "rsa", false)).toBe("example.com_rsa");
     expect(certDirName("*.example.com", "ecc", false)).toBe("_.example.com_ecc");
     expect(certDirName("*.example.com", "rsa", true)).toBe("_.example.com_rsa_staging");

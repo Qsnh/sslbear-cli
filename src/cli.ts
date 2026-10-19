@@ -12,7 +12,7 @@ import { generateCertKey } from "./issue/csr.js";
 import { parseDomains } from "./issue/domains.js";
 import { systemDnsLookup, type DnsLookup } from "./issue/propagation.js";
 import { issueNotes, leftoverNotes, printProgress, renderIssue } from "./issue/render.js";
-import { IssueError, runIssue, type AcmeFactory, type DnsResult, type IssueReport } from "./issue/run.js";
+import { cleanupNote, IssueError, runIssue, type AcmeFactory, type DnsResult, type IssueReport } from "./issue/run.js";
 import type { KeyType } from "./issue/types.js";
 import type { DnsIssue } from "./issue/zones.js";
 import { dnsEnvStatus, envStatus, renderCerts, renderDomains, renderEnv } from "./render.js";
@@ -51,6 +51,8 @@ export interface Deps {
   dnsLookup?: DnsLookup;
   acme?: AcmeFactory;
   generateKey?: (type: KeyType) => KeyObject;
+  /** 登记中断（SIGINT / SIGTERM）处理：收到信号时等 onSignal 完成再退出，返回撤销登记的函数；入口提供，测试可注入 */
+  trapInterrupt?: (onSignal: () => Promise<void>) => () => void;
 }
 
 interface CommonOpts {
@@ -346,6 +348,20 @@ function failIssue(opts: OutputOptions, e: IssueError): never {
   fail(opts, e.status, e.message, 1, e.extra);
 }
 
+/** 签发途中被中止（agent 的命令超时、Ctrl+C）：删掉本次加的 TXT 记录，按失败输出（status Interrupted）后退出 */
+function interruptHandler(out: OutputOptions, trap: NonNullable<Deps["trapInterrupt"]>) {
+  return (cleanup: () => Promise<DnsResult[]>) =>
+    trap(async () => {
+      if (!out.json) console.error("\n收到中止信号，正在删除本次添加的 TXT 记录…");
+      const dns = await cleanup();
+      try {
+        failIssue(out, new IssueError("Interrupted", `签发被中止；${cleanupNote(dns)}`, { retryable: true, dns }));
+      } catch {
+        // failIssue 输出后抛 ExitError，退出由入口负责
+      }
+    });
+}
+
 const ISSUE_DESCRIPTION = `向 Let's Encrypt 申请证书（ACME DNS-01 验证），产出 fullchain.pem + privkey.pem，可直接用于 deploy --cert / --key。
 自动在域名所在的 DNS 服务商添加 _acme-challenge TXT 记录，验证完自动删除。签发通常需要 1~2 分钟。
 首次运行会自动注册 Let's Encrypt 账号，即视为同意 Let's Encrypt 订阅协议（https://letsencrypt.org/repository/）。
@@ -354,7 +370,8 @@ const ISSUE_DESCRIPTION = `向 Let's Encrypt 申请证书（ACME DNS-01 验证�
   - -d 逗号分隔、可重复，最多 100 个；*.example.com 只覆盖一级子域，不含 example.com 本身（需要的话两个都写）
   - 自动找出每个域名由哪家 DNS 服务商解析：取最长后缀匹配的 zone（子域单独托管时以子域为准）；
     多家都托管了同一个 zone 时按域名实际的 NS 记录判定，判定不了须用 --dns 指定
-  - 证书默认保存在 ~/.sslbear-cli/certs/<第一个域名>_<rsa|ecc>/（* 换成 _，测试环境再加 _staging），--out 可改；
+  - 主域名（层级最少的，同级时非泛域名优先、再按字母序；与 -d 的顺序无关）作证书的 CN，也决定保存目录名；
+  - 证书默认保存在 ~/.sslbear-cli/certs/<主域名>_<rsa|ecc>/（* 换成 _，测试环境再加 _staging），--out 可改；
     目录 700、privkey.pem 600、fullchain.pem 644（环境变量 SSLBEAR_CLI_HOME 可改 ~/.sslbear-cli 的位置）
   - 保存位置已有同一组域名（不计顺序）、同算法、同为正式 / 测试环境且剩余 30 天以上的证书时直接复用（reused: true），
     不申请新证书，重复执行是安全的（--dry-run 也一样）；--force 才重新签发
@@ -516,6 +533,7 @@ export function buildProgram(deps: Deps, output: OutputOptions = { json: false }
             acme: deps.acme ?? createAcmeClient,
             generateKey: deps.generateKey ?? generateCertKey,
             ...(!out.json && { progress: printProgress }),
+            ...(deps.trapInterrupt && { trapInterrupt: interruptHandler(out, deps.trapInterrupt) }),
           },
         );
       } catch (e) {

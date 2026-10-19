@@ -430,6 +430,36 @@ describe("错误", () => {
   });
 });
 
+describe("网络重试", () => {
+  it("网络错误、超时自动重试（共 3 次，间隔 1、2 秒）；POST 原样重发同一个 nonce", async () => {
+    const ca = fakeCa();
+    cas.push(ca);
+    const failOnce = new Set([DIR_URL, DIRECTORY.newAccount]);
+    const flaky = (async (input: string | URL | Request, init?: RequestInit) => {
+      // 目录与 newAccount 的第一次发送都在连上之前断开：CA 没收到，nonce 仍有效
+      if (failOnce.delete(String(input))) throw new TypeError("fetch failed", { cause: { code: "ECONNRESET" } });
+      return ca.fetch(input, init);
+    }) as Fetch;
+    const sleeps: number[] = [];
+    const client = await createAcmeClient(ctxOf(flaky, sleeps), { directoryUrl: DIR_URL, accountKey: generateAccountKey() });
+    await client.ensureAccount();
+    expect(sleeps).toEqual([1000, 1000]);
+    expect(ca.requests.map((r) => r.path)).toEqual(["/new-account"]);
+  });
+
+  it("连续 3 次网络错误才放弃", async () => {
+    let calls = 0;
+    const down = (async () => {
+      calls++;
+      throw new TypeError("fetch failed", { cause: { code: "ECONNRESET" } });
+    }) as Fetch;
+    const sleeps: number[] = [];
+    expect(await acmeError(createAcmeClient(ctxOf(down, sleeps), { directoryUrl: DIR_URL, accountKey: generateAccountKey() }))).toMatchObject({ type: "network" });
+    expect(calls).toBe(3);
+    expect(sleeps).toEqual([1000, 2000]);
+  });
+});
+
 describe("waitAuthorization", () => {
   it("pending → valid；轮询间隔遵守 Retry-After（上限 10 秒、下限 1 秒，缺省 2 秒）", async () => {
     const replies: Record<string, string>[] = [{ "Retry-After": "3" }, {}, { "Retry-After": "60" }, { "Retry-After": "0" }];
@@ -547,6 +577,21 @@ describe("finalize 与下载", () => {
       return undefined;
     });
     expect(await acmeError(client.finalize(snapshot, Buffer.from([0x30, 0x00]), 60_000))).toMatchObject({ type: "badCSR", httpStatus: 400 });
+  });
+
+  it("提交 CSR 报错但订单其实已在签发（网络重试导致重复提交）时接着等", async () => {
+    const states = ["ready", "processing", "valid"];
+    let i = 0;
+    const { client } = await setup((req) => {
+      if (req.path === "/order/1") {
+        const s = states[i++]!;
+        return json(order(s, s === "valid" ? { certificate: `${BASE}/cert/1` } : {}));
+      }
+      if (req.path === "/order/1/finalize") return problem(403, "orderNotReady", "Order's status (\"processing\") is not acceptable for finalization");
+      return undefined;
+    });
+    const done = await client.finalize(snapshot, Buffer.from([0x30, 0x00]), 60_000);
+    expect(done.certificate).toBe(`${BASE}/cert/1`);
   });
 
   it("一直 processing 时按累计等待时间超时", async () => {

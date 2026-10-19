@@ -38,11 +38,28 @@ function hostOf(url: string): string {
   }
 }
 
+/** 网络错误、超时的总尝试次数：实测经代理访问 Let's Encrypt 偶发 ECONNRESET，重试即恢复 */
+const MAX_NETWORK_ATTEMPTS = 3;
+
 /**
  * 自己发请求而不用 lib/http.ts 的 send：ACME 要读 Replay-Nonce / Location / Retry-After 响应头。
- * 读响应体也在超时与网络错误处理范围内（响应头到了但响应体卡住同样算超时）
+ * 网络错误、超时自动重试：POST 原样重发是安全的——CA 没收到时 nonce 仍有效；收到过则 nonce 已用掉，
+ * CA 回 badNonce，由 post() 换新 nonce 重发（newAccount、POST-as-GET、应答质询可重复执行，finalize 另行处理）
  */
 async function request(ctx: QueryContext, url: string, init: { method: string; headers?: Record<string, string>; body?: string }): Promise<AcmeResponse> {
+  const sleep = ctx.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await requestOnce(ctx, url, init);
+    } catch (e) {
+      if (attempt >= MAX_NETWORK_ATTEMPTS || !(e instanceof AcmeError)) throw e;
+      await sleep(1000 * attempt);
+    }
+  }
+}
+
+/** 读响应体也在超时与网络错误处理范围内（响应头到了但响应体卡住同样算超时） */
+async function requestOnce(ctx: QueryContext, url: string, init: { method: string; headers?: Record<string, string>; body?: string }): Promise<AcmeResponse> {
   try {
     const res = await ctx.fetch(url, { ...init, headers: { "User-Agent": USER_AGENT, ...init.headers }, signal: AbortSignal.timeout(ctx.timeoutMs) });
     return { status: res.status, headers: res.headers, text: await res.text() };
@@ -312,9 +329,16 @@ export async function createAcmeClient(ctx: QueryContext, opts: { directoryUrl: 
       // 传入的是下单时的订单快照（通常还是 pending），以 CA 现在的状态为准
       let cur = await readOrder(order.url);
       if (cur.order.status === "ready") {
-        const res = await post(cur.order.finalize, { csr: b64u(csrDer) });
-        const body = jsonOf(res, cur.order.finalize);
-        cur = { order: parseOrder(body, order.url), body, retryAfter: retryAfterOf(res.headers) };
+        try {
+          const res = await post(cur.order.finalize, { csr: b64u(csrDer) });
+          const body = jsonOf(res, cur.order.finalize);
+          cur = { order: parseOrder(body, order.url), body, retryAfter: retryAfterOf(res.headers) };
+        } catch (e) {
+          // 网络重试时第一次提交其实已被 CA 受理，重发会报 orderNotReady：订单已在签发就接着等，否则原样报错
+          const now = await readOrder(order.url);
+          if (now.order.status !== "processing" && now.order.status !== "valid") throw e;
+          cur = now;
+        }
       }
       const wait = waiter(timeoutMs);
       for (;;) {

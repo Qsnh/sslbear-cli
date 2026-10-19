@@ -64,6 +64,7 @@ export interface RunCliOptions {
   dnsLookup?: Deps["dnsLookup"];
   acme?: Deps["acme"];
   generateKey?: Deps["generateKey"];
+  trapInterrupt?: Deps["trapInterrupt"];
 }
 
 export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<CliResult> {
@@ -88,6 +89,7 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
       ...(opts.dnsLookup && { dnsLookup: opts.dnsLookup }),
       ...(opts.acme && { acme: opts.acme }),
       ...(opts.generateKey && { generateKey: opts.generateKey }),
+      ...(opts.trapInterrupt && { trapInterrupt: opts.trapInterrupt }),
     });
     const stdout = out.join("\n");
     let json: unknown;

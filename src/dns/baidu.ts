@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { domainToASCII } from "node:url";
 import { ENV_FAMILIES, readAccessKey, type AccessKeyCredentials } from "../lib/env.js";
-import type { QueryContext } from "../lib/http.js";
+import { CloudApiError, type QueryContext } from "../lib/http.js";
 import { callBce } from "../providers/baidu/client.js";
 import { familyEnv } from "./env.js";
 import { defineDns, normalizeName, relativeName, type DnsZone } from "./types.js";
@@ -94,7 +94,13 @@ export const baiduDns = defineDns<AccessKeyCredentials>({
    * 只返回 running：nsunchange（NS 尚未修改，即未接入）、torenew（未备案，百度只解析已备案的域名）、unregister、failed 时解析记录不会生效
    */
   async listZones(ctx, creds) {
-    const zones = await listAll<BceZone>(ctx, creds, "/v1/dns/zone", "zones");
+    const zones = await listAll<BceZone>(ctx, creds, "/v1/dns/zone", "zones").catch((e: unknown) => {
+      // 实测：没开通智能云解析的账号报 NotFound「could not found: role[BceServiceRole_console_dns]」（缺服务角色），原文看不出原因
+      if (e instanceof CloudApiError && /BceServiceRole_console_dns/.test(e.message)) {
+        throw new CloudApiError("baidu", e.code, `${e.message}（智能云解析 DNS 未开通：缺少服务角色，请先在百度智能云控制台开通智能云解析）`, e.requestId, e.httpStatus);
+      }
+      throw e;
+    });
     return zones
       .filter((z): z is BceZone & { name: string } => !!z.name?.trim() && z.status === "running")
       .map((z) => ({

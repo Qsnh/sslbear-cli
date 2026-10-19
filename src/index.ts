@@ -21,12 +21,37 @@ async function confirm(question: string): Promise<boolean> {
   }
 }
 
+/**
+ * 收到 SIGINT / SIGTERM 时先跑 onSignal（issue 删除本次加的 TXT 记录）再退出，最多等 30 秒；
+ * 再按一次 Ctrl+C 立即退出
+ */
+function trapInterrupt(onSignal: () => Promise<void>): () => void {
+  let fired = false;
+  const handler = (signal: NodeJS.Signals) => {
+    const code = signal === "SIGINT" ? 130 : 143;
+    if (fired) process.exit(code);
+    fired = true;
+    const limit = new Promise<void>((r) => setTimeout(r, 30_000).unref());
+    // 等 stderr 写完再退出：macOS 上写管道是异步的，直接 exit 会丢掉最后那行错误 JSON
+    void Promise.race([onSignal(), limit])
+      .catch(() => {})
+      .finally(() => process.stderr.write("", () => process.exit(code)));
+  };
+  process.on("SIGINT", handler);
+  process.on("SIGTERM", handler);
+  return () => {
+    process.off("SIGINT", handler);
+    process.off("SIGTERM", handler);
+  };
+}
+
 const code = await run(process.argv.slice(2), {
   env: process.env,
   fetch: globalThis.fetch,
   now: () => new Date(),
   cwd: process.cwd(),
   home: homedir(),
+  trapInterrupt,
   // 只有人在终端直接运行时才交互；AI / 脚本调用（管道、重定向）不询问
   ...(process.stdin.isTTY && process.stdout.isTTY && { confirm }),
 });

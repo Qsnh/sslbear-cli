@@ -57,6 +57,11 @@ export interface IssueDeps {
   generateKey: (type: KeyType) => KeyObject;
   /** 人在终端运行时每一步打一行进度（写 stderr）；--json 时不传 */
   progress?: (message: string) => void;
+  /**
+   * 进程被 Ctrl+C / kill 时先清理再退出：加 TXT 记录前登记，清理完成后撤销。
+   * onSignal 删除本次加的记录并返回 dns[]；返回撤销登记的函数。测试不传
+   */
+  trapInterrupt?: (onSignal: () => Promise<DnsResult[]>) => () => void;
 }
 
 /** 一个需要验证的域名对应的 TXT 记录；--dry-run 时没有 cleaned */
@@ -223,13 +228,16 @@ function withState(e: unknown, state: RunState): unknown {
   return err;
 }
 
-/** 失败时在 message 末尾交代本次加的记录清理得怎样：表格模式下用户只看得到 message */
+/** 本次加的记录清理得怎样，接在失败 message 末尾：表格模式下用户只看得到 message */
+export function cleanupNote(dns: DnsResult[]): string {
+  const left = dns.filter((d) => d.cleaned === false).length;
+  return left > 0 ? `有 ${left} 条 TXT 记录可能残留，需要手动删除（见 dns）` : `本次添加的 ${dns.length} 条 TXT 记录已删除`;
+}
+
 function withCleanup(e: unknown, dns: DnsResult[]): unknown {
   if (e instanceof UsageError || dns.length === 0) return e;
   const err = asIssueError(e);
-  const left = dns.filter((d) => d.cleaned === false).length;
-  const note = left > 0 ? `；有 ${left} 条 TXT 记录可能残留，需要手动删除（见 dns）` : `；本次添加的 ${dns.length} 条 TXT 记录已删除`;
-  return new IssueError(err.status, `${err.message}${note}`, err.extra);
+  return new IssueError(err.status, `${err.message}；${cleanupNote(dns)}`, err.extra);
 }
 
 interface IssueCtx {
@@ -257,6 +265,13 @@ async function issue(ctx: QueryContext, opts: IssueOptions, deps: IssueDeps, ic:
 
   // 6~8. 设置 DNS、等生效、验证；无论成败都先清理再往下走
   const added: Added[] = [];
+  // 正常流程与中断信号可能同时触发清理，只跑一次：记录集模型的服务商读改写不能并发
+  let cleaning: Promise<void> | undefined;
+  const cleanupOnce = () => (cleaning ??= cleanup(ctx, added, say));
+  const untrap = deps.trapInterrupt?.(async () => {
+    await cleanupOnce();
+    return ic.state.dns;
+  });
   let failure: { error: unknown } | undefined;
   try {
     const challenges = await pendingChallenges(client, order, ic);
@@ -267,7 +282,8 @@ async function issue(ctx: QueryContext, opts: IssueOptions, deps: IssueDeps, ic:
     failure = { error };
   }
   // 9. 清理：只删本次加的值，失败不影响签发结果，但要在 dns[] 里写明
-  await cleanup(ctx, added, say);
+  await cleanupOnce();
+  untrap?.();
   if (failure) throw withCleanup(failure.error, ic.state.dns);
 
   // 10. 签发

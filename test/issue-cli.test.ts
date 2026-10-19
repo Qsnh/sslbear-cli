@@ -659,3 +659,29 @@ describe("env 命令的 DNS 服务商与 .env 整组屏蔽", () => {
     expect(dns.cloudflare.state).toBe("ok");
   });
 });
+
+describe("issue 被中止", () => {
+  it("等待生效时收到中止信号：删除本次加的记录、输出 Interrupted；正常流程随后不会重复删除", async () => {
+    const s = setup();
+    let onSignal: (() => Promise<void>) | undefined;
+    const untrap = vi.fn();
+    const trapInterrupt = vi.fn((fn: () => Promise<void>) => ((onSignal = fn), untrap));
+    // 第一次查权威 DNS 时模拟收到信号（入口会等 onSignal 完成后退出进程；测试里进程不退出，正常流程会接着走完）
+    let signalled: Promise<void> | undefined;
+    const dnsLookup = fakeLookup(s.world, {
+      queryTxt: vi.fn(async (_ip: string, fqdn: string) => {
+        signalled ??= onSignal!();
+        await signalled;
+        return s.world.txt.get(fqdn) ?? [];
+      }),
+    });
+    const r = await s.issue(["-d", DOMAINS, "--json"], { dnsLookup, trapInterrupt });
+    const interrupted = r.stderr.split("\n").map((l) => JSON.parse(l)).find((e) => e.status === "Interrupted");
+    expect(interrupted).toMatchObject({ ok: false, retryable: true, message: "签发被中止；本次添加的 2 条 TXT 记录已删除" });
+    expect(interrupted.dns.map((d: { cleaned: boolean }) => d.cleaned)).toEqual([true, true]);
+    expect(s.world.log.filter((l) => l.startsWith("remove"))).toHaveLength(2);
+    // 清理完成后撤销登记：之后再按 Ctrl+C 不会再跑清理
+    expect(trapInterrupt).toHaveBeenCalledTimes(1);
+    expect(untrap).toHaveBeenCalledTimes(1);
+  });
+});
