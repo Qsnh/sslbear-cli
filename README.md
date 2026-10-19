@@ -13,7 +13,7 @@ agent 调用一律加 `--json`，这样遇到需要确认的情况也不会停�
 1. **检查凭证**：`npx sslbear-cli env --json`。`data.providers[].state` 为 `ok` 的云会被查询，`missing` 的云会被跳过。只要有一家是 `incomplete`（只配了一半），后面的命令就会整条报错（exit 2），除非用 `-p` 把它排除；这时请用户补全或删掉这家的凭证（见[凭证](#凭证)）。要签发证书时，域名所在的 DNS 服务商在 `data.dns[]` 里也要是 `ok`。
 2. **找出快到期的域名**：`npx sslbear-cli domains -e 30 --json`。这条命令列出 30 天内到期的证书，已过期的也算在内；`data.items` 按 `daysLeft` 升序，`cert.sans` 是新证书需要覆盖的域名。
 3. **准备新证书**：按 `cert.sans` 分组，每组签一张：`npx sslbear-cli issue -d <sans 用逗号连接> --json`，按[处理 issue 结果](#处理-issue-结果)处理。`data.files.cert` / `data.files.key` 就是下一步的 `--cert` / `--key`。签发一般要 1~2 分钟，最长约 `--dns-timeout`（默认 300 秒）再加 4 分钟，命令超时请设到 10 分钟以上。
-   - 用户自备证书时跳过 `issue`：要 fullchain（叶子证书 + 中间证书链）和未加密的 RSA / ECC 私钥，并且带 CN。多数服务拒收没有 CN 的证书，Let's Encrypt shortlived / tlsserver 配置文件签发的就没有（见[已知限制·通用](docs/limitations.md#通用)）；`issue` 签的证书都带 CN。
+   - 用户自备证书时跳过 `issue`：要 fullchain（叶子证书 + 中间证书链）和未加密的 RSA / ECC 私钥，并且带 CN。多数服务拒收没有 CN 的证书，Let's Encrypt shortlived / tlsserver 配置文件签发的就没有（见[已知限制·通用](docs/limitations.md#通用)）；`issue` 用 classic 配置文件签发，证书带 CN。
    - 一张证书只需部署一次，它覆盖的所有域名会被自动找出来。
 4. **预览**：`npx sslbear-cli deploy --cert fullchain.pem --key privkey.pem --dry-run --json`。只输出计划，不上传证书，也不修改任何配置。
 5. **执行**：同一条命令去掉 `--dry-run`。
@@ -83,7 +83,7 @@ agent 调用一律加 `--json`，这样遇到需要确认的情况也不会停�
 | `AcmeChallengeFailed` | Let's Encrypt 验证 `domain` 失败（`acmeType`、`detail`） | 把 `detail` 报给用户。常见原因：`_acme-challenge` 有 CNAME、CAA 记录不允许 Let's Encrypt |
 | `AcmeRateLimited` | 触发 Let's Encrypt 频率限制，`retryAfter` 秒后可重试 | 不要马上重试，把时间告诉用户 |
 | `AcmeError` | 其他 ACME 错误，含网络错误（`acmeType`） | `retryable: true` 稍后重跑；否则报给用户 |
-| `Interrupted` | 签发被中止（进程收到 SIGINT / SIGTERM），本次加的记录已删除 | 把命令超时设长后重跑 |
+| `Interrupted` | 签发被中止（进程收到 SIGINT / SIGTERM，exit 130 / 143），本次加的记录已删除；没删掉的在 `dns` 里 `cleaned: false` | 转告需要手动删除的记录，把命令超时设长后重跑 |
 
 参数、凭证配置错误为 `UsageError`（exit 2），没调用任何接口，按 `message` 修正后重跑。
 

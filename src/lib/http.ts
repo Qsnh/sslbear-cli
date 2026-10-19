@@ -67,6 +67,10 @@ export async function send(ctx: QueryContext, provider: Vendor, url: string, ini
       throw new CloudApiError(provider, "Timeout", `请求超时（${ctx.timeoutMs}ms）：${new URL(url).host}`);
     }
     const cause = (err as { cause?: { code?: string } }).cause?.code;
+    // 请求在发出前就被拒（如请求头里有换行等非法字符）：fetch 的错误信息带着整个头部值，可能就是凭证原文，不能透出；重试也没用
+    if (!cause && err instanceof TypeError && err.message !== "fetch failed") {
+      throw new CloudApiError(provider, "InvalidRequest", `请求无法发出：${new URL(url).host} 的请求头或参数含非法字符，请检查凭证里是否混入了换行等控制字符`);
+    }
     throw new CloudApiError(provider, "NetworkError", `网络错误：${new URL(url).host} ${cause ?? err.message}`);
   }
 }

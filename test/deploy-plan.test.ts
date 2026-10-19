@@ -68,9 +68,8 @@ describe("decide", () => {
     expect(d).toMatchObject({ kind: "skip", reason: "same_expiry", needsConfirm: true });
     expect(d.message).toContain("当前证书还覆盖 *.example.com");
     expect(decide(other, CERT, { ...opts, force: true })).toMatchObject({ kind: "update" });
-    // 多数服务只返回 CN：CN 不在新证书里同样不是同一张；不像域名的 CN（如证书名）不参与
-    expect(decide(rec({ cert: { notAfter: "2027-01-01T00:00:00Z", commonName: "www.example.com" } }), CERT, opts)).toMatchObject({ reason: "same_expiry" });
-    expect(decide(rec({ cert: { notAfter: "2027-01-01T00:00:00Z", commonName: "my cert" } }), CERT, opts)).toMatchObject({ reason: "already_current" });
+    // 不看 commonName：有的服务填的是证书名（如 sslbear 上传时起的名字），拿来比会让重复执行不再跳过
+    expect(decide(rec({ cert: { notAfter: "2027-01-01T00:00:00Z", commonName: "sslbear-example.com-20270101" } }), CERT, opts)).toMatchObject({ reason: "already_current" });
     // 服务返回的 SAN 比证书里的少（或大小写不同）不算不同：仍是同一张
     const partial = rec({ cert: { name: "old", notAfter: "2027-01-01T00:00:00Z", algorithm: "RSA", sans: ["EXAMPLE.com"] } });
     expect(decide(partial, CERT, opts)).toMatchObject({ kind: "skip", reason: "already_current" });

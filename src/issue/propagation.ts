@@ -61,6 +61,17 @@ export const SETTLE_MS = 10_000;
 /** 连不上任何权威服务器时（网络限制 UDP 53 等）的固定等待 */
 export const FALLBACK_MS = 30_000;
 const QUERY_TIMEOUT_MS = 3_000;
+/**
+ * 本机 DNS 被代理接管时第一次查询前的等待：NS 解析到 fake-ip（198.18.0.0/15），UDP 53 也被代理截走，
+ * 应答来自代理的上游递归解析器。记录还没同步时查一次，「没有记录」会被缓存几分钟（SOA 最小 TTL），之后一直查不到
+ */
+export const INTERCEPTED_DELAY_MS = 20_000;
+
+/** Clash / Surge 等代理 fake-ip 模式用的保留地址段（RFC 2544 的 198.18.0.0/15） */
+export function isFakeIp(ip: string): boolean {
+  const m = /^198\.(\d+)\./.exec(ip);
+  return !!m && (m[1] === "18" || m[1] === "19");
+}
 
 export class PropagationTimeout extends Error {
   constructor(message: string) {
@@ -169,8 +180,18 @@ export async function waitForTxt(lookup: DnsLookup, zones: PropagationZone[], op
   const say = opts.progress ?? (() => {});
   const states = await Promise.all(zones.map((z) => prepare(lookup, z)));
   let waited = 0;
+  const intercepted = states.some((st) => st.servers.some((s) => isFakeIp(s.ip)));
+  const hint = intercepted ? "（本机 DNS 被代理接管，查到的是代理上游解析器的结果，可能有缓存；可关闭代理的 DNS 劫持后重试）" : "";
+  if (intercepted) {
+    say(`本机 DNS 被代理接管（权威 NS 解析到 fake-ip 地址），先等 ${INTERCEPTED_DELAY_MS / 1000} 秒再查，减少缓存的影响`);
+    await opts.sleep(INTERCEPTED_DELAY_MS);
+    waited += INTERCEPTED_DELAY_MS;
+  }
   for (;;) {
+    // 查询本身的耗时也计入：连不上的服务器每轮要等满查询超时，只按 sleep 计时会远超 --dns-timeout
+    const started = Date.now();
     await poll(lookup, states);
+    waited += Date.now() - started;
     const reachable = states.filter((st) => reachedServers(st).length > 0);
     // 应答过的服务器会一直算作连得上，所以只有第一轮可能一个都没有
     if (reachable.length === 0) {
@@ -187,7 +208,7 @@ export async function waitForTxt(lookup: DnsLookup, zones: PropagationZone[], op
     if (waited >= opts.timeoutMs) {
       // 从没连上过的 zone 不在提示之列：它们不是没生效，而是查不了
       const pending = reachable.filter((st) => !zoneDone(st)).map(describePending);
-      throw new PropagationTimeout(`等待 ${waited / 1000} 秒后仍未在权威 DNS 上看到全部 TXT 记录：${pending.join("；")}。可加大 --dns-timeout 后重试`);
+      throw new PropagationTimeout(`等待 ${Math.round(waited / 1000)} 秒后仍未在权威 DNS 上看到全部 TXT 记录：${pending.join("；")}${hint}。可加大 --dns-timeout 后重试`);
     }
     await opts.sleep(POLL_INTERVAL_MS);
     waited += POLL_INTERVAL_MS;

@@ -62,6 +62,9 @@ export interface AcmeClient {
  * 网络错误为 "network"，超时为 "timeout"
  */
 export class AcmeError extends Error {
+  /** 授权变成了 invalid（CA 验证没通过）；只有 waitAuthorization 会设置，用来与请求被拒、授权过期等区分 */
+  invalidAuthorization = false;
+
   constructor(
     public type: string,
     public detail: string,

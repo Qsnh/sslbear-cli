@@ -57,11 +57,24 @@ export interface IssueDeps {
   generateKey: (type: KeyType) => KeyObject;
   /** 人在终端运行时每一步打一行进度（写 stderr）；--json 时不传 */
   progress?: (message: string) => void;
-  /**
-   * 进程被 Ctrl+C / kill 时先清理再退出：加 TXT 记录前登记，清理完成后撤销。
-   * onSignal 删除本次加的记录并返回 dns[]；返回撤销登记的函数。测试不传
-   */
-  trapInterrupt?: (onSignal: () => Promise<DnsResult[]>) => () => void;
+  /** 进程被 Ctrl+C / kill 时先清理再退出：加 TXT 记录前登记，清理完成后撤销（返回撤销登记的函数）。测试不传 */
+  trapInterrupt?: (hooks: InterruptHooks) => () => void;
+}
+
+/** 中止时用：先 cleanup，来不及完成时退而用 snapshot 输出现状 */
+export interface InterruptHooks {
+  /** 停止再加新记录，等正在进行的添加结束，删除本次加的记录，返回最终的 dns[] 与 issues[] */
+  cleanup(): Promise<RunState>;
+  /** 清理没来得及完成时的现状：还没确认删除的记录标 cleaned: false 并说明怎么手动删 */
+  snapshot(): RunState;
+}
+
+/** 收到中止信号后正常流程不再输出任何结果：中止的结果已由信号处理输出，进程随后退出 */
+export class IssueAborted extends Error {
+  constructor() {
+    super("签发被中止");
+    this.name = "IssueAborted";
+  }
 }
 
 /** 一个需要验证的域名对应的 TXT 记录；--dry-run 时没有 cleaned */
@@ -147,6 +160,20 @@ interface Added {
   result: DnsResult;
 }
 
+/** 与中止信号共享的状态 */
+interface Control {
+  aborted: boolean;
+  /** 正在进行的那次添加 */
+  inflight?: Promise<unknown>;
+  /** 每条记录没删掉时给用户的手动删除说明（中止时来不及确认删除的用） */
+  manual: Map<DnsResult, string>;
+}
+
+/** 服务商报已存在却查不到记录（RecordMayExist）、超时 / 网络错误：记录可能已经加上了，但没有句柄删不掉 */
+function maybeAdded(e: unknown): boolean {
+  return isRetryable(e) || (e instanceof CloudApiError && e.code === "RecordMayExist");
+}
+
 interface Challenge {
   domain: string;
   authzUrl: string;
@@ -156,7 +183,7 @@ interface Challenge {
 }
 
 /** 本次运行累积的、失败时也要输出的状态 */
-interface RunState {
+export interface RunState {
   dns: DnsResult[];
   issues: DnsIssue[];
 }
@@ -185,6 +212,9 @@ export async function runIssue(ctx: QueryContext, opts: IssueOptions, deps: Issu
     throw new UsageError(`${dir} 里已有正式环境的证书，--staging 签发的测试证书不会覆盖它；请换一个 --out 目录`);
   }
   assertWritable(dir);
+  const directoryUrl = opts.staging ? LETSENCRYPT_STAGING_DIRECTORY : LETSENCRYPT_DIRECTORY;
+  // 联网之前就读出（或生成）账号私钥：文件损坏是本地问题（UsageError，exit 2），不该等调用过 DNS 接口才发现
+  const account = opts.dryRun ? undefined : loadAccountKey(root, directoryUrl);
 
   try {
     // 3. 查找 zone
@@ -205,7 +235,7 @@ export async function runIssue(ctx: QueryContext, opts: IssueOptions, deps: Issu
       return report({ reused: false, dns });
     }
 
-    const cert = await issue(ctx, opts, deps, { root, dir, existing, matches: found.matches, state, say });
+    const cert = await issue(ctx, opts, deps, { directoryUrl, account: account!, dir, existing, matches: found.matches, state, say });
     writeCertFiles(dir, cert);
     say(`证书已保存到 ${dir}`);
     return report({ reused: false, cert: certInfo(cert), dns: state.dns });
@@ -222,7 +252,7 @@ function asIssueError(e: unknown): IssueError {
 
 /** 失败输出统一带上已知的 dns、issues；UsageError 原样抛出（exit 2） */
 function withState(e: unknown, state: RunState): unknown {
-  if (e instanceof UsageError) return e;
+  if (e instanceof UsageError || e instanceof IssueAborted) return e;
   const err = asIssueError(e);
   err.extra = { ...err.extra, dns: state.dns, issues: state.issues };
   return err;
@@ -230,18 +260,19 @@ function withState(e: unknown, state: RunState): unknown {
 
 /** 本次加的记录清理得怎样，接在失败 message 末尾：表格模式下用户只看得到 message */
 export function cleanupNote(dns: DnsResult[]): string {
-  const left = dns.filter((d) => d.cleaned === false).length;
+  const left = dns.filter((d) => d.cleaned !== true).length;
   return left > 0 ? `有 ${left} 条 TXT 记录可能残留，需要手动删除（见 dns）` : `本次添加的 ${dns.length} 条 TXT 记录已删除`;
 }
 
 function withCleanup(e: unknown, dns: DnsResult[]): unknown {
-  if (e instanceof UsageError || dns.length === 0) return e;
+  if (e instanceof UsageError || e instanceof IssueAborted || dns.length === 0) return e;
   const err = asIssueError(e);
   return new IssueError(err.status, `${err.message}；${cleanupNote(dns)}`, err.extra);
 }
 
 interface IssueCtx {
-  root: string;
+  directoryUrl: string;
+  account: ReturnType<typeof loadAccountKey>;
   dir: string;
   existing: ExistingCert;
   matches: ZoneMatch[];
@@ -252,8 +283,7 @@ interface IssueCtx {
 /** 第 5~10 步：下单、设置 DNS、等生效、验证、清理、finalize、下载并校验 */
 async function issue(ctx: QueryContext, opts: IssueOptions, deps: IssueDeps, ic: IssueCtx): Promise<LocalCert> {
   const { say } = ic;
-  const directoryUrl = opts.staging ? LETSENCRYPT_STAGING_DIRECTORY : LETSENCRYPT_DIRECTORY;
-  const account = loadAccountKey(ic.root, directoryUrl);
+  const { directoryUrl, account } = ic;
   const client = await deps.acme(ctx, { directoryUrl, accountKey: account.key });
   const ca = `Let's Encrypt ${opts.staging ? "测试环境" : ""}账号`;
   const tos = client.directory.termsOfService ? `：${client.directory.termsOfService}` : "";
@@ -265,18 +295,30 @@ async function issue(ctx: QueryContext, opts: IssueOptions, deps: IssueDeps, ic:
 
   // 6~8. 设置 DNS、等生效、验证；无论成败都先清理再往下走
   const added: Added[] = [];
+  const control: Control = { aborted: false, manual: new Map() };
   // 正常流程与中断信号可能同时触发清理，只跑一次：记录集模型的服务商读改写不能并发
   let cleaning: Promise<void> | undefined;
   const cleanupOnce = () => (cleaning ??= cleanup(ctx, added, say));
-  const untrap = deps.trapInterrupt?.(async () => {
-    await cleanupOnce();
-    return ic.state.dns;
+  const untrap = deps.trapInterrupt?.({
+    async cleanup() {
+      control.aborted = true;
+      // 正在进行的添加可能已在服务商那边生效：等它结束、拿到句柄再一起删，否则会漏删
+      await control.inflight?.catch(() => {});
+      await cleanupOnce();
+      return ic.state;
+    },
+    snapshot: () => ({
+      issues: ic.state.issues,
+      dns: ic.state.dns.map((d) => (d.cleaned === undefined ? { ...d, cleaned: false, message: control.manual.get(d) } : d)),
+    }),
   });
   let failure: { error: unknown } | undefined;
   try {
     const challenges = await pendingChallenges(client, order, ic);
-    await addRecords(ctx, client, challenges, added, ic);
+    await addRecords(ctx, client, challenges, added, ic, control);
     if (added.length > 0) await propagate(deps, added, opts, ctx, say);
+    // 已中止时不再通知验证：记录已经（或正在）删除，验证必然失败，白白消耗 Let's Encrypt 的验证失败配额
+    if (control.aborted) throw new IssueAborted();
     await validate(client, challenges, say);
   } catch (error) {
     failure = { error };
@@ -284,6 +326,7 @@ async function issue(ctx: QueryContext, opts: IssueOptions, deps: IssueDeps, ic:
   // 9. 清理：只删本次加的值，失败不影响签发结果，但要在 dns[] 里写明
   await cleanupOnce();
   untrap?.();
+  if (control.aborted) throw new IssueAborted();
   if (failure) throw withCleanup(failure.error, ic.state.dns);
 
   // 10. 签发
@@ -345,30 +388,41 @@ async function pendingChallenges(client: AcmeClient, order: AcmeOrder, ic: Issue
   return list.sort((a, b) => rank(a) - rank(b));
 }
 
-/** 串行添加：同名记录集（根域名与泛域名共用 _acme-challenge.example.com）的读改写不能并发 */
-async function addRecords(ctx: QueryContext, client: AcmeClient, challenges: Challenge[], added: Added[], ic: IssueCtx): Promise<void> {
+/**
+ * 串行添加：同名记录集（根域名与泛域名共用 _acme-challenge.example.com）的读改写不能并发。
+ * 每条记录在调用服务商之前就记进 dns[]（没有 cleaned）：中止时来不及确认的也能列出来让用户核对
+ */
+async function addRecords(ctx: QueryContext, client: AcmeClient, challenges: Challenge[], added: Added[], ic: IssueCtx, control: Control): Promise<void> {
   for (const c of challenges) {
+    if (control.aborted) throw new IssueAborted();
     const { def, creds } = c.match.target;
     const record: TxtRecord = { zone: c.match.zone, fqdn: c.match.record, value: client.dnsTxtValue(c.token) };
     const result: DnsResult = { domain: c.domain, provider: def.vendor, zone: c.match.zone.name, record: record.fqdn };
+    ic.state.dns.push(result);
+    control.manual.set(result, `请到 ${def.label} 核对 ${record.fqdn} 下值为 "${record.value}" 的 TXT 记录，存在就手动删除`);
     try {
-      const handle = await def.addTxt(ctx, creds, record);
+      // 先登记再调用：信号可能在 addTxt 同步执行的那一段里到达，登记晚了中止清理就不会等它
+      const adding = Promise.resolve().then(() => def.addTxt(ctx, creds, record));
+      control.inflight = adding;
+      const handle = await adding;
       added.push({ match: c.match, record, handle, result });
-      ic.state.dns.push(result);
       ic.say(`已在 ${def.label} 添加 ${record.fqdn}`);
     } catch (e) {
-      const retryable = isRetryable(e);
-      // 超时 / 网络错误时服务商那边可能已经加上了，没有句柄删不掉，只能列出来让用户核对
-      if (retryable) {
-        ic.state.dns.push({ ...result, cleaned: false, message: `添加时${errText(e)}，服务商可能已添加成功；如果存在值为 "${record.value}" 的 TXT 记录，请手动删除` });
+      if (maybeAdded(e)) {
+        Object.assign(result, { cleaned: false, message: `添加时${errText(e)}，服务商可能已添加成功；${control.manual.get(result)}` });
+      } else {
+        // 服务商明确拒绝（如缺权限）：没加上，不用列出来
+        ic.state.dns.splice(ic.state.dns.indexOf(result), 1);
       }
       const code = e instanceof CloudApiError ? e.code : "Unknown";
       throw new IssueError("DnsRecordFailed", `在 ${def.label} 添加 ${record.fqdn} 失败：${errText(e)}${rid(e)}${cnameHint(e)}`, {
-          retryable,
-          provider: def.vendor,
-          code,
-          ...(e instanceof CloudApiError && e.requestId && { requestId: e.requestId }),
+        retryable: maybeAdded(e),
+        provider: def.vendor,
+        code,
+        ...(e instanceof CloudApiError && e.requestId && { requestId: e.requestId }),
       });
+    } finally {
+      control.inflight = undefined;
     }
   }
 }
@@ -406,8 +460,8 @@ async function validate(client: AcmeClient, challenges: Challenge[], say: (m: st
     try {
       await client.waitAuthorization(c.authzUrl, AUTHZ_TIMEOUT_MS);
     } catch (e) {
-      // 网络错误、超时、限流等可重试的错误按普通 ACME 错误处理；其余是授权变成了 invalid（CA 验证没通过）
-      if (e instanceof AcmeError && !e.retryable) {
+      // 只有授权变成 invalid 才是验证没通过；网络错误、授权过期、请求被拒等按普通 ACME 错误处理（授权过期重跑就会重新下单）
+      if (e instanceof AcmeError && e.invalidAuthorization) {
         throw new IssueError("AcmeChallengeFailed", `CA 验证 ${c.domain} 失败（${e.type}）：${e.detail}`, {
           retryable: false,
           domain: c.domain,

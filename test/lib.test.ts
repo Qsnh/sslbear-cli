@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { loadEnvFile, mask, parseDotenv, readAliyun, readTencent } from "../src/lib/env.js";
-import { CloudApiError, withRetry } from "../src/lib/http.js";
+import { CloudApiError, isRetryable, send, withRetry } from "../src/lib/http.js";
 import { renderDomains } from "../src/render.js";
 import { displayWidth, renderTable } from "../src/lib/table.js";
 import { daysUntil, toIso } from "../src/lib/time.js";
@@ -159,6 +159,17 @@ describe("withRetry", () => {
       }),
     ).rejects.toThrow("bad request");
     expect(n).toBe(1);
+  });
+});
+
+describe("send", () => {
+  it("请求头含换行等非法字符（凭证里混入控制字符）：错误信息不带头部值，不可重试", async () => {
+    const ctx = { fetch, timeoutMs: 1000, now: new Date(), env: {} };
+    const e = await send(ctx, "cloudflare", "http://127.0.0.1:9/", { headers: { Authorization: "Bearer secret-part\nrest" } }).catch((err: unknown) => err);
+    expect(e).toBeInstanceOf(CloudApiError);
+    expect(e).toMatchObject({ code: "InvalidRequest" });
+    expect((e as Error).message).not.toContain("secret-part");
+    expect(isRetryable(e)).toBe(false);
   });
 });
 

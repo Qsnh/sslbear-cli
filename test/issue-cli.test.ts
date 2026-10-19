@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { DnsZone } from "../src/dns/types.js";
+import type { DnsZone, TxtRecord } from "../src/dns/types.js";
 import { ariCertId, buildCsr } from "../src/issue/csr.js";
 import { AcmeError, LETSENCRYPT_DIRECTORY, LETSENCRYPT_STAGING_DIRECTORY } from "../src/issue/types.js";
 import { CloudApiError } from "../src/lib/http.js";
@@ -67,6 +67,8 @@ function setup(o: SetupOptions = {}) {
 }
 
 const errOf = (r: CliResult) => JSON.parse(r.stderr);
+/** waitAuthorization 在授权变成 invalid 时抛的错误 */
+const invalidAuthz = (type: string, detail: string) => Object.assign(new AcmeError(type, detail, 403), { invalidAuthorization: true });
 const visibleTxt = (world: ReturnType<typeof fakeWorld>) => [...world.txt.values()].flat();
 
 beforeEach(() => {
@@ -520,7 +522,7 @@ describe("issue 失败（exit 1）：stderr 一行错误 JSON，带 dns / issues
     const s = setup({
       acme: {
         waitAuthorization: async (url) => {
-          if (url.endsWith("*.example.com")) throw new AcmeError("unauthorized", "Incorrect TXT record found at _acme-challenge.example.com", 403);
+          if (url.endsWith("*.example.com")) throw invalidAuthz("unauthorized", "Incorrect TXT record found at _acme-challenge.example.com");
         },
       },
     });
@@ -530,6 +532,12 @@ describe("issue 失败（exit 1）：stderr 一行错误 JSON，带 dns / issues
     expect(e).toMatchObject({ status: "AcmeChallengeFailed", retryable: false, domain: "*.example.com", acmeType: "unauthorized", detail: expect.stringContaining("Incorrect TXT") });
     expect(e.dns.map((d: any) => d.cleaned)).toEqual([true, true]);
     expect(s.ca.client.finalize).not.toHaveBeenCalled();
+  });
+
+  it("授权过期等不是验证失败的错误按 AcmeError 处理（重跑会重新下单）", async () => {
+    const s = setup({ acme: { waitAuthorization: async () => Promise.reject(new AcmeError("unauthorized", "example.com：授权已失效（expired），请重新下单")) } });
+    const e = errOf(await s.issue(["-d", DOMAINS, "--json"]));
+    expect(e).toMatchObject({ status: "AcmeError", acmeType: "unauthorized" });
   });
 
   it("验证超时 / 网络错误按 AcmeError（可重试）处理，不当成验证失败", async () => {
@@ -610,7 +618,7 @@ describe("清理失败", () => {
   it("签发失败且清理也失败：错误里列出需手动删除的记录", async () => {
     const s = setup({
       overrides: { aliyun: { removeTxt: failingRemove() } },
-      acme: { waitAuthorization: async () => Promise.reject(new AcmeError("dns", "DNS problem: SERVFAIL")) },
+      acme: { waitAuthorization: async () => Promise.reject(invalidAuthz("dns", "DNS problem: SERVFAIL")) },
     });
     const j = await s.issue(["-d", DOMAINS, "--json"]);
     const e = errOf(j);
@@ -676,12 +684,45 @@ describe("issue 被中止", () => {
       }),
     });
     const r = await s.issue(["-d", DOMAINS, "--json"], { dnsLookup, trapInterrupt });
-    const interrupted = r.stderr.split("\n").map((l) => JSON.parse(l)).find((e) => e.status === "Interrupted");
-    expect(interrupted).toMatchObject({ ok: false, retryable: true, message: "签发被中止；本次添加的 2 条 TXT 记录已删除" });
+    // 只有信号处理输出的那一行：正常流程随后不再输出、不再通知验证、不再 finalize
+    expect(r.stdout).toBe("");
+    expect(r.stderr.split("\n")).toHaveLength(1);
+    const interrupted = JSON.parse(r.stderr);
+    expect(interrupted).toMatchObject({ ok: false, status: "Interrupted", retryable: true, message: "签发被中止；本次添加的 2 条 TXT 记录已删除", issues: [] });
     expect(interrupted.dns.map((d: { cleaned: boolean }) => d.cleaned)).toEqual([true, true]);
     expect(s.world.log.filter((l) => l.startsWith("remove"))).toHaveLength(2);
+    expect(s.world.log).not.toContain("answer example.com");
+    expect(s.ca.client.finalize).not.toHaveBeenCalled();
     // 清理完成后撤销登记：之后再按 Ctrl+C 不会再跑清理
     expect(trapInterrupt).toHaveBeenCalledTimes(1);
     expect(untrap).toHaveBeenCalledTimes(1);
+  });
+
+  it("正在添加记录时收到中止信号：等这次添加结束再一起删除，不再添加后面的记录", async () => {
+    let onSignal: (() => Promise<void>) | undefined;
+    const trapInterrupt = vi.fn((fn: () => Promise<void>) => ((onSignal = fn), () => {}));
+    let signalled: Promise<void> | undefined;
+    const s = setup({
+      overrides: {
+        aliyun: {
+          addTxt: vi.fn(async (_ctx: unknown, _creds: unknown, r: TxtRecord) => {
+            // 第一次添加还没返回时收到信号
+            signalled ??= onSignal!();
+            await new Promise((res) => setTimeout(res, 5));
+            s.world.txt.set(r.fqdn, [...(s.world.txt.get(r.fqdn) ?? []), r.value]);
+            s.world.log.push(`add ${r.value}`);
+            return `h-${r.value}`;
+          }),
+        },
+      },
+    });
+    const r = await s.issue(["-d", DOMAINS, "--json"], { trapInterrupt });
+    await signalled;
+    const e = JSON.parse(r.stderr);
+    expect(e).toMatchObject({ status: "Interrupted", message: "签发被中止；本次添加的 1 条 TXT 记录已删除" });
+    expect(e.dns).toEqual([{ domain: "example.com", provider: "aliyun", zone: "example.com", record: FQDN, cleaned: true }]);
+    // 第二条没有再添加；第一条（中止时正在添加的）已删除
+    expect(s.world.log.filter((l) => l.startsWith("add"))).toEqual(["add v-tok-example.com"]);
+    expect(visibleTxt(s.world)).toEqual([]);
   });
 });

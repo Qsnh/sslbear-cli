@@ -501,6 +501,7 @@ describe("waitAuthorization", () => {
     expect(e.type).toBe("unauthorized");
     expect(e.detail).toBe("*.example.com：Incorrect TXT record found at _acme-challenge.example.com");
     expect(e.subproblems).toEqual(["example.com：SERVFAIL"]);
+    expect(e.invalidAuthorization).toBe(true);
   });
 
   it("invalid 但 CA 没给原因、授权已过期时也报 AcmeError", async () => {
@@ -509,8 +510,12 @@ describe("waitAuthorization", () => {
       if (req.path === "/authz/old") return json(authz("b.example.com", "expired"));
       return undefined;
     });
-    expect((await acmeError(client.waitAuthorization(`${BASE}/authz/bare`, 1000))).detail).toBe("a.example.com：验证失败，CA 没有给出原因");
-    expect((await acmeError(client.waitAuthorization(`${BASE}/authz/old`, 1000))).detail).toMatch(/^b\.example\.com：授权已失效（expired）/);
+    const bare = await acmeError(client.waitAuthorization(`${BASE}/authz/bare`, 1000));
+    expect(bare).toMatchObject({ detail: "a.example.com：验证失败，CA 没有给出原因", invalidAuthorization: true });
+    // 过期不是验证没通过：重跑会重新下单
+    const old = await acmeError(client.waitAuthorization(`${BASE}/authz/old`, 1000));
+    expect(old.detail).toMatch(/^b\.example\.com：授权已失效（expired）/);
+    expect(old.invalidAuthorization).toBe(false);
   });
 
   it("按累计等待时间判超时：最后一次等待截到正好用完，再查一次后报 timeout", async () => {

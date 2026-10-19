@@ -12,7 +12,7 @@ import { generateCertKey } from "./issue/csr.js";
 import { parseDomains } from "./issue/domains.js";
 import { systemDnsLookup, type DnsLookup } from "./issue/propagation.js";
 import { issueNotes, leftoverNotes, printProgress, renderIssue } from "./issue/render.js";
-import { cleanupNote, IssueError, runIssue, type AcmeFactory, type DnsResult, type IssueReport } from "./issue/run.js";
+import { cleanupNote, IssueAborted, IssueError, runIssue, type AcmeFactory, type DnsResult, type InterruptHooks, type IssueReport } from "./issue/run.js";
 import type { KeyType } from "./issue/types.js";
 import type { DnsIssue } from "./issue/zones.js";
 import { dnsEnvStatus, envStatus, renderCerts, renderDomains, renderEnv } from "./render.js";
@@ -348,14 +348,22 @@ function failIssue(opts: OutputOptions, e: IssueError): never {
   fail(opts, e.status, e.message, 1, e.extra);
 }
 
-/** 签发途中被中止（agent 的命令超时、Ctrl+C）：删掉本次加的 TXT 记录，按失败输出（status Interrupted）后退出 */
+/** 中止时清理的时间预算：入口最多等 30 秒就退出，留出输出结果的时间 */
+const INTERRUPT_CLEANUP_MS = 25_000;
+
+/**
+ * 签发途中被中止（agent 的命令超时、Ctrl+C）：删掉本次加的 TXT 记录，按失败输出（status Interrupted）后由入口退出。
+ * 清理超过预算时不再等，按现状输出：没确认删除的记录标 cleaned: false，告诉用户怎么手动删
+ */
 function interruptHandler(out: OutputOptions, trap: NonNullable<Deps["trapInterrupt"]>) {
-  return (cleanup: () => Promise<DnsResult[]>) =>
+  return (hooks: InterruptHooks) =>
     trap(async () => {
       if (!out.json) console.error("\n收到中止信号，正在删除本次添加的 TXT 记录…");
-      const dns = await cleanup();
+      // 用真实计时：测试注入的 sleep 不真等，会让预算立刻用完
+      const budget = new Promise<void>((r) => setTimeout(r, INTERRUPT_CLEANUP_MS).unref());
+      const state = await Promise.race([hooks.cleanup(), budget.then(() => hooks.snapshot())]);
       try {
-        failIssue(out, new IssueError("Interrupted", `签发被中止；${cleanupNote(dns)}`, { retryable: true, dns }));
+        failIssue(out, new IssueError("Interrupted", `签发被中止；${cleanupNote(state.dns)}`, { retryable: true, dns: state.dns, issues: state.issues }));
       } catch {
         // failIssue 输出后抛 ExitError，退出由入口负责
       }
@@ -398,11 +406,13 @@ const ISSUE_HELP_AFTER = `
   AcmeChallengeFailed    CA 验证失败（domain、acmeType、detail）
   AcmeRateLimited        触发 Let's Encrypt 频率限制（retryAfter：多少秒后可重试，有的话）
   AcmeError              其他 ACME 错误，含网络错误（acmeType）
+  Interrupted            进程收到 SIGINT / SIGTERM 被中止，本次添加的 TXT 记录已删除（没删掉的在 dns 里 cleaned: false）
 
 退出码：
-  0  签发成功，或复用了现有证书
-  1  签发失败（status 见上）
-  2  参数或凭证配置错误（status 为 UsageError，未调用任何接口、未修改 DNS）
+  0    签发成功，或复用了现有证书
+  1    签发失败（status 见上）
+  2    参数或凭证配置错误（status 为 UsageError，未调用任何接口、未修改 DNS）
+  130  被 Ctrl+C（SIGINT）中止；143  被 SIGTERM 中止（status 为 Interrupted）
 
 示例：
   sslbear-cli issue -d example.com,*.example.com --dry-run --json
@@ -538,6 +548,8 @@ export function buildProgram(deps: Deps, output: OutputOptions = { json: false }
         );
       } catch (e) {
         if (e instanceof IssueError) failIssue(out, e);
+        // 中止的结果已由信号处理输出，这里不再输出，进程随后由入口退出
+        if (e instanceof IssueAborted) return;
         throw e;
       }
       if (out.json) outJson(issueData(report));

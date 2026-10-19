@@ -319,7 +319,11 @@ export async function createAcmeClient(ctx: QueryContext, opts: { directoryUrl: 
         // 泛域名的授权对象是去掉 *. 的域名，报错时还原成用户写的名字
         const name = authz.wildcard ? `*.${authz.domain}` : authz.domain;
         if (authz.status === "valid") return;
-        if (authz.status === "invalid") throw authorizationError(body, name);
+        if (authz.status === "invalid") {
+          const err = authorizationError(body, name);
+          err.invalidAuthorization = true;
+          throw err;
+        }
         if (authz.status !== "pending") throw new AcmeError("unauthorized", `${name}：授权已失效（${authz.status}），请重新下单`);
         await wait(retryAfterOf(res.headers), `${name}：等待 CA 验证超时（${Math.round(timeoutMs / 1000)} 秒）`);
       }

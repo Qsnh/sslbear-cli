@@ -77,10 +77,10 @@ export function decide(record: DomainRecord, cert: LocalCert, o: DecideOptions):
     // 但用户点名并坚持（-d + --force）就换；只加 --force 不波及它们（它们不在需确认清单里，用户没被问过）
     const oldStart = Date.parse(oldCert?.notBefore ?? "");
     const startNear = !Number.isFinite(oldStart) || near(oldStart, Date.parse(cert.notBefore));
-    // 两天内重签（如 issue --force、改了域名再签）的证书时间也相近：当前证书有新证书没有的域名就肯定不是同一张。
-    // 只看「多出来的」：有的服务返回的 SAN 不全，少了不能说明是另一张；多数服务只返回 CN，CN 也算（像域名的才算）
-    const oldNames = [...(oldCert?.sans ?? []), ...(oldCert?.commonName ? [oldCert.commonName] : [])].map(normalizeDomain);
-    const extraSan = oldNames.find((d) => /^(\*\.)?[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(d) && !cert.sans.includes(d));
+    // 两天内重签（如 issue --force、改了域名再签）的证书时间也相近：当前证书的 SAN 有新证书没有的域名就肯定不是同一张。
+    // 只看「多出来的」：有的服务返回的 SAN 不全，少了不能说明是另一张。不看 commonName：有的服务填的其实是证书名
+    // （火山引擎点播的 CertName 可能是 sslbear 上传时起的名字），拿来比会让重复执行不再跳过
+    const extraSan = oldCert?.sans?.map(normalizeDomain).find((d) => !cert.sans.includes(d));
     const oldAlg = oldCert?.algorithm;
     if (extraSan) {
       confirm = ["same_expiry", `当前证书与新证书到期时间相近，但当前证书还覆盖 ${extraSan}，不是同一张`];
