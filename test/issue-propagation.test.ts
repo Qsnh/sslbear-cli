@@ -179,7 +179,7 @@ describe("waitForTxt", () => {
       { zone: "example.org", label: "Cloudflare", nameServerPattern: /\.ns\.cloudflare\.com$/, records: [{ fqdn: "_acme-challenge.example.org", values: ["o"] }] },
     ];
     expect(await waitForTxt(lookup, zones, { timeoutMs: 300_000, sleep })).toBe("visible");
-    expect(sleeps).toEqual([POLL_INTERVAL_MS, FALLBACK_MS - POLL_INTERVAL_MS]);
+    expect(sleeps).toEqual([POLL_INTERVAL_MS, Math.max(SETTLE_MS, FALLBACK_MS - POLL_INTERVAL_MS)]);
   });
 });
 

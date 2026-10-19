@@ -51,13 +51,18 @@ export interface PropagationZone {
 export interface WaitOptions {
   /** --dns-timeout：按累计等待时间计 */
   timeoutMs: number;
+  /** 看到后再等多久，缺省 SETTLE_MS；验证因 DNS 失败重试时加长 */
+  settleMs?: number;
   sleep: (ms: number) => Promise<void>;
   progress?: (message: string) => void;
 }
 
 export const POLL_INTERVAL_MS = 5_000;
-/** 全部权威服务器都看到后再等一会：Let's Encrypt 从多地验证，anycast 各节点同步有先后 */
-export const SETTLE_MS = 10_000;
+/**
+ * 全部权威服务器都看到后再等一会：Let's Encrypt 从多地验证，anycast 各节点同步有先后。
+ * 实测 DNSPod 免费版加完记录 39 秒后仍有节点答「不存在」，本机也只能看到其中一个节点
+ */
+export const SETTLE_MS = 30_000;
 /** 连不上任何权威服务器时（网络限制 UDP 53 等）的固定等待 */
 export const FALLBACK_MS = 30_000;
 const QUERY_TIMEOUT_MS = 3_000;
@@ -200,7 +205,8 @@ export async function waitForTxt(lookup: DnsLookup, zones: PropagationZone[], op
       return "unreachable";
     }
     if (reachable.length > 0 && reachable.every(zoneDone)) {
-      const settle = reachable.length < states.length ? Math.max(SETTLE_MS, FALLBACK_MS - waited) : SETTLE_MS;
+      const base = opts.settleMs ?? SETTLE_MS;
+      const settle = reachable.length < states.length ? Math.max(base, FALLBACK_MS - waited) : base;
       say(`权威 DNS 已全部生效，再等 ${settle / 1000} 秒让各节点同步`);
       await opts.sleep(settle);
       return "visible";

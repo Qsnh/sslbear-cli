@@ -113,6 +113,9 @@ export class IssueError extends Error {
   }
 }
 
+/** 验证因 DNS 查不到记录失败时重新下单重试一次，这次确认生效后多等这么久：DNS 服务商个别节点同步慢（实测 DNSPod 免费版 40 秒以上） */
+export const RETRY_SETTLE_MS = 90_000;
+
 /** 授权验证、finalize 的轮询上限：Let's Encrypt 通常几秒到几十秒 */
 export const AUTHZ_TIMEOUT_MS = 120_000;
 export const FINALIZE_TIMEOUT_MS = 120_000;
@@ -293,18 +296,17 @@ async function issue(ctx: QueryContext, opts: IssueOptions, deps: IssueDeps, ic:
   // 5. 下单
   let order = await placeOrder(client, opts, ic);
 
-  // 6~8. 设置 DNS、等生效、验证；无论成败都先清理再往下走
-  const added: Added[] = [];
+  // 6~8. 设置 DNS、等生效、验证；无论成败都先清理再往下走。验证因 DNS 查不到记录失败时重新下单再试一次
   const control: Control = { aborted: false, manual: new Map() };
-  // 正常流程与中断信号可能同时触发清理，只跑一次：记录集模型的服务商读改写不能并发
-  let cleaning: Promise<void> | undefined;
-  const cleanupOnce = () => (cleaning ??= cleanup(ctx, added, say));
+  // 当前这一轮加的记录。正常流程与中断信号可能同时触发清理，只跑一次：记录集模型的服务商读改写不能并发
+  let round: { added: Added[]; cleaning?: Promise<void> } = { added: [] };
+  const cleanupRound = () => (round.cleaning ??= cleanup(ctx, round.added, say));
   const untrap = deps.trapInterrupt?.({
     async cleanup() {
       control.aborted = true;
       // 正在进行的添加可能已在服务商那边生效：等它结束、拿到句柄再一起删，否则会漏删
       await control.inflight?.catch(() => {});
-      await cleanupOnce();
+      await cleanupRound();
       return ic.state;
     },
     snapshot: () => ({
@@ -312,22 +314,38 @@ async function issue(ctx: QueryContext, opts: IssueOptions, deps: IssueDeps, ic:
       dns: ic.state.dns.map((d) => (d.cleaned === undefined ? { ...d, cleaned: false, message: control.manual.get(d) } : d)),
     }),
   });
-  let failure: { error: unknown } | undefined;
   try {
-    const challenges = await pendingChallenges(client, order, ic);
-    await addRecords(ctx, client, challenges, added, ic, control);
-    if (added.length > 0) await propagate(deps, added, opts, ctx, say);
-    // 已中止时不再通知验证：记录已经（或正在）删除，验证必然失败，白白消耗 Let's Encrypt 的验证失败配额
-    if (control.aborted) throw new IssueAborted();
-    await validate(client, challenges, say);
-  } catch (error) {
-    failure = { error };
+    for (let attempt = 1; ; attempt++) {
+      let failure: { error: unknown } | undefined;
+      try {
+        if (attempt > 1) order = await placeOrder(client, opts, ic);
+        const challenges = await pendingChallenges(client, order, ic);
+        await addRecords(ctx, client, challenges, round.added, ic, control);
+        const settleMs = attempt > 1 ? RETRY_SETTLE_MS : undefined;
+        if (round.added.length > 0) await propagate(deps, round.added, opts, ctx, say, settleMs);
+        // 已中止时不再通知验证：记录已经（或正在）删除，验证必然失败，白白消耗 Let's Encrypt 的验证失败配额
+        if (control.aborted) throw new IssueAborted();
+        await validate(client, challenges, say);
+      } catch (error) {
+        failure = { error };
+      }
+      // 9. 清理：只删本次加的值，失败不影响签发结果，但要在 dns[] 里写明
+      await cleanupRound();
+      if (control.aborted) throw new IssueAborted();
+      if (!failure) break;
+      if (attempt === 1 && dnsLookupFailed(failure.error)) {
+        say(`${(failure.error as Error).message}；可能是 DNS 服务商部分节点还没同步，重新下单再试一次（这次多等 ${RETRY_SETTLE_MS / 1000} 秒）`);
+        // 上一轮已删干净的不再列出，删除失败的保留
+        const kept = ic.state.dns.filter((d) => d.cleaned !== true);
+        ic.state.dns.splice(0, ic.state.dns.length, ...kept);
+        round = { added: [] };
+        continue;
+      }
+      throw withCleanup(failure.error, ic.state.dns);
+    }
+  } finally {
+    untrap?.();
   }
-  // 9. 清理：只删本次加的值，失败不影响签发结果，但要在 dns[] 里写明
-  await cleanupOnce();
-  untrap?.();
-  if (control.aborted) throw new IssueAborted();
-  if (failure) throw withCleanup(failure.error, ic.state.dns);
 
   // 10. 签发
   say("生成证书私钥并提交 CSR…");
@@ -337,6 +355,14 @@ async function issue(ctx: QueryContext, opts: IssueOptions, deps: IssueDeps, ic:
   say("下载证书…");
   const pem = await client.downloadCertificate(order.certificate);
   return verifyIssued(pem, key, opts.domains, ctx.now);
+}
+
+/**
+ * CA 查不到或查错 TXT 记录导致验证失败（dns：NXDOMAIN / SERVFAIL 等，unauthorized：记录值不对，如节点还是旧值），
+ * 多半是服务商个别节点没同步，值得重新下单再试；CAA 拒绝等其他原因重试也没用
+ */
+function dnsLookupFailed(e: unknown): boolean {
+  return e instanceof IssueError && e.status === "AcmeChallengeFailed" && ["dns", "unauthorized"].includes(String(e.extra.acmeType));
 }
 
 /** ARI 续签标识：保存目录里有同为正式 / 测试环境、与本次至少有一个相同域名的旧证书（CA 只接受这样的 replaces） */
@@ -428,7 +454,7 @@ async function addRecords(ctx: QueryContext, client: AcmeClient, challenges: Cha
 }
 
 /** 按 zone 归并本次加的记录，等它们在权威 DNS 上生效 */
-async function propagate(deps: IssueDeps, added: Added[], opts: IssueOptions, ctx: QueryContext, say: (m: string) => void): Promise<void> {
+async function propagate(deps: IssueDeps, added: Added[], opts: IssueOptions, ctx: QueryContext, say: (m: string) => void, settleMs?: number): Promise<void> {
   const zones = new Map<string, PropagationZone>();
   for (const a of added) {
     const { zone } = a.match;
@@ -444,7 +470,7 @@ async function propagate(deps: IssueDeps, added: Added[], opts: IssueOptions, ct
   }
   say(`等待 DNS 生效（最长 ${opts.dnsTimeoutMs / 1000} 秒）…`);
   try {
-    await waitForTxt(deps.dnsLookup, [...zones.values()], { timeoutMs: opts.dnsTimeoutMs, sleep: ctx.sleep ?? realSleep, progress: say });
+    await waitForTxt(deps.dnsLookup, [...zones.values()], { timeoutMs: opts.dnsTimeoutMs, sleep: ctx.sleep ?? realSleep, progress: say, ...(settleMs && { settleMs }) });
   } catch (e) {
     if (e instanceof PropagationTimeout) throw new IssueError("DnsPropagationTimeout", e.message, { retryable: true });
     throw e;

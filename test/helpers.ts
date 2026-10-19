@@ -65,6 +65,8 @@ export interface RunCliOptions {
   acme?: Deps["acme"];
   generateKey?: Deps["generateKey"];
   trapInterrupt?: Deps["trapInterrupt"];
+  /** 记录等待时长用；缺省不真等 */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<CliResult> {
@@ -80,7 +82,7 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
       fetch: opts.fetch ?? fakeFetch(() => undefined),
       now: () => new Date(opts.now ?? "2026-10-15T00:00:00Z"),
       cwd: opts.cwd ?? "/nonexistent-sslbear-test",
-      sleep: async () => {},
+      sleep: opts.sleep ?? (async () => {}),
       ...(opts.defs && { defs: opts.defs }),
       ...(opts.confirm && { confirm: opts.confirm }),
       ...(opts.readFile && { readFile: opts.readFile }),

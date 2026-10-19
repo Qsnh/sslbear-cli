@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DnsZone, TxtRecord } from "../src/dns/types.js";
 import { ariCertId, buildCsr } from "../src/issue/csr.js";
+import { RETRY_SETTLE_MS } from "../src/issue/run.js";
 import { AcmeError, LETSENCRYPT_DIRECTORY, LETSENCRYPT_STAGING_DIRECTORY } from "../src/issue/types.js";
 import { CloudApiError } from "../src/lib/http.js";
 import type { DnsVendor } from "../src/types.js";
@@ -623,12 +624,13 @@ describe("清理失败", () => {
     const j = await s.issue(["-d", DOMAINS, "--json"]);
     const e = errOf(j);
     expect(e.status).toBe("AcmeChallengeFailed");
-    expect(e.message).toContain("有 1 条 TXT 记录可能残留，需要手动删除（见 dns）");
-    expect(e.dns.map((d: any) => d.cleaned)).toEqual([true, false]);
+    // 验证因 DNS 失败会重新下单再试一次：两轮各有一条删不掉，第一轮删掉的不再列出
+    expect(e.message).toContain("有 2 条 TXT 记录可能残留，需要手动删除（见 dns）");
+    expect(e.dns.map((d: any) => d.cleaned)).toEqual([false, true, false]);
 
     const t = await s.issue(["-d", DOMAINS]);
     expect(t.code).toBe(1);
-    expect(t.stderr).toContain("警告：以下 1 条 TXT 记录可能残留");
+    expect(t.stderr).toContain("警告：以下 2 条 TXT 记录可能残留");
     expect(t.stderr).toContain("错误：CA 验证 example.com 失败（dns）");
   });
 });
@@ -724,5 +726,39 @@ describe("issue 被中止", () => {
     // 第二条没有再添加；第一条（中止时正在添加的）已删除
     expect(s.world.log.filter((l) => l.startsWith("add"))).toEqual(["add v-tok-example.com"]);
     expect(visibleTxt(s.world)).toEqual([]);
+  });
+});
+
+describe("验证因 DNS 查不到记录失败时重试一次", () => {
+  it("第一次 NXDOMAIN：重新下单、加长等待后成功；dns 只列第二轮的记录", async () => {
+    let calls = 0;
+    const s = setup({
+      acme: {
+        waitAuthorization: async () => {
+          if (calls++ === 0) throw invalidAuthz("dns", "DNS problem: NXDOMAIN looking up TXT for _acme-challenge.example.com");
+        },
+      },
+    });
+    const sleeps: number[] = [];
+    const r = await s.issue(["-d", DOMAINS, "--json"], { sleep: async (ms: number) => void sleeps.push(ms) });
+    expect(r.code).toBe(0);
+    expect(s.ca.client.newOrder).toHaveBeenCalledTimes(2);
+    expect(sleeps).toContain(RETRY_SETTLE_MS);
+    expect(r.json.data.dns.map((d: any) => [d.domain, d.cleaned])).toEqual([
+      ["example.com", true],
+      ["*.example.com", true],
+    ]);
+    expect(s.world.log.filter((l) => l.startsWith("add"))).toHaveLength(4);
+    expect(s.world.log.filter((l) => l.startsWith("remove"))).toHaveLength(4);
+  });
+
+  it("CAA 拒绝等非 DNS 原因不重试；第二次仍因 DNS 失败就报错", async () => {
+    const caa = setup({ acme: { waitAuthorization: async () => Promise.reject(invalidAuthz("caa", "CAA record forbids issuance")) } });
+    expect(errOf(await caa.issue(["-d", DOMAINS, "--json"]))).toMatchObject({ status: "AcmeChallengeFailed", acmeType: "caa" });
+    expect(caa.ca.client.newOrder).toHaveBeenCalledTimes(1);
+
+    const dns = setup({ acme: { waitAuthorization: async () => Promise.reject(invalidAuthz("dns", "DNS problem: NXDOMAIN")) } });
+    expect(errOf(await dns.issue(["-d", DOMAINS, "--json"]))).toMatchObject({ status: "AcmeChallengeFailed", acmeType: "dns" });
+    expect(dns.ca.client.newOrder).toHaveBeenCalledTimes(2);
   });
 });
