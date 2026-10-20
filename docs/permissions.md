@@ -344,23 +344,24 @@ CDN、全站加速、TOS、点播、veImageX 靠跨服务授权读证书中心�
 | CDN | `CDNReadAccessPolicy` | `CDNOperateAccessPolicy` |
 | 证书管理 | `CASReadAccessPolicy` | `CASOperateAccessPolicy` |
 
-签发（智能云解析）：`DNSReadAccessPolicy` + `DNSOperateAccessPolicy`；只跑 `--dry-run` 时 `DNSReadAccessPolicy` 就够。
+签发（智能云解析）：`DNSOperateAccessPolicy`（已含读权限）；只跑 `--dry-run` 时 `DNSReadAccessPolicy` 就够。
 
 注意：
 
 - 策略名按控制台「授权 → 系统策略」列表核对过（2026-10），注意 CDN 是大写 `CDN` 开头。
-- 证书管理用系统策略，没有实测自定义策略。
 - 智能云解析缺读权限时，域名列表不报错、只返回空，`issue` 会报 `ZoneNotFound`（报错里会提示这种可能）。
 - 实测：没开通智能云解析时，签发报缺少服务角色 `BceServiceRole_console_dns`，要先在控制台开通。
 
-最小权限（2026-10 实测：子用户只挂下面这条自定义策略 + 4 条系统策略，查询、部署、签发都能跑通）：
+最小权限（2026-10 实测：子用户只挂下面这一条自定义策略，查询、部署、签发都能跑通）：
 
-- CDN：自定义策略，服务 `bce:cdn`，查询要 `QueryDomainList`、`QueryDomainConfig`，部署再加 `UpdateDomain`。资源填 `*`；想只放行部分域名，资源写 `domain/<域名>`（`QueryDomainList` 要 `domain/*`）
-- 证书管理：查询 `CASReadAccessPolicy`；部署再加 `CASOperateAccessPolicy`（上传证书）
-- 签发：`DNSReadAccessPolicy`、`DNSOperateAccessPolicy`
+- CDN（`bce:cdn`）：查询 `QueryDomainList`、`QueryDomainConfig`，部署再加 `UpdateDomain`。想只放行部分域名，资源写 `domain/<域名>`（`QueryDomainList` 要 `domain/*`）
+- 证书管理（`bce:cas`）：查询 `READ`，部署再加 `OPERATE`（上传证书）
+- 签发（`bce:dns`）：`READ`、`OPERATE`；`--dry-run` 只要 `READ`
+
+证书管理、智能云解析的写法取自对应系统策略的原文（它们也只有 `READ` / `OPERATE` 这一级）。
 
 <details>
-<summary>CDN 自定义策略（查询 + 部署，可直接粘贴到「策略管理 → 创建策略 → 按策略语法创建」）</summary>
+<summary>完整的自定义策略（查询 + 部署 + 签发，可直接粘贴到「策略管理 → 创建策略 → 按策略语法创建」）</summary>
 
 ```json
 {
@@ -371,12 +372,26 @@ CDN、全站加速、TOS、点播、veImageX 靠跨服务授权读证书中心�
       "effect": "Allow",
       "permission": ["QueryDomainList", "QueryDomainConfig", "UpdateDomain"],
       "resource": ["*"]
+    },
+    {
+      "service": "bce:cas",
+      "region": "*",
+      "effect": "Allow",
+      "permission": ["READ", "OPERATE"],
+      "resource": ["*"]
+    },
+    {
+      "service": "bce:dns",
+      "region": "*",
+      "effect": "Allow",
+      "permission": ["READ", "OPERATE"],
+      "resource": ["*"]
     }
   ]
 }
 ```
 
-只查询时把 `UpdateDomain` 删掉。
+不用的服务、不用的命令，把对应的段或权限删掉即可。
 
 </details>
 
