@@ -1,6 +1,6 @@
 {
   "name": "sslbear-cli",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "证书熊 CLI：向 Let's Encrypt 申请证书（自动设置 DNS 验证记录），查询并部署 / 更新阿里云、腾讯云、火山引擎、华为云、百度智能云、七牛云云服务上的域名 SSL 证书",
   "type": "module",
   "bin": {
