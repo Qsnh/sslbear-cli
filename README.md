@@ -180,3 +180,7 @@ env                                                               凭证配置�
 ```bash
 npm install && npm test && npm run typecheck && npm run build   # 产物在 dist/index.js
 ```
+
+## 许可证
+
+[GPL-3.0](LICENSE)，Copyright (C) 2026 滕勇志

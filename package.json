@@ -37,7 +37,7 @@
     "dns-01",
     "sslbear"
   ],
-  "license": "MIT",
+  "license": "GPL-3.0-only",
   "homepage": "https://github.com/Qsnh/sslbear-cli#readme",
   "repository": {
     "type": "git",
