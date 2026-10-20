@@ -95,7 +95,7 @@ export const baiduDns = defineDns<AccessKeyCredentials>({
   nameServerPattern: /(^|\.)bdydns\.cn$/,
 
   // 实测 2026-10：子用户没有智能云解析的读权限时，域名列表返回 200 + 空列表（查解析记录才报 401 PermissionDeny）
-  emptyZonesHint: "百度智能云解析返回的域名列表是空的，子用户没有智能云解析的读权限时也是这样（不报错），请确认已授予 DNSReadAccessPolicy（签发还要 DNSOperateAccessPolicy）",
+  emptyZonesHint: "百度智能云解析返回的域名列表是空的，子用户没有智能云解析的读权限时也是这样（不报错），请确认已授予 DNSOperateAccessPolicy（含读权限），或自定义策略里 bce:dns 的 READ、OPERATE",
 
   /**
    * 公网 DNS 的域名列表（内网 DNS 是另一个服务 privatezone.baidubce.com，不会出现在这里）。

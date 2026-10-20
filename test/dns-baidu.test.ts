@@ -125,7 +125,7 @@ describe("百度智能云 DNS 无权限", () => {
     const fetch = bce(() => bceError(401, "PermissionDeny", "logical permission deny."));
     await expect(baiduDns.addTxt(ctxOf(fetch), CREDS, rec("_acme-challenge.example.com"))).rejects.toMatchObject({
       code: "PermissionDeny",
-      message: "logical permission deny.（缺少权限，可授予系统策略 DNSReadAccessPolicy、DNSOperateAccessPolicy）",
+      message: "logical permission deny.（缺少权限，可授予系统策略 DNSOperateAccessPolicy，或自定义策略里 bce:dns 的 READ、OPERATE）",
     });
   });
 });

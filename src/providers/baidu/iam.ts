@@ -2,7 +2,7 @@
  * 无权限时在报错里写出可授予的系统策略。百度智能云的拒绝原文都不说缺哪个权限（实测 2026-10）：
  * CDN 403 Forbidden「the current sub user does not have permission」、证书管理 403 BceSignatureValidateException.UnauthorizedException
  * 「您没有当前操作的访问权限」、智能云解析 401 PermissionDeny「logical permission deny.」（列域名不报错、返回空列表，见 dns/baidu.ts）。
- * 按接入点与请求方法推断：读接口给只读策略，写接口给运维策略（策略名以控制台的系统策略列表为准，与 docs/permissions.md 一致）。
+ * 按接入点与请求方法推断：读接口给只读策略，写接口给运维策略（策略名以控制台的系统策略列表为准，自定义策略的写法取自系统策略原文并实测过，与 docs/permissions.md 一致）。
  */
 
 interface Rule {
@@ -20,14 +20,14 @@ const RULES: Record<string, Rule> = {
   },
   "certificate.baidubce.com": {
     denied: (code) => code === "BceSignatureValidateException.UnauthorizedException",
-    read: "系统策略 CASReadAccessPolicy",
-    write: "系统策略 CASOperateAccessPolicy",
+    read: "系统策略 CASReadAccessPolicy，或自定义策略里 bce:cas 的 READ",
+    write: "系统策略 CASOperateAccessPolicy，或自定义策略里 bce:cas 的 OPERATE",
   },
   // 只有签发用到，签发要增删记录：查询被拒也给运维策略
   "dns.baidubce.com": {
     denied: (code) => code === "PermissionDeny",
-    read: "系统策略 DNSReadAccessPolicy、DNSOperateAccessPolicy",
-    write: "系统策略 DNSReadAccessPolicy、DNSOperateAccessPolicy",
+    read: "系统策略 DNSOperateAccessPolicy，或自定义策略里 bce:dns 的 READ、OPERATE",
+    write: "系统策略 DNSOperateAccessPolicy，或自定义策略里 bce:dns 的 READ、OPERATE",
   },
 };
 
