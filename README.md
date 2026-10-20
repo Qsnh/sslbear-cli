@@ -10,19 +10,19 @@ npx -y sslbear-cli@latest skill install
 
 ## 服务表
 
-| 云服务商 | 服务 | 证书 |
-| --- | --- | --- |
-| `aliyun` | `cdn`、`dcdn`（全站加速）、`esa`（边缘安全加速）、`oss`、`live`（直播）、`vod`（点播） | 数字证书管理服务 |
-| `tencent` | `cdn`、`teo`（EdgeOne）、`cos`、`live`、`vod` | SSL 证书 |
-| `volcengine` | `cdn`、`dcdn`、`tos`、`vod`、`live`、`imagex`（veImageX） | 证书中心（只含已签发的证书） |
-| `huawei` | `cdn`、`live`、`obs` | 云证书管理 CCM（含上传的证书，以及过期不满 3 年的证书） |
-| `baidu` | `cdn` | 证书管理 |
-| `qiniu` | `cdn`（含全站加速） | SSL 证书（CDN 和 SSL 证书服务共用） |
+| 云服务商 | 服务 |
+| --- | --- |
+| `aliyun` | `cdn`、`dcdn`（全站加速）、`esa`（边缘安全加速）、`oss`、`live`（直播）、`vod`（点播） |
+| `tencent` | `cdn`、`teo`（EdgeOne）、`cos`、`live`、`vod` |
+| `volcengine` | `cdn`、`dcdn`、`tos`、`vod`、`live`、`imagex`（veImageX） | 
+| `huawei` | `cdn`、`live`、`obs` |
+| `baidu` | `cdn` |
+| `qiniu` | `cdn`（含全站加速） |
 
 ## 按需查阅
 
 - [docs/permissions.md](docs/permissions.md)：各云需要的只读权限、写权限和 DNS 权限。
-- [docs/limitations.md](docs/limitations.md)：各云服务与 DNS 服务商的已知限制，按厂商分节。
+- [docs/limitations.md](docs/limitations.md)：各云服务与 DNS 服务商的已知限制。
 
 ## 开发
 
