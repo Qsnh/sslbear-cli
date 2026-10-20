@@ -105,9 +105,11 @@ export const teo: DomainService<TencentCredentials> = {
     });
     const all = perZone.flat();
     const httpsOf = (d: AccelerationDomain) => !!d.Certificate?.Mode && d.Certificate.Mode !== "disable";
-    // 证书列表的 ExpireTime 可能缺失（官方示例里 List 只有 CertId），缺了就按 ID 从 SSL 证书列表补，整个服务只拉一次
-    const needSsl = all.some(([, d]) => httpsOf(d) && d.Certificate?.List?.some((c) => c.CertId && !c.ExpireTime));
-    const ssl = needSsl ? await sslCertsById(ctx, creds, warn) : undefined;
+    // 证书列表的 ExpireTime 可能缺失（官方示例里 List 只有 CertId），也没有 SAN、签发时间（部署时区分到期时间相近的另一张证书要用），
+    // 按 ID 从 SSL 证书列表补，整个命令只拉一次
+    const withCerts = all.filter(([, d]) => httpsOf(d) && d.Certificate?.List?.some((c) => c.CertId));
+    const missingExpiry = withCerts.some(([, d]) => d.Certificate!.List!.some((c) => c.CertId && !c.ExpireTime));
+    const ssl = withCerts.length ? await sslCertsById(ctx, creds, missingExpiry ? warn : undefined) : undefined;
     return all.map(([zone, d]) => {
       const mode = d.Certificate?.Mode;
       // 一个加速域名可挂多张证书（如 RSA + ECC）：cert 取最早到期的那张，certs 列出全部并标出算法
@@ -122,7 +124,7 @@ export const teo: DomainService<TencentCredentials> = {
             notBefore: s?.notBefore,
             notAfter: toIso(c.ExpireTime) ?? s?.notAfter,
             status: c.Status,
-            algorithm: algorithmOf(c.SignAlgo),
+            algorithm: algorithmOf(c.SignAlgo) ?? s?.algorithm,
           });
         })
         .sort((a, b) => (a.notAfter ?? "9999").localeCompare(b.notAfter ?? "9999"));

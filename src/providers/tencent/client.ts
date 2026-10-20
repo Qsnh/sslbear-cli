@@ -1,5 +1,6 @@
 import type { TencentCredentials } from "../../lib/env.js";
 import { CloudApiError, parseJson, send, withRetry, type QueryContext } from "../../lib/http.js";
+import { explainDenied } from "./cam.js";
 import { tc3Authorization } from "./sign.js";
 
 export interface TencentRequest {
@@ -54,7 +55,9 @@ export async function callTencentOnce<T>(ctx: QueryContext, creds: TencentCreden
     throw new CloudApiError("tencent", `HTTP${raw.status}`, `响应缺少 Response 字段：${raw.text.slice(0, 200)}`, undefined, raw.status);
   }
   if (res.Error) {
-    throw new CloudApiError("tencent", res.Error.Code ?? "Unknown", res.Error.Message ?? "未知错误", res.RequestId, raw.status);
+    const code = res.Error.Code ?? "Unknown";
+    const message = explainDenied(code, res.Error.Message ?? "未知错误", `${req.service}:${req.action}`);
+    throw new CloudApiError("tencent", code, message, res.RequestId, raw.status);
   }
   return res as T;
 }

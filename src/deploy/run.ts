@@ -55,8 +55,11 @@ export interface DeployPlan {
   pending: PendingItem[];
 }
 
-/** 写入前发现状态与查询时不同而放弃的错误：重新执行会按新状态重新判断，所以算可重试 */
-const RERUNNABLE = new Set(["HttpsAlreadyEnabled", "HttpsDisabled"]);
+/**
+ * 重新执行就能过的错误，算可重试：写入前发现状态与查询时不同而放弃（重新执行会按新状态重新判断），
+ * 域名还在部署上一次的变更（DomainBusy）
+ */
+const RERUNNABLE = new Set(["HttpsAlreadyEnabled", "HttpsDisabled", "DomainBusy"]);
 
 const NO_CN =
   "不接受没有通用名（CN）的证书（如 Let's Encrypt shortlived / tlsserver 配置文件签发的证书），未做修改；请改用带 CN 的证书（如 Let's Encrypt classic 配置文件）";

@@ -4,10 +4,10 @@ import { compact } from "../../lib/compact.js";
 import { paginate } from "../../lib/paginate.js";
 import { toIso } from "../../lib/time.js";
 import type { DomainRecord } from "../../types.js";
-import type { Deployer, DomainService } from "../registry.js";
+import type { Deployer, DomainService, Warn } from "../registry.js";
 import { callTencent } from "./client.js";
 import { asPlatformDomain, isPlatformDomain } from "./platform.js";
-import { explainMissingCn, listSslCertificates } from "./ssl.js";
+import { enrichFromSsl, explainMissingCn } from "./ssl.js";
 
 interface CdnHttps {
   Switch?: string;
@@ -110,7 +110,7 @@ const deployer: Deployer<TencentCredentials> = {
 export const cdn: DomainService<TencentCredentials> = {
   key: "cdn",
   label: "CDN",
-  async list(ctx: QueryContext, creds: TencentCredentials): Promise<DomainRecord[]> {
+  async list(ctx: QueryContext, creds: TencentCredentials, warn: Warn): Promise<DomainRecord[]> {
     const domains = await paginate(PAGE, async (_page, offset) => {
       const res = await call<{ Domains?: CdnDomain[] | null; TotalNumber?: number }>(ctx, creds, "DescribeDomainsConfig", {
         Offset: offset,
@@ -118,18 +118,10 @@ export const cdn: DomainService<TencentCredentials> = {
       });
       return { items: res.Domains ?? [], total: res.TotalNumber };
     });
-    // 实测用 ModifyDomainConfig 只换 CertId 后，CertInfo.Message（证书备注）仍是旧证书的，所以证书名以 SSL 证书列表里
-    // 该 ID 的备注名为准；列表拉不到（如没有 SSL 只读权限）时退回 Message，不记 issue（到期时间 CDN 自己就给了）
-    const sslAlias = domains.some((d) => d.Https?.Switch === "on" && d.Https.CertInfo?.CertId)
-      ? await listSslCertificates(ctx, creds).then(
-          (certs) => new Map(certs.map((c) => [c.id, c.name])),
-          () => undefined,
-        )
-      : undefined;
-    return domains.map((d) => {
+    const records = domains.map((d) => {
       const cert = d.Https?.CertInfo;
       const https = d.Https?.Switch === "on";
-      const name = (cert?.CertId && sslAlias?.get(cert.CertId)) || cert?.Message || cert?.CertName;
+      const name = cert?.Message || cert?.CertName;
       const record = compact({
         provider: "tencent" as const,
         service: "cdn",
@@ -142,6 +134,9 @@ export const cdn: DomainService<TencentCredentials> = {
       // 平台域名（如 *.video.myqcloud.com）有 HTTPS 开关但没有用户证书，HTTPS 以开关为准
       return isPlatformDomain(d.Domain) ? asPlatformDomain(record, https) : record;
     });
+    // 实测用 ModifyDomainConfig 只换 CertId 后，CertInfo.Message（证书备注）仍是旧证书的，所以证书名以 SSL 证书列表里
+    // 该 ID 的备注名为准；列表拉不到（如没有 SSL 只读权限）时退回 Message，不记 issue（到期时间 CDN 自己就给了）
+    return enrichFromSsl(ctx, creds, warn, records, { preferSslName: true });
   },
   deployer,
 };

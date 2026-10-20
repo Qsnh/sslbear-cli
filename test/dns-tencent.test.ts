@@ -86,6 +86,17 @@ describe("DNSPod listZones", () => {
     });
     expect(fetch.calls).toHaveLength(2);
   });
+
+  it("缺 CAM 权限时写出缺少的权限；DNSPod 只有签发用到，签发要增删记录，即使被拒的是查询接口也给读写策略", async () => {
+    const message = "you are not authorized to perform operation (dnspod:DescribeDomainList)\nresource (*) has no permission\n";
+    const fetch = dnspod(() => tcError("AuthFailure.UnauthorizedOperation", message));
+    await expect(tencentDns.listZones(ctxOf(fetch), CREDS)).rejects.toMatchObject({
+      code: "AuthFailure.UnauthorizedOperation",
+      message:
+        "you are not authorized to perform operation (dnspod:DescribeDomainList) resource (*) has no permission" +
+        "（缺少 CAM 权限 dnspod:DescribeDomainList，可授予预设策略 QcloudDNSPodFullAccess）",
+    });
+  });
 });
 
 describe("DNSPod addTxt", () => {

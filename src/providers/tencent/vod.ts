@@ -1,5 +1,5 @@
 import type { TencentCredentials } from "../../lib/env.js";
-import type { QueryContext } from "../../lib/http.js";
+import { CloudApiError, type QueryContext } from "../../lib/http.js";
 import { compact } from "../../lib/compact.js";
 import { paginate } from "../../lib/paginate.js";
 import { mapLimit } from "../../lib/pool.js";
@@ -55,9 +55,13 @@ async function listAppDomains(ctx: QueryContext, creds: TencentCredentials, app:
   throw new Error(`点播域名分页超过 ${MAX_DOMAIN_PAGES} 页仍未取完，已中止（接口返回可能异常）`);
 }
 
+/** 上一次的配置变更还在下发（实测 2026-10 换证书后 DeployStatus 为 Deploying 约 3~4 分钟）时再改，点播报这个错 */
+const DEPLOYING = "FailedOperation.DomainDeploying";
+
 /**
  * SetVodDomainCertificate(Operation=Set) 按 SSL 证书 ID 设置证书，设置即开启 HTTPS，只涉及证书；
  * 2023-12-25 之后开通点播的账号必须带应用 ID（list 时已记在 extra.subAppId）。
+ * 域名还在部署上一次的变更时报 DomainBusy（原文只有 failed operation），编排层按可重试处理。
  */
 const deployer: Deployer<TencentCredentials> = {
   // 实测点播不接受没有 CN 的证书
@@ -78,7 +82,11 @@ const deployer: Deployer<TencentCredentials> = {
         CertID: certId,
         ...(subAppId && { SubAppId: Number(subAppId) }),
       }),
-    );
+    ).catch((e: unknown) => {
+      if (!(e instanceof CloudApiError) || e.code !== DEPLOYING) throw e;
+      const message = `该域名上一次的配置变更还在部署中（通常几分钟），未做修改；稍后重新执行即可（${DEPLOYING}）`;
+      throw new CloudApiError(e.provider, "DomainBusy", message, e.requestId, e.httpStatus);
+    });
     return { certId };
   },
 };

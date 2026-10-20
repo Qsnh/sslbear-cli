@@ -7,6 +7,7 @@ import { toIso } from "../../lib/time.js";
 import { xmlBlocks, xmlText } from "../../lib/xml.js";
 import type { DomainRecord } from "../../types.js";
 import type { Deployer, DomainService, Warn } from "../registry.js";
+import { permissionHint } from "./cam.js";
 import { cosAuthorization, cosEncode } from "./sign.js";
 import { enrichFromSsl, explainMissingCn } from "./ssl.js";
 
@@ -21,24 +22,27 @@ const SIGN_TTL_S = 900;
 /**
  * COS 错误响应是 <Error><Code/><Message/><RequestId/></Error>。
  * 限流错误码 SlowDown（HTTP 503）记为 Throttling 让 withRetry 重试，原始错误码保留在 message 里。
+ * 无权限只有 AccessDenied「Access Denied.」，不说缺哪个权限（也可能来自 bucket 的访问策略），按接口名推断，措辞为「可能」。
  */
-function cosError(raw: RawResponse): CloudApiError {
+function cosError(raw: RawResponse, action: string): CloudApiError {
   const rawCode = xmlText(raw.text, "Code");
   const message = xmlText(raw.text, "Message") ?? (raw.text.slice(0, 200) || `HTTP ${raw.status}`);
   let code = rawCode ?? `HTTP${raw.status}`;
   if (rawCode === "SlowDown") code = "Throttling";
   else if (!rawCode && raw.status === 503) code = "ServiceUnavailable";
-  const detail = rawCode && code !== rawCode ? `${message}（${rawCode}）` : message;
+  let detail = rawCode && code !== rawCode ? `${message}（${rawCode}）` : message;
+  if (code === "AccessDenied") detail += permissionHint(`cos:${action}`, true);
   return new CloudApiError("tencent", code, detail, xmlText(raw.text, "RequestId"), raw.status);
 }
 
 /**
  * 调用 COS XML 接口（路径固定为 /），返回响应 XML。带请求体时同时签 Content-MD5 与 Content-Type
- * （COS 的 PUT Bucket 子资源接口要求 Content-MD5）。
+ * （COS 的 PUT Bucket 子资源接口要求 Content-MD5）。action 是接口名，即 CAM Action 去掉 cos: 前缀（无权限时写进报错）。
  */
 async function cosRequest(
   ctx: QueryContext,
   creds: TencentCredentials,
+  action: string,
   method: "GET" | "PUT",
   host: string,
   query: Record<string, string>,
@@ -66,13 +70,13 @@ async function cosRequest(
       .map(([k, v]) => (v ? `${cosEncode(k)}=${cosEncode(v)}` : cosEncode(k)))
       .join("&");
     const raw = await send(ctx, "tencent", `https://${host}/${qs ? `?${qs}` : ""}`, { method, headers, ...(body !== undefined && { body }) });
-    if (raw.status >= 400) throw cosError(raw);
+    if (raw.status >= 400) throw cosError(raw, action);
     return raw.text;
   });
 }
 
-const cosGet = (ctx: QueryContext, creds: TencentCredentials, host: string, query: Record<string, string>) =>
-  cosRequest(ctx, creds, "GET", host, query);
+const cosGet = (ctx: QueryContext, creds: TencentCredentials, action: string, host: string, query: Record<string, string>) =>
+  cosRequest(ctx, creds, action, "GET", host, query);
 
 /** 官方 Java SDK 对 GET Bucket domain / domain certificate 都把 404 视为「没有配置」 */
 const isNotFound = (e: unknown) => e instanceof CloudApiError && e.httpStatus === 404;
@@ -87,7 +91,7 @@ async function listBuckets(ctx: QueryContext, creds: TencentCredentials): Promis
   const buckets: Bucket[] = [];
   let marker: string | undefined;
   for (let page = 0; page < 100; page++) {
-    const xml = await cosGet(ctx, creds, SERVICE_HOST, { "max-keys": String(BUCKET_PAGE), ...(marker && { marker }) });
+    const xml = await cosGet(ctx, creds, "GetService", SERVICE_HOST, { "max-keys": String(BUCKET_PAGE), ...(marker && { marker }) });
     for (const b of xmlBlocks(xml, "Bucket")) {
       const name = xmlText(b, "Name");
       const region = xmlText(b, "Location");
@@ -113,7 +117,7 @@ interface CosDomain {
 async function listDomains(ctx: QueryContext, creds: TencentCredentials, bucket: Bucket): Promise<CosDomain[]> {
   let xml: string;
   try {
-    xml = await cosGet(ctx, creds, bucketHost(bucket), { domain: "" });
+    xml = await cosGet(ctx, creds, "GetBucketDomain", bucketHost(bucket), { domain: "" });
   } catch (e) {
     // 没配置自定义域名时返回 404 DomainConfigNotFoundError
     if (isNotFound(e)) return [];
@@ -136,7 +140,7 @@ interface DomainCert {
 async function getDomainCert(ctx: QueryContext, creds: TencentCredentials, d: CosDomain): Promise<DomainCert | undefined> {
   let xml: string;
   try {
-    xml = await cosGet(ctx, creds, bucketHost(d.bucket), { domaincertificate: "", domainname: d.name });
+    xml = await cosGet(ctx, creds, "GetBucketDomainCertificate", bucketHost(d.bucket), { domaincertificate: "", domainname: d.name });
   } catch (e) {
     if (isNotFound(e)) return undefined;
     throw e;
@@ -172,7 +176,7 @@ const deployer: Deployer<TencentCredentials> = {
       `<DomainCertificate><CertificateInfo><CertType>CustomCert</CertType><CustomCert><CertId>${xmlEscape(certId)}</CertId></CustomCert></CertificateInfo>` +
       `<DomainList><DomainName>${xmlEscape(record.domain)}</DomainName></DomainList></DomainCertificate>`;
     await explainMissingCn(input.cert, " COS ", ["InvalidDomainCertificate"], () =>
-      cosRequest(ctx, creds, "PUT", bucketHost({ name: bucket, region }), { domaincertificate: "" }, body),
+      cosRequest(ctx, creds, "PutBucketDomainCertificate", "PUT", bucketHost({ name: bucket, region }), { domaincertificate: "" }, body),
     );
     return { certId };
   },

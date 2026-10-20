@@ -152,7 +152,7 @@ describe("skill 文档与 CLI 保持一致", () => {
     const deployHelp = (await runCli(["deploy", "--help"])).stdout;
     const reasons = [...deployHelp.matchAll(/^ {2}([a-z_]+) {2,}/gm)].map((m) => m[1]!);
     expect(reasons).toContain("shared_cert_blocked");
-    const codes = ["HttpsStateUnknown", "DomainNotFound", "NotCovered", "CertWithoutCommonName", "HttpsAlreadyEnabled", "HttpsDisabled"];
+    const codes = ["HttpsStateUnknown", "DomainNotFound", "NotCovered", "CertWithoutCommonName", "HttpsAlreadyEnabled", "HttpsDisabled", "DomainBusy"];
     for (const name of [...statuses, ...reasons, ...codes]) expect(all, name).toContain(`\`${name}\``);
   });
 

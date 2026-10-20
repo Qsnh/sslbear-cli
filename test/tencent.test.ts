@@ -64,6 +64,18 @@ describe("tencent certs", () => {
     ]);
   });
 
+  it("SSL 证书：EncryptAlgorithm 只取算法名（RSA 2048 → RSA，ECC 256 → ECC），国密证书为 SM2", async () => {
+    const certs = [
+      { ...SSL_CERTS[0], CertificateId: "rsa", EncryptAlgorithm: "RSA 2048" },
+      { ...SSL_CERTS[0], CertificateId: "ecc", EncryptAlgorithm: "ECC 256" },
+      { ...SSL_CERTS[0], CertificateId: "sm2", EncryptAlgorithm: "SM2", IsSM: true },
+      { ...SSL_CERTS[0], CertificateId: "unknown", EncryptAlgorithm: "" },
+    ];
+    const fetch = fakeFetch(() => ok({ TotalCount: certs.length, Certificates: certs }));
+    const r = await runCli(["certs", "--json"], { env: TENCENT_ENV, fetch });
+    expect(Object.fromEntries(r.json.data.items.map((c: any) => [c.id, c.algorithm]))).toEqual({ rsa: "RSA", ecc: "ECC", sm2: "SM2", unknown: undefined });
+  });
+
   it("业务错误以 HTTP 200 + Response.Error 返回", async () => {
     const fetch = fakeFetch(() => tcError("AuthFailure.SecretIdNotFound", "The SecretId is not found"));
     const r = await runCli(["certs", "--json"], { env: TENCENT_ENV, fetch });
@@ -131,7 +143,7 @@ describe("tencent domains", () => {
     ]);
   });
 
-  it("CDN：只换了 CertId 时 CertInfo.Message 仍是旧证书的备注（实测），证书名以 SSL 证书列表里该 ID 的备注名为准", async () => {
+  it("CDN：只换了 CertId 时 CertInfo.Message 仍是旧证书的备注（实测），证书名以 SSL 证书列表里该 ID 的备注名为准；SAN 等从 SSL 列表补", async () => {
     const cdnDomain = {
       Domain: "www.example.com",
       Status: "online",
@@ -143,7 +155,15 @@ describe("tencent domains", () => {
       return runCli(["domains", "-s", "cdn", "--json"], { env: TENCENT_ENV, fetch });
     };
     const r = await run(sslRoute);
-    expect(r.json.data.items[0].cert).toEqual({ id: "ssl-1", name: "wild", notAfter: "2026-10-29T23:59:59.000Z" });
+    expect(r.json.data.items[0].cert).toEqual({
+      id: "ssl-1",
+      name: "wild",
+      commonName: "*.example.com",
+      sans: ["*.example.com", "example.com"],
+      notBefore: "2026-08-01T00:00:00.000Z",
+      notAfter: "2026-10-29T23:59:59.000Z",
+      status: "已通过",
+    });
     expect(r.json.data.issues).toEqual([]);
 
     // SSL 列表拉不到（如没有只读权限）时退回 Message，不记 issue（到期时间 CDN 自己就有）
@@ -199,8 +219,8 @@ describe("tencent domains", () => {
     expect(r.json.data.issues).toEqual([
       expect.objectContaining({ service: "teo", kind: "error", target: "zone broken.io", code: "InternalError.ProxyServer" }),
     ]);
-    // 证书都带 ExpireTime 时不拉 SSL 证书列表
-    expect(fetch.calls.some((c) => c.action === "DescribeCertificates")).toBe(false);
+    // 证书都带 ExpireTime 时 SSL 证书列表只用来补 SAN 等，拉不到不记 issue
+    expect(fetch.calls.some((c) => c.action === "DescribeCertificates")).toBe(true);
   });
 
   it("EdgeOne：RSA + ECC 双证书时 certs 列出全部，并按 SignAlgo 标出算法", async () => {

@@ -50,6 +50,7 @@
 | `skipped` `shared_cert_blocked` | 证书挂在多条记录共用的配置上（阿里云 ESA 站点），同组有记录挡住了更新。按 `message` 里的放行方法处理后重跑 |
 | `failed` `HttpsStateUnknown` | 查不到 HTTPS 现状，没做修改。稍后重跑；仍然失败的，多半缺读权限 |
 | `failed` `HttpsAlreadyEnabled` / `HttpsDisabled` | 查询之后 HTTPS 状态变了，没做修改。重跑即可 |
+| `failed` `DomainBusy` | 域名上一次的配置变更还在部署（通常几分钟），没做修改。过几分钟重跑 |
 | `failed` `CertWithoutCommonName` | 这个服务不接受没有 CN 的证书。换一张带 CN 的，`issue` 签发的就带 CN |
 | `failed` `DomainNotFound` / `NotCovered` | `-d` 点名的域名找不到，或者不在证书的 SAN 里。核对拼写 |
 | `failed` 其他 `code` | 云接口返回的错误。`retryable: true` 时先原样重跑一次；否则把 `code`、`message`、`requestId` 报给用户。权限问题见 [setup.md](setup.md) |

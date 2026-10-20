@@ -436,6 +436,19 @@ describe("tencent vod 部署", () => {
     });
   }
 
+  it("上一次的变更还在部署（FailedOperation.DomainDeploying，原文只有 failed operation）：报 DomainBusy 并说明稍后重试", async () => {
+    const { result } = apply(
+      "vod",
+      (req) => (req.action === "SetVodDomainCertificate" ? tcError("FailedOperation.DomainDeploying", "failed operation") : undefined),
+      { mode: "update", records: [rec("vod", "v.example.com", { extra: { type: "VOD" } })] },
+    );
+    await expect(result).rejects.toMatchObject({
+      code: "DomainBusy",
+      requestId: "rid-err",
+      message: "该域名上一次的配置变更还在部署中（通常几分钟），未做修改；稍后重新执行即可（FailedOperation.DomainDeploying）",
+    });
+  });
+
   it("老账号没有应用 ID 时不带 SubAppId", async () => {
     const { fetch, result } = run("update", { type: "VOD" });
     await result;
@@ -499,8 +512,60 @@ describe("tencent 没有通用名（CN）的证书被 CDN / COS / 点播拒绝�
   it("证书有 CN、或是其他错误码时原样抛出", async () => {
     const withCn = await cdnUpdate(ECC, tcError("FailedOperation.CdnConfigError", "Https证书内容非法")).result.catch((e: unknown) => e);
     expect(withCn).toMatchObject({ code: "FailedOperation.CdnConfigError", message: "Https证书内容非法" });
-    const other = await cdnUpdate(NO_CN, tcError("UnauthorizedOperation.CdnCamUnauthorized", "no permission")).result.catch((e: unknown) => e);
-    expect(other).toMatchObject({ code: "UnauthorizedOperation.CdnCamUnauthorized", message: "no permission" });
+    const other = await cdnUpdate(NO_CN, tcError("InvalidParameter.CdnParamError", "bad param")).result.catch((e: unknown) => e);
+    expect(other).toMatchObject({ code: "InvalidParameter.CdnParamError", message: "bad param" });
+  });
+});
+
+describe("tencent 缺 CAM 权限时报错写出缺少的权限与预设策略", () => {
+  // 实测（2026-10）的拒绝原文：带被拒的 Action，有换行
+  const denied = (action: string) => `[request id:abc]you are not authorized to perform operation (${action})\nresource (qcs::svc::uin/1:domain/*) has no permission\n`;
+
+  it("原文里的 Action 写进说明，原文压成一行；写接口给读写策略", async () => {
+    const { result } = apply(
+      "cdn",
+      (req) => (req.action === "ModifyDomainConfig" ? tcError("UnauthorizedOperation.CdnCamUnauthorized", denied("cdn:ModifyDomainConfig")) : undefined),
+      { mode: "update", records: [rec("cdn", "www.example.com")] },
+    );
+    await expect(result).rejects.toMatchObject({
+      code: "UnauthorizedOperation.CdnCamUnauthorized",
+      requestId: "rid-err",
+      message:
+        "[request id:abc]you are not authorized to perform operation (cdn:ModifyDomainConfig) resource (qcs::svc::uin/1:domain/*) has no permission" +
+        "（缺少 CAM 权限 cdn:ModifyDomainConfig，可授予预设策略 QcloudCDNFullAccess）",
+    });
+  });
+
+  it("原文没写 Action 时按「服务:接口名」推断；不是缺权限的错误原样返回", async () => {
+    const fetch = fakeFetch((req) => (req.action === "UploadCertificate" ? tcError("AuthFailure.UnauthorizedOperation", "操作未授权，请检查CAM策略。") : undefined));
+    await expect(upload(fetch)).rejects.toMatchObject({
+      message: "操作未授权，请检查CAM策略。（缺少 CAM 权限 ssl:UploadCertificate，可授予预设策略 QcloudSSLFullAccess）",
+    });
+    const other = fakeFetch((req) => (req.action === "UploadCertificate" ? tcError("UnauthorizedOperation", "account not verified") : undefined));
+    await expect(upload(other)).rejects.toMatchObject({ code: "UnauthorizedOperation", message: "account not verified" });
+  });
+
+  it("查询接口给只读策略：点播的只读策略名官方写作 QcloudVODReadonlyAccess", async () => {
+    const fetch = fakeFetch((req) => {
+      if (req.action === "DescribeSubAppIds") return ok({ TotalCount: 0, SubAppIdInfoSet: [] });
+      if (req.action === "DescribeVodDomains") return tcError("UnauthorizedOperation", denied("vod:DescribeVodDomains").replace(/\n/g, " "));
+      return undefined;
+    });
+    const r = await planDeploy(ctxOf(fetch), RSA, { providers: ["tencent"], services: ["vod"], force: false, dryRun: true });
+    expect(r.report.issues).toEqual([
+      expect.objectContaining({ code: "UnauthorizedOperation", message: expect.stringContaining("（缺少 CAM 权限 vod:DescribeVodDomains，可授予预设策略 QcloudVODReadonlyAccess）") }),
+    ]);
+  });
+
+  it("COS 只返回 AccessDenied：按接口名推断，措辞为「可能」", async () => {
+    const err = "<Error><Code>AccessDenied</Code><Message>Access Denied.</Message><RequestId>req-1</RequestId></Error>";
+    const extra = { bucket: "static-1250000000", region: "ap-shanghai", type: "REST" };
+    const { result } = apply("cos", () => ({ status: 403, body: err }), { mode: "update", records: [rec("cos", "img.example.com", { extra })] });
+    await expect(result).rejects.toMatchObject({
+      code: "AccessDenied",
+      httpStatus: 403,
+      message: "Access Denied.（可能缺少 CAM 权限 cos:PutBucketDomainCertificate，可授予预设策略 QcloudCOSFullAccess）",
+    });
   });
 });
 
@@ -553,5 +618,52 @@ describe("tencent 经编排层部署（planDeploy + executeDeploy）", () => {
     const plan = await planDeploy(ctxOf(fetch), RSA, { providers: ["tencent"], services: ["cdn", "live"], force: false, dryRun: true });
     expect(plan.report.results.filter((r) => r.action === "would_update").map((r) => r.domain)).toEqual(["due.example.com", "play.example.com"]);
     expect(fetch.calls.filter((c) => WRITES.has(c.action ?? ""))).toEqual([]);
+  });
+
+  it("CDN / 直播只给证书 ID 和到期时间：从 SSL 列表补 SAN、签发时间与算法，到期时间相近的另一张证书不当成同一张", async () => {
+    // 实测（2026-10）：两张证书到期只差一天多，CDN、直播因为没有 SAN 被当成「已是该证书」跳过
+    const sslCert = (CertificateId: string, SubjectAltName: string[], EncryptAlgorithm: string) => ({
+      CertificateId,
+      Alias: CertificateId,
+      Domain: "example.com",
+      SubjectAltName,
+      CertBeginTime: "2026-01-01 08:00:00",
+      CertEndTime: "2027-01-01 08:00:00",
+      EncryptAlgorithm,
+    });
+    const fetch = fakeFetch((req) => {
+      switch (req.action) {
+        case "DescribeDomainsConfig":
+          return ok({
+            TotalNumber: 2,
+            Domains: [
+              { Domain: "near.example.com", Status: "online", Https: { Switch: "on", CertInfo: { CertId: "extra-san", ExpireTime: "2027-01-01 08:00:00" } } },
+              { Domain: "same.example.com", Status: "online", Https: { Switch: "on", CertInfo: { CertId: "same", ExpireTime: "2027-01-01 08:00:00" } } },
+            ],
+          });
+        case "DescribeLiveDomains":
+          return ok({ AllCount: 1, DomainList: [{ Name: "play.example.com", Type: 1, Status: 1 }] });
+        case "DescribeLiveDomainCertBindings":
+          return ok({ TotalNum: 1, LiveDomainCertBindings: [{ DomainName: "play.example.com", CertificateAlias: "ecc", Status: 1, CertExpireTime: "2027-01-01 08:00:00", CloudCertId: "ecc" }] });
+        case "DescribeCertificates":
+          return ok({
+            TotalCount: 3,
+            Certificates: [
+              sslCert("extra-san", ["example.com", "*.example.com", "example.org"], "RSA 2048"),
+              sslCert("same", ["example.com", "*.example.com"], "RSA 2048"),
+              sslCert("ecc", ["example.com", "*.example.com"], "ECC 256"),
+            ],
+          });
+      }
+      return undefined;
+    });
+    const plan = await planDeploy(ctxOf(fetch), RSA, { providers: ["tencent"], services: ["cdn", "live"], force: false, dryRun: true });
+    expect(plan.report.results.map((r) => [r.domain, r.reason])).toEqual([
+      ["near.example.com", "same_expiry"],
+      ["same.example.com", "already_current"],
+      ["play.example.com", "same_expiry"],
+    ]);
+    expect(plan.report.results[0]!.message).toContain("还覆盖 example.org");
+    expect(plan.report.results[2]!.message).toContain("算法不同");
   });
 });

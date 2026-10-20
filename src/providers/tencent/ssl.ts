@@ -4,7 +4,7 @@ import { CloudApiError, type QueryContext } from "../../lib/http.js";
 import { compact } from "../../lib/compact.js";
 import { memo, paginate } from "../../lib/paginate.js";
 import { toIso } from "../../lib/time.js";
-import type { CertificateRecord, DomainRecord } from "../../types.js";
+import type { CertInfo, CertificateRecord, DomainRecord } from "../../types.js";
 import type { Warn } from "../registry.js";
 import { callTencent } from "./client.js";
 
@@ -20,6 +20,16 @@ interface SslCertificate {
   StatusName?: string;
   From?: string;
   ProductZhName?: string;
+  /** 如 "RSA 2048"、"ECC 256" */
+  EncryptAlgorithm?: string;
+  IsSM?: boolean;
+}
+
+const ALGORITHMS: Record<string, CertInfo["algorithm"]> = { RSA: "RSA", ECC: "ECC", EC: "ECC", ECDSA: "ECC", SM2: "SM2" };
+
+function algorithmOf(c: SslCertificate): CertInfo["algorithm"] {
+  if (c.IsSM) return "SM2";
+  return ALGORITHMS[(c.EncryptAlgorithm ?? "").trim().split(/\s+/)[0]!.toUpperCase()];
 }
 
 const PAGE = 1000;
@@ -45,6 +55,7 @@ async function fetchAll(ctx: QueryContext, creds: TencentCredentials): Promise<C
       notBefore: toIso(c.CertBeginTime),
       notAfter: toIso(c.CertEndTime),
       status: c.StatusName ?? (c.Status === undefined ? undefined : String(c.Status)),
+      algorithm: algorithmOf(c),
       source: c.From,
     }),
   );
@@ -57,36 +68,39 @@ export function listSslCertificates(ctx: QueryContext, creds: TencentCredentials
   return cached(ctx, `ssl:${creds.secretId}`, () => fetchAll(ctx, creds));
 }
 
-/** 按 ID 索引的 SSL 证书；拉取失败（如没有 SSL 只读权限）只记一条 issue 并返回 undefined */
+/**
+ * 按 ID 索引的 SSL 证书；拉取失败（如没有 SSL 只读权限）返回 undefined，给了 warn 时（有证书缺到期时间要靠它补）记一条 issue
+ */
 export async function sslCertsById(
   ctx: QueryContext,
   creds: TencentCredentials,
-  warn: Warn,
+  warn?: Warn,
 ): Promise<Map<string, CertificateRecord> | undefined> {
   try {
     const certs = await listSslCertificates(ctx, creds);
     return new Map(certs.map((c) => [c.id, c]));
   } catch (e) {
-    warn(e, "SSL 证书列表（用于补全到期时间）");
+    warn?.(e, "SSL 证书列表（用于补全到期时间）");
     return undefined;
   }
 }
 
 const needsExpiry = (r: DomainRecord) => !!r.cert?.id && !r.cert.notAfter;
-/** 点播、COS 的证书配置只有 ID（和到期时间），没有证书名，表格里只能显示 ID */
-const needsName = (r: DomainRecord) => !!r.cert?.id && !r.cert.name;
 
 /**
- * 有些服务只返回证书 ID 而缺到期时间、证书名等信息，用 SSL 证书列表按 ID 补全；服务给出的字段不覆盖。
- * 补全失败（如没有 SSL 只读权限）时，有域名缺到期时间才记一条 issue（只缺证书名不影响到期判断），域名本身照常返回。
+ * 各服务的证书配置只给证书 ID 和部分信息（点播、COS 没有证书名，CDN、直播没有 SAN、签发时间和算法），用 SSL 证书列表
+ * 按 ID 补全；服务给出的字段不覆盖（preferSslName 时证书名以 SSL 列表为准）。SAN、签发时间、算法是部署时区分
+ * 「到期时间相近的另一张证书」要用的，所以有证书 ID 的都补。
+ * 补全失败（如没有 SSL 只读权限）时，有域名缺到期时间才记一条 issue（其他字段不影响到期判断），域名本身照常返回。
  */
 export async function enrichFromSsl(
   ctx: QueryContext,
   creds: TencentCredentials,
   warn: Warn,
   records: DomainRecord[],
+  opts: { preferSslName?: boolean } = {},
 ): Promise<DomainRecord[]> {
-  const pending = records.filter((r) => needsExpiry(r) || needsName(r));
+  const pending = records.filter((r) => !!r.cert?.id);
   if (pending.length === 0) return records;
   let certs: CertificateRecord[];
   try {
@@ -102,12 +116,13 @@ export async function enrichFromSsl(
     const cert = r.cert!;
     r.cert = compact({
       ...cert,
-      name: cert.name ?? c.name,
+      name: opts.preferSslName ? (c.name ?? cert.name) : (cert.name ?? c.name),
       commonName: cert.commonName ?? c.commonName,
       sans: cert.sans ?? c.sans,
       notBefore: cert.notBefore ?? c.notBefore,
       notAfter: cert.notAfter ?? c.notAfter,
       status: cert.status ?? c.status,
+      algorithm: cert.algorithm ?? c.algorithm,
     });
   }
   return records;

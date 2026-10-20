@@ -410,17 +410,19 @@ describe("planDeploy / executeDeploy", () => {
     expect(r.results[1]!.message).toContain("[私钥已隐藏]");
   });
 
-  it("写入前发现状态与查询时不同（HttpsAlreadyEnabled / HttpsDisabled）：记为可重试，重新执行会按新状态判断", async () => {
+  it("写入前发现状态与查询时不同（HttpsAlreadyEnabled / HttpsDisabled）、域名还在部署上次的变更（DomainBusy）：记为可重试", async () => {
+    const CODES: Record<string, string> = { a: "HttpsAlreadyEnabled", b: "HttpsDisabled", c: "DomainBusy" };
     const dep = {
       apply: vi.fn(async (_c: QueryContext, _cr: unknown, t: { records: DomainRecord[] }) => {
-        throw new CloudApiError("aliyun", t.records[0]!.domain.startsWith("a") ? "HttpsAlreadyEnabled" : "HttpsDisabled", "changed");
+        throw new CloudApiError("aliyun", CODES[t.records[0]!.domain[0]!]!, "changed");
       }),
     };
-    const d = defs(def("aliyun", [svc("cdn", [rec("cdn", "a.example.com"), rec("cdn", "b.example.com")], dep)]));
+    const d = defs(def("aliyun", [svc("cdn", [rec("cdn", "a.example.com"), rec("cdn", "b.example.com"), rec("cdn", "c.example.com")], dep)]));
     const r = await run(d);
     expect(r.results.map((x) => [x.code, x.retryable])).toEqual([
       ["HttpsAlreadyEnabled", true],
       ["HttpsDisabled", true],
+      ["DomainBusy", true],
     ]);
   });
 
