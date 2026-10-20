@@ -1,0 +1,27 @@
+name: 功能建议
+description: 支持新的云厂商、云服务或 DNS 服务商，或者改进现有命令
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: kind
+    attributes:
+      label: 类型
+      options:
+        - 新的云厂商或云服务（查询 / 部署证书）
+        - 新的 DNS 服务商（issue 自动添加验证记录）
+        - 改进现有命令或输出
+        - 其他
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: 需要什么
+      description: 想支持的厂商和产品（如「华为云 WAF」），或想改进的地方，以及使用场景。
+    validations:
+      required: true
+  - type: textarea
+    id: docs
+    attributes:
+      label: 相关的官方 API 文档
+      description: 查询域名、查询证书、上传证书、绑定证书（或 DNS 解析记录增删）等接口的文档链接，有就贴。

@@ -181,6 +181,8 @@ env                                                               凭证配置�
 npm install && npm test && npm run typecheck && npm run build   # 产物在 dist/index.js
 ```
 
+开发约定、新增云服务的步骤和发布流程见 [CONTRIBUTING.md](CONTRIBUTING.md)；安全问题请按 [SECURITY.md](SECURITY.md) 私下报告。
+
 ## 许可证
 
 [GPL-3.0](LICENSE)，Copyright (C) 2026 滕勇志

@@ -1,0 +1,68 @@
+# 推送到 main 或提交 PR 时检查类型、跑测试、打包，并在最低支持的 Node 18.17 上运行打包产物
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 开发工具（vitest、tsup）要求 Node 22.18+ 或 24.11+
+        node-version: ["22", "24"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  smoke:
+    # engines 声明支持 Node >= 18.17，但开发工具跑不了 18：用 22 打包，再换 18.17 运行产物
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "18.17.0"
+          package-manager-cache: false
+
+      - name: 在 Node 18.17 上运行打包产物
+        run: |
+          node --version
+          node dist/index.js --version
+          node dist/index.js env --json
+          # 没配任何凭证时应报参数错误（exit 2），且不发出网络请求
+          set +e
+          node dist/index.js issue -d example.com --dry-run --json
+          code=$?
+          set -e
+          if [ "$code" != 2 ]; then
+            echo "::error::issue --dry-run 期望 exit 2，实际 $code"
+            exit 1
+          fi

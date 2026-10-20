@@ -1,0 +1,72 @@
+name: 问题反馈
+description: 命令报错、结果不对，或与云控制台显示的不一致
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请先查看[已知限制](https://github.com/Qsnh/sslbear-cli/blob/main/docs/limitations.md)和[所需权限](https://github.com/Qsnh/sslbear-cli/blob/main/docs/permissions.md)，权限不足、服务未开通等情况多数在里面有说明。
+
+        **不要贴 AccessKey / Secret、Token、私钥或 .env 的内容。** `env --json` 的输出已脱敏，可以贴。
+  - type: input
+    id: version
+    attributes:
+      label: sslbear-cli 版本
+      description: "`npx sslbear-cli --version` 的输出"
+      placeholder: "0.3.0"
+    validations:
+      required: true
+  - type: input
+    id: runtime
+    attributes:
+      label: Node.js 版本与操作系统
+      placeholder: "Node.js 22.18.0，macOS 15"
+    validations:
+      required: true
+  - type: dropdown
+    id: command
+    attributes:
+      label: 命令
+      options:
+        - domains
+        - certs
+        - issue
+        - deploy
+        - env
+        - 其他
+    validations:
+      required: true
+  - type: input
+    id: target
+    attributes:
+      label: 云厂商 / 服务 / DNS 服务商
+      description: 与 `-p`、`-s`、`--dns` 的取值一致
+      placeholder: "aliyun / esa；或 DNS：cloudflare"
+  - type: textarea
+    id: command-line
+    attributes:
+      label: 执行的命令
+      render: shell
+      placeholder: "npx sslbear-cli deploy --cert fullchain.pem --key privkey.pem -p aliyun --dry-run --json"
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: 输出
+      description: 加 `--json` 后 stdout / stderr 的完整内容。`requestId`、`code` 有助于排查，请保留；域名可以按需打码。
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果
+      description: 你认为应该是什么结果；与控制台不一致时，说明控制台上显示的是什么。
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充信息
+      description: 子账号授予的权限、域名的特殊配置等。

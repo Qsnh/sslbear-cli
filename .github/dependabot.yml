@@ -1,0 +1,23 @@
+# 每月检查一次依赖更新，每类合并成一个 PR，由 CI 验证
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: chore
+
+  # 只有开发依赖（commander 会被打包进产物，也在其中）
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      dev-dependencies:
+        patterns: ["*"]
+    commit-message:
+      prefix: chore

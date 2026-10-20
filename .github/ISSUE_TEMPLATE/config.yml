@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 报告安全问题
+    url: https://github.com/Qsnh/sslbear-cli/security/advisories/new
+    about: 凭证或私钥泄露、签名实现缺陷等安全问题请私下报告，不要公开提 issue
+  - name: 证书熊 sslbear.com
+    url: https://sslbear.com
+    about: SSL 证书自动签发、续签与部署服务

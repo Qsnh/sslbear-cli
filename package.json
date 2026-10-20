@@ -24,7 +24,9 @@
   },
   "keywords": [
     "ssl",
+    "https",
     "certificate",
+    "certificate-management",
     "aliyun",
     "tencentcloud",
     "volcengine",
@@ -35,6 +37,9 @@
     "acme",
     "letsencrypt",
     "dns-01",
+    "cloudflare",
+    "cli",
+    "ai-agent",
     "sslbear"
   ],
   "license": "GPL-3.0-only",
