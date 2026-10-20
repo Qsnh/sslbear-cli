@@ -101,10 +101,6 @@
 
 </details>
 
-注意：
-
-- 缺权限时，报错末尾会写出缺少的 RAM 权限和包含它的系统策略，如「缺少 RAM 权限 cdn:SetCdnDomainSSLCertificate，可授予系统策略 AliyunCDNFullAccess」。OSS 的原文是「The bucket you access does not belong to you」，多半也是缺权限。
-
 ## 腾讯云
 
 | 服务 | 查询 | 部署 |
@@ -173,11 +169,6 @@
 不用的服务、不用的命令，把对应的行删掉即可。
 
 </details>
-
-注意：
-
-- 缺权限时，报错末尾会写出缺少的 CAM 权限和包含它的预设策略，如「缺少 CAM 权限 cdn:UpdateDomainConfig，可授予预设策略 QcloudCDNFullAccess」。COS 的原文只有「Access Denied.」，多半也是缺权限。
-- CDN、COS、EdgeOne 用 SSL 证书 ID 绑定证书，不需要额外的证书读取权限。
 
 ## 火山引擎
 
