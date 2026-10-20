@@ -474,16 +474,26 @@ describe("aliyun OSS deployer", () => {
     });
   });
 
-  it("OSS 错误响应带 AuthAction 时以它为准", async () => {
-    const { ctx } = context(() => ({
-      status: 403,
-      body:
-        "<Error><Code>AccessDenied</Code><Message>denied</Message><RequestId>oss-req</RequestId>" +
-        "<AccessDeniedDetail><AuthAction>yundun-cert:DescribeSSLCertificatePrivateKey</AuthAction></AccessDeniedDetail></Error>",
-    }));
+  /** 实测的 OSS 无权限响应：AccessDeniedDetail 带 AuthAction 与 NoPermissionType（绑定证书时 OSS 以调用者身份读证书服务） */
+  const ossDenied = (authAction: string, noPermissionType = "ImplicitDeny"): FakeReply => ({
+    status: 403,
+    body:
+      "<Error><Code>AccessDenied</Code><Message>You are forbidden to " + authAction + "</Message><RequestId>oss-req</RequestId>" +
+      "<AccessDeniedDetail><PolicyType>AccountLevelIdentityBasedPolicy</PolicyType><AuthPrincipalType>SubUser</AuthPrincipalType>" +
+      `<NoPermissionType>${noPermissionType}</NoPermissionType><AuthAction>${authAction}</AuthAction>` +
+      "<EncodedDiagnosticMessage>AQIB</EncodedDiagnosticMessage></AccessDeniedDetail><EC>0003-00000001</EC></Error>",
+  });
+
+  it("OSS 错误响应带 AuthAction 时以它为准；显式拒绝时提示解除拒绝", async () => {
     const record = rec("oss", "img.example.com", { extra: { bucket: "b1", region: "cn-hangzhou" } });
-    await expect(oss.deployer!.apply(ctx, CREDS, target([record]), input())).rejects.toMatchObject({
-      message: "denied（缺少 RAM 权限 yundun-cert:DescribeSSLCertificatePrivateKey，可授予系统策略 AliyunYundunCertReadOnlyAccess）",
+    const a = context(() => ossDenied("yundun-cert:DescribeSSLCertificatePrivateKey"));
+    await expect(oss.deployer!.apply(a.ctx, CREDS, target([record]), input())).rejects.toMatchObject({
+      message:
+        "You are forbidden to yundun-cert:DescribeSSLCertificatePrivateKey（缺少 RAM 权限 yundun-cert:DescribeSSLCertificatePrivateKey，可授予系统策略 AliyunYundunCertReadOnlyAccess）",
+    });
+    const b = context(() => ossDenied("oss:PutCname", "ExplicitDeny"));
+    await expect(oss.deployer!.apply(b.ctx, CREDS, target([record]), input())).rejects.toMatchObject({
+      message: "You are forbidden to oss:PutCname（RAM 权限 oss:PutCname 被策略显式拒绝，请在 RAM 控制台解除该拒绝）",
     });
   });
 });

@@ -33,15 +33,73 @@
 
 签发（云解析 DNS）：`AliyunDNSFullAccess`；只跑 `--dry-run` 时 `AliyunDNSReadOnlyAccess` 就够。
 
-最小权限：
+最小权限（2026-10 实测：子账号只挂一条含下列 Action 的自定义策略，资源填 `*`，查询、部署、签发都能跑通）：
 
-- 部署（在上表只读策略之上追加）
+- 查询
+  - 数字证书管理服务：`yundun-cert:ListUserCertificateOrder`、`yundun-cert:GetUserCertificateDetail`
+  - CDN：`cdn:DescribeUserDomains`、`cdn:DescribeCdnHttpsDomainList`；全站加速：`dcdn:DescribeDcdnUserDomains`、`dcdn:DescribeDcdnHttpsDomainList`
+  - ESA：`esa:ListSites`、`esa:ListRecords`、`esa:ListCertificates`、`esa:ListHttpsBasicConfigurations`、`esa:ListCustomHostnames`
+  - OSS：`oss:ListBuckets`、`oss:ListCname`
+  - 视频直播：`live:DescribeLiveUserDomains`、`live:DescribeLiveHttpsDomainList`；视频点播：`vod:DescribeVodUserDomains`、`vod:DescribeVodDomainCertificateInfo`
+- 部署（在查询的基础上再加）
   - 所有服务都要：`yundun-cert:UploadUserCertificate`（部署前先把证书上传到数字证书管理服务）
   - CDN：`cdn:SetCdnDomainSSLCertificate`；全站加速：`dcdn:SetDcdnDomainSSLCertificate`
-  - ESA：`esa:SetCertificate`、`esa:UpdateCustomHostname`
-  - OSS：`oss:PutCname`，绑定证书还要 `yundun-cert:CreateSSLCertificate`（OSS 官方要求的另外两项 `yundun-cert:DescribeSSLCertificatePrivateKey`、`yundun-cert:DescribeSSLCertificatePublicKeyDetail` 已含在证书只读策略里）
+  - ESA：`esa:SetCertificate`；有 SaaS 域名时再加 `esa:UpdateCustomHostname`
+  - OSS：`oss:PutCname`，外加 `yundun-cert:DescribeSSLCertificatePrivateKey`、`yundun-cert:DescribeSSLCertificatePublicKeyDetail`（OSS 用你的身份去证书服务读证书）。OSS 文档里的第三项 `yundun-cert:CreateSSLCertificate` 实测不需要
   - 视频直播：`live:SetLiveDomainCertificate`；视频点播：`vod:SetVodDomainSSLCertificate`
-- 签发（不需要上表的策略）：`alidns:DescribeDomains`（资源只能填 `*`）；`alidns:DescribeSubDomainRecords`、`alidns:AddDomainRecord`、`alidns:DeleteDomainRecord`（可以限定到域名：`acs:alidns::<账号ID>:domain/<域名>`）
+- 签发（只需要这几项）：`alidns:DescribeDomains`（资源只能填 `*`）；`alidns:DescribeSubDomainRecords`、`alidns:AddDomainRecord`、`alidns:DeleteDomainRecord`（可以限定到域名：`acs:alidns::<账号ID>:domain/<域名>`）
+
+<details>
+<summary>完整的自定义策略（查询 + 部署 + 签发，可直接粘贴到 RAM「创建权限策略 → 脚本编辑」）</summary>
+
+```json
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "yundun-cert:ListUserCertificateOrder",
+        "yundun-cert:GetUserCertificateDetail",
+        "yundun-cert:UploadUserCertificate",
+        "yundun-cert:DescribeSSLCertificatePrivateKey",
+        "yundun-cert:DescribeSSLCertificatePublicKeyDetail",
+        "cdn:DescribeUserDomains",
+        "cdn:DescribeCdnHttpsDomainList",
+        "cdn:SetCdnDomainSSLCertificate",
+        "dcdn:DescribeDcdnUserDomains",
+        "dcdn:DescribeDcdnHttpsDomainList",
+        "dcdn:SetDcdnDomainSSLCertificate",
+        "esa:ListSites",
+        "esa:ListRecords",
+        "esa:ListCertificates",
+        "esa:ListHttpsBasicConfigurations",
+        "esa:ListCustomHostnames",
+        "esa:SetCertificate",
+        "esa:UpdateCustomHostname",
+        "oss:ListBuckets",
+        "oss:ListCname",
+        "oss:PutCname",
+        "live:DescribeLiveUserDomains",
+        "live:DescribeLiveHttpsDomainList",
+        "live:SetLiveDomainCertificate",
+        "vod:DescribeVodUserDomains",
+        "vod:DescribeVodDomainCertificateInfo",
+        "vod:SetVodDomainSSLCertificate",
+        "alidns:DescribeDomains",
+        "alidns:DescribeSubDomainRecords",
+        "alidns:AddDomainRecord",
+        "alidns:DeleteDomainRecord"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+不用的服务、不用的命令，把对应的行删掉即可。
+
+</details>
 
 注意：
 

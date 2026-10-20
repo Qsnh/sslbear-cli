@@ -55,9 +55,17 @@ async function ossRequest(ctx: QueryContext, creds: AliyunCredentials, req: OssR
     });
     if (raw.status >= 400) {
       const code = xmlText(raw.text, "Code") ?? `HTTP${raw.status}`;
-      // 无权限时 OSS 只说 bucket 不属于你；AccessDenied 也可能来自 bucket 策略，没给 AuthAction 时措辞为「可能」
+      // 无权限时的原文不说缺哪个权限（自身接口只说 bucket 不属于你），AccessDeniedDetail 里有 AuthAction；
+      // 没给 AuthAction 时 AccessDenied 也可能来自 bucket 策略，措辞为「可能」
       const authAction = xmlText(raw.text, "AuthAction");
-      const hint = code === "AccessDenied" ? permissionHint({ action: authAction ?? `oss:${req.action}`, uncertain: !authAction }) : "";
+      const hint =
+        code === "AccessDenied"
+          ? permissionHint({
+              action: authAction ?? `oss:${req.action}`,
+              explicit: xmlText(raw.text, "NoPermissionType") === "ExplicitDeny",
+              uncertain: !authAction,
+            })
+          : "";
       throw new CloudApiError("aliyun", code, `${xmlText(raw.text, "Message") ?? `HTTP ${raw.status}`}${hint}`, xmlText(raw.text, "RequestId"), raw.status);
     }
     return raw.text;
