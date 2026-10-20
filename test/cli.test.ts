@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -241,6 +241,30 @@ describe("env 与 .env", () => {
     expect(cas.url.searchParams.get("SecurityToken")).toBeNull();
     // 腾讯云在 shell 里没有任何变量，照常从 .env 读取
     expect(fetch.calls.some((c) => c.headers.authorization?.includes("Credential=t-id/"))).toBe(true);
+  });
+
+  it("当前目录没有 .env 时加载 ~/.sslbear-cli/.env（SSLBEAR_CLI_HOME 可改目录）；当前目录有 .env 时只用它", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sslbear-cli-home-"));
+    mkdirSync(join(home, ".sslbear-cli"));
+    writeFileSync(join(home, ".sslbear-cli/.env"), "QINIU_ACCESS_KEY=home-ak\nQINIU_SECRET_KEY=home-sk\n");
+    const fromHome = await runCli(["env", "--json"], { home });
+    expect(fromHome.json.data.envFile).toBe(join(home, ".sslbear-cli/.env"));
+    expect(fromHome.json.data.providers.find((p: any) => p.provider === "qiniu").state).toBe("ok");
+
+    const custom = mkdtempSync(join(tmpdir(), "sslbear-cli-state-"));
+    writeFileSync(join(custom, ".env"), "QINIU_ACCESS_KEY=custom-ak\n");
+    const fromCustom = await runCli(["env", "--json"], { home, env: { SSLBEAR_CLI_HOME: custom } });
+    expect(fromCustom.json.data.envFile).toBe(join(custom, ".env"));
+    expect(fromCustom.json.data.providers.find((p: any) => p.provider === "qiniu").state).toBe("incomplete");
+
+    const cwd = mkdtempSync(join(tmpdir(), "sslbear-cli-"));
+    writeFileSync(join(cwd, ".env"), "TENCENTCLOUD_SECRET_ID=cwd-id\n");
+    const fromCwd = await runCli(["env", "--json"], { home, cwd });
+    expect(fromCwd.json.data.envFile).toBe(join(cwd, ".env"));
+    expect(fromCwd.json.data.providers.find((p: any) => p.provider === "qiniu").state).toBe("missing");
+
+    const none = await runCli(["env"], { home: mkdtempSync(join(tmpdir(), "sslbear-cli-home-")) });
+    expect(none.stdout).toContain(".env 文件：未加载（当前目录和 ~/.sslbear-cli 下都没有 .env）");
   });
 
   it("--env-file 指定的文件不存在时 exit 2", async () => {

@@ -59,7 +59,7 @@ export function resolveTargets(env: Env, providers?: Provider[], defs: ProviderD
   }
   if (targets.length === 0) {
     const hints = Object.values(defs).map((d) => `${d.provider}: ${requiredEnvNames(d).join("、")}`);
-    throw new UsageError(`未检测到任何云厂商凭证，请设置环境变量（或写入当前目录 .env）：\n  ${hints.join("\n  ")}`);
+    throw new UsageError(`未检测到任何云厂商凭证，请设置环境变量（或写入当前目录或 ~/.sslbear-cli 下的 .env）：\n  ${hints.join("\n  ")}`);
   }
   return targets;
 }

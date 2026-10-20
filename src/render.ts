@@ -86,7 +86,7 @@ function keyLine(k: EnvKeyStatus): string {
 }
 
 export function renderEnv(env: Env, envFile?: string, dnsDefs: DnsDefs = DNS_DEFS): string {
-  const lines = [`.env 文件：${envFile ?? "未加载（当前目录不存在 .env）"}`, ""];
+  const lines = [`.env 文件：${envFile ?? "未加载（当前目录和 ~/.sslbear-cli 下都没有 .env）"}`, ""];
   for (const s of envStatus(env)) {
     lines.push(`${PROVIDER_LABEL[s.provider]}（${s.provider}）：${STATE_LABEL[s.state]}`);
     lines.push(...s.keys.map(keyLine), `  可查询服务：${s.services.join(", ")}`, "");

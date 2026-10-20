@@ -20,6 +20,7 @@ npm run build                   # 产物在 dist/index.js
 - **输出契约**：`--json` 时成功在 stdout 输出一行 `{"ok":true,"data":…}`，失败在 stderr 输出一行 `{"ok":false,"status":"…","message":"…"}`；退出码 1 是接口失败，2 是参数错误（没调用任何云接口）。详见 README 的[输出约定](README.md#输出约定)。新增字段可以，改名、删字段属于不兼容变更。
 - **以官方 API 定义为准**：字段名、时间格式（有的云返回不带时区的时间）、分页方式按官方 API 元数据或文档实现，不要照搬控制台的显示。
 - **文档分层**：README 是给 AI agent 看的，只放维护流程、输出约定、命令速查和凭证。各云需要的权限写进 [docs/permissions.md](docs/permissions.md)，已知限制写进 [docs/limitations.md](docs/limitations.md)，都按云厂商分节。
+- **agent skill**：[skills/sslbear-cli](skills/sslbear-cli) 是装进 agent 的使用说明（`SKILL.md` 只放调用方式、规则和路由，细节在 `references/`），随 npm 包发布供 `skill install` 安装，也供 `npx skills add Qsnh/sslbear-cli` 从仓库安装。改了命令、参数、结果字段或凭证变量时同步更新；`test/skill.test.ts` 会检查 skill 里提到的参数都存在、相对链接有效、`--help` 列出的结果码都有处理方法。
 - **测试不发真实请求**：用 `test/helpers.ts` 的 `fakeFetch` 按请求路由返回固定响应，没命中的请求返回 404，能直接看出漏了哪个接口。测试和代码里不要放真实凭证，也不要放云厂商文档里的示例密钥原文（会被 GitHub Push Protection 拦截）。
 
 ## 新增云服务 / DNS 服务商
@@ -28,7 +29,7 @@ npm run build                   # 产物在 dist/index.js
 - **证书部署**：给服务加 `deployer`，接口和各方法的约束见 `src/providers/registry.ts` 的 `Deployer`。上传证书不是幂等操作，只发一次；重试前先重新查重。
 - **新云厂商**：在 `src/types.ts`（`Provider`、`PROVIDERS`、`PROVIDER_LABEL`）、`src/lib/env.ts`（`ENV_FAMILIES`）、`src/query.ts`（`PROVIDER_DEFS`）注册，用 `defineProvider` 定义。
 - **新 DNS 服务商**：在 `src/dns/` 下实现 `DnsProviderDef`（`listZones`、`addTxt`、`removeTxt`，约束见 `src/dns/types.ts` 的注释），注册到 `src/types.ts` 的 `DnsVendor` / `DNS_VENDORS` 和 `src/dns/index.ts` 的 `DNS_DEFS`。`removeTxt` 只能删自己添加的那个值。
-- 同步更新 README 的服务表或凭证表、`docs/permissions.md`、`docs/limitations.md`。
+- 同步更新 README 的服务表或凭证表、skill 的 `references/setup.md`（凭证表）、`docs/permissions.md`、`docs/limitations.md`。
 
 ## 提交
 

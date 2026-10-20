@@ -8,6 +8,7 @@
   },
   "files": [
     "dist",
+    "skills",
     "README.md",
     "docs/permissions.md",
     "docs/limitations.md"
@@ -40,6 +41,7 @@
     "cloudflare",
     "cli",
     "ai-agent",
+    "agent-skills",
     "sslbear"
   ],
   "license": "GPL-3.0-only",

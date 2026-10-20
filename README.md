@@ -6,13 +6,24 @@
 - 覆盖：阿里云、腾讯云、火山引擎、华为云、百度智能云、七牛云的 CDN / 全站加速 / 边缘加速、对象存储、直播、点播、图片服务（见[服务表](#服务表)）
 - 签发：`issue` 向 Let's Encrypt 申请证书，自动在 11 家 DNS 服务商添加、删除验证记录（见[凭证](#凭证)）；也可以用证书熊、acme.sh、certbot 等另备的证书
 
+## 安装 agent skill
+
+装上 skill，Claude Code、Codex、Cursor 等 AI agent 就知道怎么用本 CLI 申请、部署、续期证书，包括设置每天自动续期：
+
+```bash
+npx -y sslbear-cli@latest skill install   # 装进本机检测到的所有 agent；--agent 指定 agent，--dir 指定 skills 目录
+npx skills add Qsnh/sslbear-cli           # 或者用 skills CLI 从 GitHub 安装
+```
+
+新开 agent 会话后生效。skill 的内容在 [skills/sslbear-cli](skills/sslbear-cli)，重复执行 `skill install` 会更新到当前版本。
+
 ## 维护流程
 
-agent 调用一律加 `--json`，这样遇到需要确认的情况也不会停下来交互提问。用户只提到部分云或服务时，每条命令都加 `-p` / `-s` 限定范围。
+agent 调用一律加 `--json`，这样遇到需要确认的情况也不会停下来交互提问。用户只提到部分云或服务时，每条命令都加 `-p` / `-s` 限定范围。带 `*` 的域名参数要加引号，如 `-d 'example.com,*.example.com'`，否则 zsh 会报 no matches found。
 
 1. **检查凭证**：`npx sslbear-cli env --json`。`data.providers[].state` 为 `ok` 的云会被查询，`missing` 的云会被跳过。只要有一家是 `incomplete`（只配了一半），后面的命令就会整条报错（exit 2），除非用 `-p` 把它排除；这时请用户补全或删掉这家的凭证（见[凭证](#凭证)）。要签发证书时，域名所在的 DNS 服务商在 `data.dns[]` 里也要是 `ok`。
 2. **找出快到期的域名**：`npx sslbear-cli domains -e 30 --json`。这条命令列出 30 天内到期的证书，已过期的也算在内；`data.items` 按 `daysLeft` 升序，`cert.sans` 是新证书需要覆盖的域名。
-3. **准备新证书**：按 `cert.sans` 分组，每组签一张：`npx sslbear-cli issue -d <sans 用逗号连接> --json`，按[处理 issue 结果](#处理-issue-结果)处理。`data.files.cert` / `data.files.key` 就是下一步的 `--cert` / `--key`。签发一般要 1~2 分钟，最长约 `--dns-timeout`（默认 300 秒）再加 4 分钟，命令超时请设到 10 分钟以上。
+3. **准备新证书**：按 `cert.sans` 分组，每组签一张：`npx sslbear-cli issue -d '<sans 用逗号连接>' --json`，按[处理 issue 结果](#处理-issue-结果)处理。`data.files.cert` / `data.files.key` 就是下一步的 `--cert` / `--key`。签发一般要 1~2 分钟，最长约 `--dns-timeout`（默认 300 秒）再加 4 分钟，命令超时请设到 10 分钟以上。
    - 用户自备证书时跳过 `issue`：要 fullchain（叶子证书 + 中间证书链）和未加密的 RSA / ECC 私钥，并且带 CN。多数服务拒收没有 CN 的证书，Let's Encrypt shortlived / tlsserver 配置文件签发的就没有（见[已知限制·通用](docs/limitations.md#通用)）；`issue` 用 classic 配置文件签发，证书带 CN。
    - 一张证书只需部署一次，它覆盖的所有域名会被自动找出来。
 4. **预览**：`npx sslbear-cli deploy --cert fullchain.pem --key privkey.pem --dry-run --json`。只输出计划，不上传证书，也不修改任何配置。
@@ -120,6 +131,7 @@ issue    -d <域名,...> [--key-type rsa|ecc] [--dns 服务商,...] [--out 目�
                                                                   向 Let's Encrypt 申请证书（自动添加、删除 DNS 验证记录）
 deploy   --cert <fullchain.pem> --key <privkey.pem> [-p 云] [-s 服务] [-d 域名,...] [--force] [--dry-run] [--timeout ms]
 env                                                               凭证配置检查（ID 脱敏，Secret 只显示是否已设置）
+skill install [--agent 名称,...] [--dir 目录]                     把 agent skill 装进 AI agent 的 skills 目录
 所有命令都支持：--json  --env-file <path>；--timeout 是单个请求的超时，默认 15000
 ```
 
@@ -143,7 +155,7 @@ env                                                               凭证配置�
 
 ## 凭证
 
-凭证从环境变量读取。当前目录有 `.env` 文件时会自动加载，也可以用 `--env-file` 指定。只需配置要用的云。
+凭证从环境变量读取。会自动加载当前目录的 `.env`，当前目录没有时加载 `~/.sslbear-cli/.env`（agent 在任何目录下、定时任务都能读到）；也可以用 `--env-file` 指定。只需配置要用的云。
 
 | 云 | 必填 | 可选（临时凭证） |
 | --- | --- | --- |

@@ -1,7 +1,7 @@
 import type { KeyObject } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { Command, Help, Option } from "commander";
 import { loadLocalCert } from "./deploy/cert.js";
 import { renderConfirm, renderDeploy } from "./deploy/render.js";
@@ -13,12 +13,14 @@ import { parseDomains } from "./issue/domains.js";
 import { systemDnsLookup, type DnsLookup } from "./issue/propagation.js";
 import { issueNotes, leftoverNotes, printProgress, renderIssue } from "./issue/render.js";
 import { cleanupNote, IssueAborted, IssueError, runIssue, type AcmeFactory, type DnsResult, type InterruptHooks, type IssueReport } from "./issue/run.js";
+import { stateRoot } from "./issue/store.js";
 import type { KeyType } from "./issue/types.js";
 import type { DnsIssue } from "./issue/zones.js";
 import { dnsEnvStatus, envStatus, renderCerts, renderDomains, renderEnv } from "./render.js";
 import { familyNames, loadEnvFile, type Env } from "./lib/env.js";
 import type { Fetch, QueryContext } from "./lib/http.js";
 import { ExitError, fail, outJson, type OutputOptions } from "./lib/output.js";
+import { renderTable } from "./lib/table.js";
 import {
   PROVIDER_DEFS,
   UsageError,
@@ -29,6 +31,7 @@ import {
   type ProviderDefs,
   type QueryIssue,
 } from "./query.js";
+import { SKILL_AGENTS, SKILL_NAME, agentSkillsDir, detectAgents, installSkill, readSkillFiles, type InstallResult } from "./skill.js";
 import { DNS_VENDORS, PROVIDERS, type DnsVendor, type Provider } from "./types.js";
 import { VERSION } from "./version.js";
 
@@ -78,6 +81,12 @@ interface DeployCliOpts extends CommonOpts {
   force?: boolean;
   dryRun?: boolean;
   timeout: number;
+}
+
+interface SkillInstallOpts {
+  json?: boolean;
+  agent?: string[];
+  dir?: string;
 }
 
 interface IssueCliOpts extends CommonOpts {
@@ -155,7 +164,10 @@ const CREDENTIAL_GROUPS = [
   ...DNS_VENDORS.filter((v) => !(PROVIDERS as readonly string[]).includes(v)).map((v) => [...DNS_DEFS[v].envNames]),
 ];
 
-/** 环境变量快照 + .env 文件：显式 --env-file 不存在时报错，默认的 ./.env 不存在则忽略 */
+/**
+ * 环境变量快照 + .env 文件：显式 --env-file 不存在时报错；默认加载当前目录的 .env，没有时加载状态目录（~/.sslbear-cli）的 .env，
+ * 只加载先找到的一个。状态目录里的 .env 让 agent、定时任务在任何目录下运行都能读到同一份凭证
+ */
 function loadEnv(deps: Deps, opts: CommonOpts): { env: Env; envFile?: string } {
   const env: Env = { ...deps.env };
   if (opts.envFile) {
@@ -163,8 +175,11 @@ function loadEnv(deps: Deps, opts: CommonOpts): { env: Env; envFile?: string } {
     if (!loadEnvFile(path, env, CREDENTIAL_GROUPS)) throw new UsageError(`--env-file 指定的文件不存在：${path}`);
     return { env, envFile: path };
   }
-  const path = resolve(deps.cwd, ".env");
-  return loadEnvFile(path, env, CREDENTIAL_GROUPS) ? { env, envFile: path } : { env };
+  // 状态目录按 shell 里的 SSLBEAR_CLI_HOME 定位：.env 还没加载，不能用它里面的值
+  for (const path of [resolve(deps.cwd, ".env"), join(stateRoot(deps.env, deps.home ?? homedir(), deps.cwd), ".env")]) {
+    if (loadEnvFile(path, env, CREDENTIAL_GROUPS)) return { env, envFile: path };
+  }
+  return { env };
 }
 
 function createContext(deps: Deps, opts: CommonOpts & { timeout: number }): QueryContext {
@@ -177,12 +192,14 @@ function createContext(deps: Deps, opts: CommonOpts & { timeout: number }): Quer
   };
 }
 
+const ENV_FILE_HELP = "从指定文件加载环境变量（默认加载当前目录的 .env，没有时加载 ~/.sslbear-cli/.env）";
+
 /** 调用云接口的命令共用：请求超时、JSON 输出、.env 文件 */
 function withCommon(cmd: Command): Command {
   return cmd
     .addOption(new Option("--timeout <ms>", "单个请求超时（毫秒）").default(15000).argParser(intArg("--timeout", 1, 600000)))
     .option("--json", "输出单行 JSON：成功 {ok:true,data}，失败 {ok:false,status,message}")
-    .option("--env-file <path>", "从指定文件加载环境变量（默认加载当前目录的 .env，若存在）");
+    .option("--env-file <path>", ENV_FILE_HELP);
 }
 
 function withQuery(cmd: Command, serviceHelp?: string): Command {
@@ -416,10 +433,23 @@ const ISSUE_HELP_AFTER = `
   130  被 Ctrl+C（SIGINT）中止；143  被 SIGTERM 中止（status 为 Interrupted）
 
 示例：
-  sslbear-cli issue -d example.com,*.example.com --dry-run --json
-  sslbear-cli issue -d example.com,*.example.com --json
+  sslbear-cli issue -d 'example.com,*.example.com' --dry-run --json
+  sslbear-cli issue -d 'example.com,*.example.com' --json
   sslbear-cli issue -d www.example.com --key-type ecc --dns cloudflare --json
   sslbear-cli issue -d example.com --staging            # 演练：测试环境的证书不受浏览器信任`;
+
+const SKILL_INSTALL_DESCRIPTION = `把 ${SKILL_NAME} skill 装进 AI agent 的 skills 目录，agent 读了它就知道怎么用本 CLI 申请、部署、续期证书。
+
+  - 默认装进本机检测到的所有 agent（配置目录存在即视为已安装），写入 <agent 配置目录>/skills/${SKILL_NAME}/
+  - 重复执行会更新到当前版本，内容没变时不改动
+  - 也可以从 GitHub 安装：npx skills add Qsnh/sslbear-cli`;
+
+const ACTION_LABEL = { created: "新安装", updated: "已更新", unchanged: "已是最新" } as const;
+
+function renderSkillInstall(installed: InstallResult[]): string {
+  const rows = installed.map((r) => [SKILL_AGENTS[r.agent]?.label ?? "--dir", r.path, ACTION_LABEL[r.action]]);
+  return [`${SKILL_NAME} skill（${VERSION}）：`, "", renderTable(["agent", "目录", "结果"], rows), "", "新开 agent 会话后生效。"].join("\n");
+}
 
 export function buildProgram(deps: Deps, output: OutputOptions = { json: false }): Command {
   const program = new Command("sslbear-cli")
@@ -570,12 +600,41 @@ export function buildProgram(deps: Deps, output: OutputOptions = { json: false }
     .command("env")
     .description("检查环境变量里的云厂商与 DNS 服务商凭证配置（脱敏显示）")
     .option("--json", "输出单行 JSON")
-    .option("--env-file <path>", "从指定文件加载环境变量（默认加载当前目录的 .env，若存在）")
+    .option("--env-file <path>", ENV_FILE_HELP)
     .action((opts: CommonOpts) => {
       const { env, envFile } = loadEnv(deps, opts);
       const dnsDefs = deps.dnsDefs ?? DNS_DEFS;
       if (opts.json) outJson({ envFile: envFile ?? null, providers: envStatus(env), dns: dnsEnvStatus(env, dnsDefs) });
       else console.log(renderEnv(env, envFile, dnsDefs));
+    });
+
+  const skill = program
+    .command("skill")
+    .summary("安装 agent skill，让 AI agent 学会用本 CLI 维护证书")
+    .description("安装 agent skill：让 Claude Code、Codex、Cursor 等 AI agent 学会用本 CLI 申请、部署、续期证书");
+  skill
+    .command("install")
+    .summary("把 skill 装进本机 AI agent 的 skills 目录")
+    .description(SKILL_INSTALL_DESCRIPTION)
+    .option("--agent <list>", `只装进这些 agent，逗号分隔，没检测到也装（${Object.keys(SKILL_AGENTS).join(", ")}）`, csv)
+    .option("--dir <path>", `装进这个 skills 目录（写入 <path>/${SKILL_NAME}/），如项目级的 .claude/skills；只给 --dir 时不再装进检测到的 agent`)
+    .option("--json", "输出单行 JSON")
+    .action((opts: SkillInstallOpts) => {
+      const out = { json: !!opts.json };
+      const home = deps.home ?? homedir();
+      if (opts.agent?.length === 0) throw new UsageError("--agent 不能为空");
+      for (const a of opts.agent ?? []) {
+        if (!SKILL_AGENTS[a]) throw new UsageError(`不支持的 agent "${a}"，可选：${Object.keys(SKILL_AGENTS).join(", ")}；其他 agent 请用 --dir 指定它的 skills 目录`);
+      }
+      const agents = opts.agent ? [...new Set(opts.agent)] : opts.dir ? [] : detectAgents(deps.env, home);
+      if (agents.length === 0 && !opts.dir) {
+        throw new UsageError(`没有检测到支持的 agent（${Object.keys(SKILL_AGENTS).join(", ")}），请用 --agent 指定，或用 --dir 指定 skills 目录`);
+      }
+      const files = readSkillFiles();
+      const installed = agents.map((a) => installSkill(a, agentSkillsDir(a, deps.env, home), files));
+      if (opts.dir) installed.push(installSkill("custom", resolve(deps.cwd, opts.dir), files));
+      if (out.json) outJson({ skill: SKILL_NAME, version: VERSION, installed });
+      else console.log(renderSkillInstall(installed));
     });
 
   return program;
