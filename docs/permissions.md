@@ -118,13 +118,67 @@
 
 签发（DNSPod）：`QcloudDNSPodFullAccess`；只跑 `--dry-run` 时 `QcloudDNSPodReadOnlyAccess` 就够。
 
-最小权限：
+最小权限（2026-10 实测：子账号只挂一条含下列 Action 的自定义策略，资源填 `*`，查询、部署、签发都能跑通）：
 
-- 部署（在上表只读策略之上追加）
-  - SSL 证书：`ssl:UploadCertificate`
+- 查询
+  - SSL 证书：`ssl:DescribeCertificates`
+  - CDN：`cdn:DescribeDomainsConfig`；EdgeOne：`teo:DescribeZones`、`teo:DescribeAccelerationDomains`
+  - COS：`cos:GetService`、`cos:GetBucketDomain`、`cos:GetBucketDomainCertificate`
+  - 云直播：`live:DescribeLiveDomains`、`live:DescribeLiveDomainCertBindings`；云点播：`vod:DescribeVodDomains`、`vod:DescribeSubAppIds`
+- 部署（在查询的基础上再加）
+  - 所有服务都要：`ssl:UploadCertificate`（部署前先把证书上传到 SSL 证书服务）
   - CDN：`cdn:ModifyDomainConfig`、`cdn:UpdateDomainConfig`；EdgeOne：`teo:ModifyHostsCertificate`；COS：`cos:PutBucketDomainCertificate`
   - 云直播：`live:ModifyLiveDomainCertBindings`；云点播：`vod:SetVodDomainCertificate`
-- 签发：`dnspod:DescribeDomainList`、`dnspod:DescribeRecordList`、`dnspod:CreateRecord`、`dnspod:DeleteRecord`。都可以按域名授权，资源写 `qcs::dnspod::uin/<主账号ID>:domain/<DomainId>`（DomainId 是 DNSPod 里的域名 ID，不是域名）。只授权部分域名时 `DescribeDomainList` 会返回什么官方没写，稳妥起见它授权全部资源。
+- 签发（只需要这几项）：`dnspod:DescribeDomainList`、`dnspod:DescribeRecordList`、`dnspod:CreateRecord`、`dnspod:DeleteRecord`。`--dry-run` 只要 `dnspod:DescribeDomainList`。都可以按域名授权，资源写 `qcs::dnspod::uin/<主账号ID>:domain/<DomainId>`（DomainId 是 DNSPod 里的域名 ID，不是域名）。只授权部分域名时 `DescribeDomainList` 会返回什么官方没写，稳妥起见它授权全部资源。
+
+<details>
+<summary>完整的自定义策略（查询 + 部署 + 签发，可直接粘贴到 CAM「新建自定义策略 → 按策略语法创建」）</summary>
+
+```json
+{
+  "version": "2.0",
+  "statement": [
+    {
+      "effect": "allow",
+      "action": [
+        "ssl:DescribeCertificates",
+        "ssl:UploadCertificate",
+        "cdn:DescribeDomainsConfig",
+        "cdn:ModifyDomainConfig",
+        "cdn:UpdateDomainConfig",
+        "teo:DescribeZones",
+        "teo:DescribeAccelerationDomains",
+        "teo:ModifyHostsCertificate",
+        "cos:GetService",
+        "cos:GetBucketDomain",
+        "cos:GetBucketDomainCertificate",
+        "cos:PutBucketDomainCertificate",
+        "live:DescribeLiveDomains",
+        "live:DescribeLiveDomainCertBindings",
+        "live:ModifyLiveDomainCertBindings",
+        "vod:DescribeVodDomains",
+        "vod:DescribeSubAppIds",
+        "vod:SetVodDomainCertificate",
+        "dnspod:DescribeDomainList",
+        "dnspod:DescribeRecordList",
+        "dnspod:CreateRecord",
+        "dnspod:DeleteRecord"
+      ],
+      "resource": ["*"]
+    }
+  ]
+}
+```
+
+不用的服务、不用的命令，把对应的行删掉即可。
+
+</details>
+
+注意：
+
+- 缺权限时，报错末尾会写出缺少的 CAM 权限和包含它的预设策略，如「缺少 CAM 权限 cdn:UpdateDomainConfig，可授予预设策略 QcloudCDNFullAccess」。COS 的原文只有「Access Denied.」，多半也是缺权限。
+- CDN、COS 用 SSL 证书 ID 绑定证书，不需要额外的证书读取权限。
+- EdgeOne 的部署权限只核对过名字，没有真实部署过。
 
 ## 火山引擎
 
