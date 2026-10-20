@@ -174,7 +174,7 @@
 
 | 服务 | 查询 | 部署 |
 | --- | --- | --- |
-| CDN | `CDNReadOnlyAccess`、`CDNSSLReadOnlyAccess` | `CDNReadOnlyAccess`、`CDNSSLFullAccess` |
+| CDN | `CDNReadOnlyAccess` | `CDNFullAccess` |
 | 全站加速 DCDN | `DCDNReadOnlyAccess` | `DCDNFullAccess` |
 | 对象存储 TOS | `TOSReadOnlyAccess` | `TOSFullAccess` |
 | 视频点播 | `VodReadOnlyAccess` | `VodFullAccessV2` |
@@ -186,19 +186,78 @@
 
 注意：
 
-- **CDN 的证书权限要单独给。** `CDNFullAccess` 不含配置证书，部署要用 `CDNSSLFullAccess`；查询域名关联证书的接口也归在 CDN 证书管理里，对应 `CDNSSLReadOnlyAccess`。
 - 点播、veImageX 的 FullAccess 在 2026-08-20 升级成了带 V2 的版本，旧的 `VodFullAccess`、`ImageXFullAccess` 不要再用。
 - **第一次部署前要做跨服务授权。** CDN、全站加速、TOS、点播、veImageX 要获得授权才能访问证书中心里的证书。用主账号在该产品控制台给域名配一次 HTTPS 证书，按提示完成授权即可；子用户默认没有跨服务授权的权限。TOS 没授权时证书状态是 `RoleNotExist`。
 
-最小权限（自定义策略的 Action 写成「服务代码:接口名」，注意 `CDN`、`ImageX` 的大小写；资源填 `*`）：
+最小权限（2026-10 实测：子账号只挂一条含下列 Action 的自定义策略，资源填 `*`，查询、部署、签发都能跑通）：
 
-- 部署（在上表只读策略之上追加）
-  - 证书中心：`certificate_service:ImportCertificate`
-  - CDN：`CDN:BatchDeployCert`；全站加速：`dcdn:CreateCertBind`、`dcdn:DescribeDomainDetail`、`dcdn:UpdateDomainConfig`；TOS：`tos:PutBucketCustomDomain`
-  - 点播：`vod:DescribeVodDomainConfig`、`vod:UpdateVodDomainConfig`
-  - 直播：`live:ListCertV2`、`live:DescribeCertDetailSecretV2`、`live:CreateCert`、`live:BindCert`
-  - veImageX：`ImageX:GetDomainConfig`、`ImageX:UpdateHttps`
-- 签发：`dns:ListZones`、`dns:ListRecords`、`dns:CreateRecord`、`dns:DeleteRecord`
+- 查询
+  - 证书中心：`certificate_service:CertificateGetInstanceList`
+  - CDN：`CDN:ListCdnDomains`、`CDN:ListCdnCertInfo`；全站加速：`DCDN:ListDomainConfig`
+  - TOS：`tos:ListBuckets`、`tos:GetBucketCustomDomain`
+  - 点播：`vod:ListSpace`、`vod:ListVodDomains`、`vod:DescribeVodDomainConfig`
+  - 直播：`live:ListDomainDetail`、`live:ListCertV2`、`live:DescribeCertDetailSecretV2`
+  - veImageX：`ImageX:GetAllImageServices`、`ImageX:GetServiceDomains`、`ImageX:GetDomainConfig`、`ImageX:GetImageAllDomainCert`
+- 部署（在查询的基础上再加）
+  - 证书中心：`certificate_service:ImportCertificate`（直播以外的服务都先把证书上传到证书中心）
+  - CDN：`CDN:BatchDeployCert`；全站加速：`DCDN:CreateCertBind`，给没开 HTTPS 的域名部署时再加 `DCDN:DescribeDomainDetail`、`DCDN:UpdateDomainConfig`
+  - TOS：`tos:PutBucketCustomDomain`；点播：`vod:UpdateVodDomainConfig`；veImageX：`ImageX:UpdateHttps`
+  - 直播：`live:CreateCert`、`live:BindCert`（直播用自己的证书管理，不用证书中心）
+- 签发（只需要这几项）：`dns:ListZones`、`dns:ListRecords`、`dns:CreateRecord`、`dns:DeleteRecord`。`--dry-run` 只要 `dns:ListZones`。
+
+CDN、全站加速、TOS、点播、veImageX 靠跨服务授权读证书中心里的证书，子账号不需要额外的证书读权限（与阿里云 OSS 不同）。
+
+<details>
+<summary>完整的自定义策略（查询 + 部署 + 签发，可直接粘贴到访问控制「新建策略 → JSON 编辑」）</summary>
+
+```json
+{
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "certificate_service:CertificateGetInstanceList",
+        "certificate_service:ImportCertificate",
+        "CDN:ListCdnDomains",
+        "CDN:ListCdnCertInfo",
+        "CDN:BatchDeployCert",
+        "DCDN:ListDomainConfig",
+        "DCDN:DescribeDomainDetail",
+        "DCDN:CreateCertBind",
+        "DCDN:UpdateDomainConfig",
+        "tos:ListBuckets",
+        "tos:GetBucketCustomDomain",
+        "tos:PutBucketCustomDomain",
+        "vod:ListSpace",
+        "vod:ListVodDomains",
+        "vod:DescribeVodDomainConfig",
+        "vod:UpdateVodDomainConfig",
+        "live:ListDomainDetail",
+        "live:ListCertV2",
+        "live:DescribeCertDetailSecretV2",
+        "live:CreateCert",
+        "live:BindCert",
+        "ImageX:GetAllImageServices",
+        "ImageX:GetServiceDomains",
+        "ImageX:GetDomainConfig",
+        "ImageX:GetImageAllDomainCert",
+        "ImageX:UpdateHttps",
+        "dns:ListZones",
+        "dns:ListRecords",
+        "dns:CreateRecord",
+        "dns:DeleteRecord"
+      ],
+      "Resource": [
+        "*"
+      ]
+    }
+  ]
+}
+```
+
+不用的服务、不用的命令，把对应的行删掉即可。
+
+</details>
 
 ## 华为云
 
