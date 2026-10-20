@@ -282,11 +282,60 @@ CDN、全站加速、TOS、点播、veImageX 靠跨服务授权读证书中心�
 - 只部署 CDN 时不需要云证书管理的写权限。
 - OBS 的只读系统策略（`OBS ReadOnlyAccess`、`OBSReadOnlyPolicy`）不含读取桶的自定义域名，不能用。
 
-最小权限（自定义策略）：
+最小权限（2026-10 实测新版：子账号只挂一条含下列授权项的自定义身份策略，查询、部署、签发都能跑通）：
 
-- OBS：`obs:bucket:ListAllMyBuckets`、`obs:bucket:GetBucketCustomDomainConfiguration`，部署再加 `obs:bucket:PutBucketCustomDomainConfiguration`。新版身份策略里这三项首字母小写：`obs:bucket:listAllMyBuckets`、`obs:bucket:getBucketCustomDomainConfiguration`、`obs:bucket:putBucketCustomDomainConfiguration`。
-- 云证书管理：查询要 `scm:cert:list`；部署再加 `scm:cert:get` 和上传证书（旧版 `scm:cert:upload`，新版 `scm:cert:import`）。
-- 签发：`dns:zone:list`、`dns:recordset:list`、`dns:recordset:create`、`dns:recordset:update`、`dns:recordset:delete`。官方给其中几项列了云监控（`ces:`）的依赖授权项，要一起加上，见授权项列表（[旧版](https://support.huaweicloud.com/api-dns/dns_api_70002.html)、[新版](https://support.huaweicloud.com/api-dns/Permission.html)）。旧版里 DNS 是项目级服务，要单独建一个策略，不能和 OBS、云证书管理放在同一个策略里。
+- 查询
+  - 云证书管理：`scm:cert:list`
+  - CDN：`cdn:configuration:queryDomainList`
+  - OBS：`obs:bucket:listAllMyBuckets`、`obs:bucket:getBucketCustomDomainConfiguration`
+  - 视频直播：`live:domain:getDomains`、`live:domain:getCertificates`、`live:domain:getCDNConfig`
+- 部署（在查询的基础上再加）
+  - 云证书管理（OBS、直播要用）：`scm:cert:get`、`scm:cert:import`；部署直播再加 `scm:cert:export`（直播用你的身份从云证书管理导出证书）
+  - CDN：`cdn:configuration:queryDomains`、`cdn:configuration:modifyHttpsConf`、`cdn:configuration:modifyOriginConfInfo`（修改域名配置的接口两项都检查）
+  - OBS：`obs:bucket:putBucketCustomDomainConfiguration`；视频直播：`live:domain:updateCDNConfig`
+- 签发（只需要这几项）：`dns:zone:list`、`dns:recordset:list`、`dns:recordset:create`、`dns:recordset:update`、`dns:recordset:delete`。官方给其中几项列的云监控（`ces:`）依赖授权项实测不需要。`--dry-run` 只要 `dns:zone:list`。
+
+<details>
+<summary>完整的自定义身份策略（新版，查询 + 部署 + 签发，可直接粘贴到 IAM「身份策略 → 创建自定义身份策略 → JSON 视图」）</summary>
+
+```json
+{
+  "Version": "5.0",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "scm:cert:list",
+        "scm:cert:get",
+        "scm:cert:import",
+        "scm:cert:export",
+        "cdn:configuration:queryDomainList",
+        "cdn:configuration:queryDomains",
+        "cdn:configuration:modifyHttpsConf",
+        "cdn:configuration:modifyOriginConfInfo",
+        "obs:bucket:listAllMyBuckets",
+        "obs:bucket:getBucketCustomDomainConfiguration",
+        "obs:bucket:putBucketCustomDomainConfiguration",
+        "live:domain:getDomains",
+        "live:domain:getCertificates",
+        "live:domain:getCDNConfig",
+        "live:domain:updateCDNConfig",
+        "dns:zone:list",
+        "dns:recordset:list",
+        "dns:recordset:create",
+        "dns:recordset:update",
+        "dns:recordset:delete"
+      ]
+    }
+  ]
+}
+```
+
+不用的服务、不用的命令，把对应的行删掉即可。
+
+</details>
+
+旧版（角色与策略）的自定义策略没有实测，授权项以官方授权项列表为准（如 DNS 的[旧版列表](https://support.huaweicloud.com/api-dns/dns_api_70002.html)）。已知和新版不同的地方：OBS 三项首字母大写（`obs:bucket:ListAllMyBuckets`、`obs:bucket:GetBucketCustomDomainConfiguration`、`obs:bucket:PutBucketCustomDomainConfiguration`），上传证书是 `scm:cert:upload`；DNS 是项目级服务，要单独建一个策略，不能和 OBS、云证书管理放在同一个策略里。
 
 ## 百度智能云
 
