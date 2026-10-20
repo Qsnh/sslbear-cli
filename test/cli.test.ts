@@ -93,11 +93,31 @@ describe("凭证与参数校验", () => {
     expect(fetch.calls).toHaveLength(0);
   });
 
+  it("多余的位置参数（如 -d 后用空格分隔多个域名）exit 2，且不发请求", async () => {
+    const fetch = fakeFetch(() => undefined);
+    for (const argv of [
+      ["domains", "abc", "--json"],
+      ["deploy", "--cert", "a.pem", "--key", "b.pem", "-d", "a.example.com", "b.example.com", "--json"],
+    ]) {
+      const r = await runCli(argv, { env: BOTH, fetch });
+      expect(r.code, argv.join(" ")).toBe(2);
+      expect(JSON.parse(r.stderr), argv.join(" ")).toMatchObject({ ok: false, status: "UsageError", message: expect.stringContaining("too many arguments") });
+    }
+    expect(fetch.calls).toHaveLength(0);
+  });
+
   it("--help 与 --version exit 0", async () => {
     expect((await runCli(["--help"])).code).toBe(0);
     const v = await runCli(["--version"]);
     expect(v.code).toBe(0);
     expect(v.stdout.trim()).toBe(pkg.version);
+  });
+
+  it("--help 里手工排版的命令说明原样输出，不在句中折行", async () => {
+    const r = await runCli(["issue", "--help"]);
+    expect(r.stdout).toContain("产出 fullchain.pem + privkey.pem，可直接用于 deploy --cert / --key。\n");
+    expect(r.stdout).toContain("即视为同意 Let's Encrypt 订阅协议（https://letsencrypt.org/repository/）。\n");
+    expect(r.stdout).toContain("--out 可改；\n    目录 700");
   });
 });
 

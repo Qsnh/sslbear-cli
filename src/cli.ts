@@ -2,7 +2,7 @@ import type { KeyObject } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { Command, Option } from "commander";
+import { Command, Help, Option } from "commander";
 import { loadLocalCert } from "./deploy/cert.js";
 import { renderConfirm, renderDeploy } from "./deploy/render.js";
 import { buildPlan, executeDeploy, queryForDeploy, type DeployOptions, type DeployPlan, type DeployReport } from "./deploy/run.js";
@@ -427,7 +427,13 @@ export function buildProgram(deps: Deps, output: OutputOptions = { json: false }
       "证书熊 CLI：查询阿里云、腾讯云、火山引擎、华为云、百度智能云、七牛云等云服务上的域名及其 SSL 证书，向 Let's Encrypt 申请证书（自动设置 DNS 验证记录），并可把证书部署 / 更新到这些域名（凭证从环境变量读取）",
     )
     .version(VERSION)
-    .exitOverride();
+    .exitOverride()
+    // commander 13 起命令说明一律按 80 列折行，会把手工排版的说明（issue / deploy）拆在句中；排过版的原样输出
+    .configureHelp({
+      boxWrap(this: Help, str: string, width: number) {
+        return this.preformatted(str) ? str : Help.prototype.boxWrap.call(this, str, width);
+      },
+    });
   // JSON 模式下参数错误由 run() 统一输出为 JSON，屏蔽 commander 自带的文本报错与帮助
   if (output.json) program.configureOutput({ writeErr: () => {}, outputError: () => {} });
   else program.showHelpAfterError();
