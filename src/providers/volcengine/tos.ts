@@ -7,6 +7,7 @@ import type { DomainRecord } from "../../types.js";
 import type { DomainService, Warn } from "../registry.js";
 import { enrichFromCertCenter } from "./certs.js";
 import { httpsAlreadyEnabled, httpsDisabled } from "./common.js";
+import { permissionHint } from "./iam.js";
 import { canonicalQuery, sha256Hex, tosAuthorization, volcDate } from "./sign.js";
 
 /** ListBuckets 返回账号下所有地域的桶，任一地域的 endpoint 都可以 */
@@ -14,6 +15,8 @@ const SERVICE_HOST = "tos-cn-beijing.volces.com";
 const SERVICE_REGION = "cn-beijing";
 
 const NO_CUSTOM_DOMAIN_EC = "0016-00000008";
+/** 账户未开通 TOS 服务（同样是 403 AccessDenied，由 isInactive 识别，不是缺权限） */
+const INACTIVE_EC = "0003-00000003";
 
 interface TosError {
   Code?: string;
@@ -24,6 +27,8 @@ interface TosError {
 }
 
 interface TosRequest {
+  /** 接口名，即 IAM Action 去掉 tos: 前缀（无权限时写进报错） */
+  action: "ListBuckets" | "GetBucketCustomDomain" | "PutBucketCustomDomain";
   host: string;
   region: string;
   /** 无值参数（如 customdomain）传空串 */
@@ -75,7 +80,9 @@ async function tosCall<T>(ctx: QueryContext, creds: AccessKeyCredentials, req: T
     if (raw.status >= 400) {
       // 503 SlowDown 为限流，换成能被 withRetry 识别的错误码；其余限流码（ExceedAccountQPSLimit 等）为 HTTP 429
       const code = body.Code === "SlowDown" ? "Throttling.SlowDown" : (body.Code ?? `HTTP${raw.status}`);
-      const message = `${body.Message ?? `HTTP ${raw.status}`}${body.EC ? `（EC ${body.EC}）` : ""}`;
+      let message = `${body.Message ?? `HTTP ${raw.status}`}${body.EC ? `（EC ${body.EC}）` : ""}`;
+      // 无权限只有 AccessDenied（实测 EC 0003-00000012），不说缺哪个权限（也可能来自桶策略），按接口名推断
+      if (body.Code === "AccessDenied" && body.EC !== INACTIVE_EC) message += permissionHint(`tos:${req.action}`, true);
       throw new CloudApiError("volcengine", code, message, body.RequestId, raw.status);
     }
     return body;
@@ -127,12 +134,13 @@ export const tos: DomainService<AccessKeyCredentials> = {
   key: "tos",
   label: "对象存储 TOS",
   async list(ctx: QueryContext, creds: AccessKeyCredentials, warn: Warn): Promise<DomainRecord[]> {
-    const body = await tosCall<{ Buckets: Bucket[] | null }>(ctx, creds, { host: SERVICE_HOST, region: SERVICE_REGION, query: {} });
+    const body = await tosCall<{ Buckets: Bucket[] | null }>(ctx, creds, { action: "ListBuckets", host: SERVICE_HOST, region: SERVICE_REGION, query: {} });
     const buckets = (body.Buckets ?? []).filter((b) => b.Name && b.Location);
     const perBucket = await mapLimit(buckets, 5, async (bucket) => {
       try {
         // 必须走桶所在地域的 endpoint，走错地域会直接返回 NoSuchBucket
         const res = await tosCall<{ CustomDomainRules: CustomDomainRule[] | null }>(ctx, creds, {
+          action: "GetBucketCustomDomain",
           host: bucket.ExtranetEndpoint ? `${bucket.Name}.${bucket.ExtranetEndpoint}` : bucketHost(bucket.Name, bucket.Location!),
           region: bucket.Location!,
           query: { customdomain: "" },
@@ -179,7 +187,7 @@ export const tos: DomainService<AccessKeyCredentials> = {
     async apply(ctx, creds, target, input) {
       const [record] = target.records;
       const { bucket, region } = record!.extra ?? {};
-      const req = { host: bucketHost(bucket!, region!), region: region!, query: { customdomain: "" } };
+      const req = { action: "GetBucketCustomDomain", host: bucketHost(bucket!, region!), region: region!, query: { customdomain: "" } } as const;
       const res = await tosCall<{ CustomDomainRules: CustomDomainRule[] | null }>(ctx, creds, req);
       const rule = (res.CustomDomainRules ?? []).find((r) => r.Domain.toLowerCase() === record!.domain.toLowerCase());
       if (!rule) throw new CloudApiError("volcengine", "DomainNotFound", `桶 ${bucket} 上已没有自定义域名 ${record!.domain}`);
@@ -187,7 +195,7 @@ export const tos: DomainService<AccessKeyCredentials> = {
       if (target.mode === "update" && !ruleHttps(rule)) throw httpsDisabled(record!.domain);
       const certId = await input.certId();
       const body = JSON.stringify({ CustomDomainRule: compact({ Domain: rule.Domain, CertId: certId, Protocol: rule.Protocol }) });
-      await tosCall(ctx, creds, { ...req, method: "PUT", body });
+      await tosCall(ctx, creds, { ...req, action: "PutBucketCustomDomain", method: "PUT", body });
       return { certId };
     },
   },

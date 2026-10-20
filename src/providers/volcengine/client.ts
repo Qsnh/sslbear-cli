@@ -1,5 +1,6 @@
 import type { AccessKeyCredentials } from "../../lib/env.js";
 import { CloudApiError, send, withRetry, type QueryContext } from "../../lib/http.js";
+import { explainDenied } from "./iam.js";
 import { canonicalQuery, sha256Hex, volcAuthorization, volcDate } from "./sign.js";
 
 export interface VolcRequest {
@@ -89,7 +90,8 @@ export async function callVolcOnce<T>(ctx: QueryContext, creds: AccessKeyCredent
         : TRANSIENT_CODES.has(errCode)
           ? `ServiceUnavailable.${errCode}`
           : errCode;
-    throw new CloudApiError("volcengine", code, err.Message || errCode, meta!.RequestId, raw.status);
+    const message = explainDenied(errCode, err.CodeN, err.Message || errCode, `${req.service}:${req.action}`);
+    throw new CloudApiError("volcengine", code, message, meta!.RequestId, raw.status);
   }
   if (raw.status >= 400) {
     // 兜底：错误响应不带 ResponseMetadata.Error 时按 HTTP 状态报错

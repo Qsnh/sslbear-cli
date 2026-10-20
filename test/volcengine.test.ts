@@ -106,6 +106,28 @@ describe("volcengine 请求格式", () => {
     expect(r.json.data.items).toHaveLength(3);
   });
 
+  it("无权限时报错写出缺少的 IAM 权限与可授予的系统策略", async () => {
+    const dcdnDenied = "User is not authorized to perform: dcdn:ListDomainConfig on resource: trn:dcdn::2000000001:DomainName/*";
+    const fetch = fakeFetch((req) => {
+      // 原文带 Action（服务前缀小写）：按原文
+      if (req.action === "ListDomainConfig") return volcError("AccessDenied", dcdnDenied, 403);
+      // CDN 的原文不说缺哪个：用本次调用的「服务:接口名」
+      if (req.action === "ListCdnDomains") return volcError("AccessDenied.IAMUnauthorized", "您没有权限操作域名", 200);
+      // TOS 只有 AccessDenied（也可能来自桶策略）：按接口名推断，措辞为「可能」
+      if (req.url.host === "tos-cn-beijing.volces.com") return tosError(403, "AccessDenied", "0003-00000012");
+      return undefined;
+    });
+    const r = await runCli(["domains", "-s", "cdn,dcdn,tos", "--json"], { env: VOLC_ENV, fetch });
+    // 全部服务都失败：exit 1，issues 在 stderr 里
+    expect(r.code).toBe(1);
+    const bySvc = Object.fromEntries(JSON.parse(r.stderr).issues.map((i: { service: string; message: string }) => [i.service, i.message]));
+    expect(bySvc).toEqual({
+      cdn: "您没有权限操作域名（缺少 IAM 权限 CDN:ListCdnDomains，可授予系统策略 CDNReadOnlyAccess）",
+      dcdn: `${dcdnDenied}（缺少 IAM 权限 dcdn:ListDomainConfig，可授予系统策略 DCDNReadOnlyAccess）`,
+      tos: "AccessDenied message（EC 0003-00000012）（可能缺少 IAM 权限 tos:ListBuckets，可授予系统策略 TOSReadOnlyAccess）",
+    });
+  });
+
   it("非 JSON 的网关错误按 HTTP 状态报错", async () => {
     const fetch = fakeFetch(() => ({ status: 502, body: "<html>bad gateway</html>" }));
     const r = await runCli(["domains", "-s", "cdn", "--json"], { env: VOLC_ENV, fetch });

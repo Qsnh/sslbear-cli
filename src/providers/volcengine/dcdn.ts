@@ -63,6 +63,15 @@ async function readHttps(ctx: QueryContext, creds: AccessKeyCredentials, domain:
 
 const UNCONFIRMED_HINT = "请稍后用 domains 核对，或到全站加速控制台的 HTTPS 配置里查看";
 
+/** 域名还在部署上一次的变更（实测换证书后约 3 分钟内状态为 Deploy）时，CreateCertBind / UpdateDomainConfig 报的错误码 */
+const DEPLOYING = "UpdateStatusInvalid";
+
+/** 部署中报 DomainBusy（编排层按可重试处理），其他错误原样抛出 */
+function rethrowBusy(e: unknown, message: string): never {
+  if (!(e instanceof CloudApiError) || e.code !== DEPLOYING) throw e;
+  throw new CloudApiError(e.provider, "DomainBusy", `${message}（${DEPLOYING}）`, e.requestId, e.httpStatus);
+}
+
 /** 读回的配置里绑定的必须是新证书，否则无从确认部署结果 */
 function assertBound(https: DcdnHttps | undefined, certId: string): void {
   const bound = https?.CertBind?.CertId;
@@ -119,12 +128,14 @@ export const dcdn: DomainService<AccessKeyCredentials> = {
      * 部署：CreateCertBind 的文档没说会改 EnableHttps（绑了证书但关闭 HTTPS 的域名再绑同一张证书时可能什么都不变），
      * 所以绑定后用 DescribeDomainDetail 读回，确认绑的是新证书且 EnableHttps 为 true；HTTPS 没开时用 UpdateDomainConfig
      * 把读出的整个 Https 模块原样写回、只把 EnableHttps 改为 true（按模块整体覆盖，其他字段必须带上），再读回核对。
-     * 仍然确认不了就报错，不算部署成功。
+     * 仍然确认不了就报错，不算部署成功。域名还在部署上一次的变更时两个写接口都报 UpdateStatusInvalid，改报可重试的 DomainBusy。
      */
     async apply(ctx, creds, target, input) {
       const domain = target.records[0]!.domain;
       const certId = await input.certId();
-      const res = await call<{ Success?: boolean }>(ctx, creds, "CreateCertBind", { CertSource: "volc", CertId: certId, DomainNames: [domain] });
+      const res = await call<{ Success?: boolean }>(ctx, creds, "CreateCertBind", { CertSource: "volc", CertId: certId, DomainNames: [domain] }).catch((e: unknown) =>
+        rethrowBusy(e, "该域名上一次的配置变更还在部署中（通常几分钟），未做修改；稍后重新执行即可"),
+      );
       if (res.Success === false) throw new CloudApiError("volcengine", "CertBindFailed", "绑定证书失败（接口返回 Success=false）");
       if (target.mode === "update") return { certId };
 
@@ -132,7 +143,9 @@ export const dcdn: DomainService<AccessKeyCredentials> = {
       assertBound(bound, certId);
       if (bound!.EnableHttps === true) return { certId };
       const Https = { ...(writable(bound) as DcdnHttps), EnableHttps: true };
-      await call(ctx, creds, "UpdateDomainConfig", { Domain: domain, Https }, "2023-01-01");
+      await call(ctx, creds, "UpdateDomainConfig", { Domain: domain, Https }, "2023-01-01").catch((e: unknown) =>
+        rethrowBusy(e, "已绑定新证书，但域名还在部署这次变更，未能开启 HTTPS；几分钟后重新执行即可开启"),
+      );
       const after = await readHttps(ctx, creds, domain);
       assertBound(after, certId);
       if (after!.EnableHttps !== true) {

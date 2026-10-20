@@ -106,6 +106,15 @@ describe("volcengine uploadCertificate（证书中心）", () => {
     expect(e).toMatchObject({ code: "NotMatch.KeyPair", requestId: "rid-err" });
   });
 
+  it("无权限时报错写出缺少的 IAM 权限与可授予的系统策略（原文带 Action，按原文）", async () => {
+    const message = "User is not authorized to perform: certificate_service:ImportCertificate on resource: trn:iam::2000000001:project/default";
+    const { ctx } = setup(() => volcError("AccessDenied", message, 403));
+    await expect(volcengine.uploadCertificate!(ctx, CREDS, RSA)).rejects.toMatchObject({
+      code: "AccessDenied",
+      message: `${message}（缺少 IAM 权限 certificate_service:ImportCertificate，可授予系统策略 SSLFullAccess）`,
+    });
+  });
+
   it("响应里既没有 InstanceId 也没有 RepeatId 时报错", async () => {
     const { ctx } = setup(() => ok({}));
     await expect(volcengine.uploadCertificate!(ctx, CREDS, RSA)).rejects.toMatchObject({ code: "InvalidResponse" });
@@ -373,6 +382,27 @@ describe("volcengine dcdn 部署", () => {
     expect(fetch.calls.some((c) => c.action === "UpdateDomainConfig")).toBe(false);
   });
 
+  it("域名还在部署上一次的变更（UpdateStatusInvalid）时报可重试的 DomainBusy", async () => {
+    const deploying = () => volcError("UpdateStatusInvalid", 'When update a domain, the status must be "Started." or "Stop."', 400);
+    // 换证书时
+    const bind = setup((req) => (req.action === "CreateCertBind" ? deploying() : undefined));
+    const e1 = await deployer("dcdn").apply(bind.ctx, CREDS, target(rec("dcdn", "a.example.com", { cert: { id: "cert-old" } })), input()).catch((e) => e);
+    expect(e1).toMatchObject({
+      code: "DomainBusy",
+      requestId: "rid-err",
+      message: "该域名上一次的配置变更还在部署中（通常几分钟），未做修改；稍后重新执行即可（UpdateStatusInvalid）",
+    });
+    // 要等几分钟，请求层不自动重试（编排层按 DomainBusy 标为可重试）
+    expect(isRetryable(e1)).toBe(false);
+    // 绑定后开启 HTTPS 时：证书已换，提示重新执行即可开启
+    const dcdn = dcdnState({ EnableHttps: false, CertBind: { CertSource: "volc", CertId: "cert-old" } });
+    const enable = setup((req) => (req.action === "UpdateDomainConfig" ? deploying() : dcdn.route(req)));
+    await expect(deployer("dcdn").apply(enable.ctx, CREDS, target(rec("dcdn", "c.example.com", { https: false })), input())).rejects.toMatchObject({
+      code: "DomainBusy",
+      message: "已绑定新证书，但域名还在部署这次变更，未能开启 HTTPS；几分钟后重新执行即可开启（UpdateStatusInvalid）",
+    });
+  });
+
   it("planDeploy + executeDeploy：点名的 bound-off 域名开不了 HTTPS 时记为失败，不报 deployed", async () => {
     const dcdn = dcdnState({ EnableHttps: false, CertBind: { CertSource: "volc", CertId: "cert-new" } }, { enableWorks: false });
     const { fetch, ctx } = setup((req) => {
@@ -408,6 +438,18 @@ describe("volcengine tos 部署", () => {
     return undefined;
   };
   const extra = { bucket: "b1", region: "cn-shanghai" };
+
+  it("PUT 无权限（403 AccessDenied，不说缺哪个权限）时按接口名推断，措辞为「可能」", async () => {
+    const { ctx } = setup((req) =>
+      req.method === "PUT" ? { status: 403, body: { Code: "AccessDenied", Message: "Access Denied", RequestId: "tos-rid", EC: "0003-00000012" } } : route(req),
+    );
+    await expect(
+      deployer("tos").apply(ctx, CREDS, target(rec("tos", "www.example.com", { extra, cert: { id: "cert-old" } })), input()),
+    ).rejects.toMatchObject({
+      code: "AccessDenied",
+      message: "Access Denied（EC 0003-00000012）（可能缺少 IAM 权限 tos:PutBucketCustomDomain，可授予系统策略 TOSFullAccess）",
+    });
+  });
 
   it("更新：先读出该域名的规则，只换 CertId，访问协议原样带回", async () => {
     const { fetch, ctx } = setup(route);

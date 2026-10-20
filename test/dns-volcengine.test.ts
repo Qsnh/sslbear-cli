@@ -103,6 +103,8 @@ describe("火山引擎云解析 listZones", () => {
     const err = await volcengineDns.listZones(ctxOf(denied), CREDS).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(CloudApiError);
     expect(err).toMatchObject({ provider: "volcengine", code: "AccessDenied", requestId: "rid-err", httpStatus: 403 });
+    // 签发要增删记录：即使被拒的是查询接口也给读写策略
+    expect((err as Error).message).toBe("User is not authorized to perform: dns:ListZones（缺少 IAM 权限 dns:ListZones，可授予系统策略 DNSFullAccess）");
   });
 
   it("NS 主机名规则覆盖免费版、付费版、海外与旧 NS", () => {
