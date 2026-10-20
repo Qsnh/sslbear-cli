@@ -108,10 +108,15 @@ export async function findZones(
   const issues: DnsIssue[] = [];
   const hosted: Hosted[] = [];
   const settled = await Promise.allSettled(targets.map((t) => t.def.listZones(ctx, t.creds)));
+  /** 列 zone 成功但一个都没有、且声明了 emptyZonesHint 的服务商（可能是缺权限被静默过滤） */
+  const emptyHints: string[] = [];
   settled.forEach((r, i) => {
     const target = targets[i]!;
     if (r.status === "rejected") issues.push(toDnsIssue(target.def.vendor, r.reason));
-    else hosted.push(...r.value.map((zone) => ({ target, zone: { ...zone, name: normalizeName(zone.name) } })));
+    else {
+      if (r.value.length === 0 && target.def.emptyZonesHint) emptyHints.push(target.def.emptyZonesHint);
+      hosted.push(...r.value.map((zone) => ({ target, zone: { ...zone, name: normalizeName(zone.name) } })));
+    }
   });
 
   // 同一个 zone 的 NS 只查一次（根域名与泛域名、同 zone 的多个子域）
@@ -163,9 +168,10 @@ export async function findZones(
   if (notFound.length > 0) {
     const checked = targets.map((t) => t.def.vendor).join("、");
     const failed = issues.length > 0 ? `；其中 ${issues.map((i) => `${i.provider} 列出 zone 失败（${i.code} ${i.message}）`).join("，")}，多半是缺权限` : "";
+    const empty = emptyHints.map((h) => `；${h}`).join("");
     throw new ZoneError(
       "ZoneNotFound",
-      `以下域名不在所选 DNS 服务商（${checked}）的任何 zone 里：${notFound.join(", ")}${failed}。请确认域名由这些服务商解析，或配置实际托管该域名的服务商的凭证`,
+      `以下域名不在所选 DNS 服务商（${checked}）的任何 zone 里：${notFound.join(", ")}${failed}${empty}。请确认域名由这些服务商解析，或配置实际托管该域名的服务商的凭证`,
       { domains: notFound },
       issues,
     );

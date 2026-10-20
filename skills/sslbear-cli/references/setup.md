@@ -62,4 +62,4 @@ mkdir -p ~/.sslbear-cli && touch ~/.sslbear-cli/.env && chmod 600 ~/.sslbear-cli
 - 要用 `deploy`：再加上传证书、修改各服务 HTTPS 配置的写权限。
 - 要用 `issue`：加域名所在 DNS 服务商的解析记录读写权限。
 
-各云的具体策略见 <https://github.com/Qsnh/sslbear-cli/blob/main/docs/permissions.md>。`issues[]` 或 `failed` 结果里出现权限类错误码（如 Forbidden、NoPermission、AccessDenied、Unauthorized）时，也看这份文档，再把缺的权限告诉用户。阿里云、腾讯云、火山引擎、华为云的 `message` 末尾会写出缺少的权限（RAM / CAM / IAM）和可授予的系统策略，直接转告用户。
+各云的具体策略见 <https://github.com/Qsnh/sslbear-cli/blob/main/docs/permissions.md>。`issues[]` 或 `failed` 结果里出现权限类错误码（如 Forbidden、NoPermission、AccessDenied、Unauthorized）时，也看这份文档，再把缺的权限告诉用户。阿里云、腾讯云、火山引擎、华为云、百度智能云的 `message` 末尾会写出缺少的权限（RAM / CAM / IAM）或可授予的系统策略，直接转告用户。

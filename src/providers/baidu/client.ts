@@ -1,5 +1,6 @@
 import type { AccessKeyCredentials } from "../../lib/env.js";
 import { CloudApiError, send, withRetry, type QueryContext } from "../../lib/http.js";
+import { explainDenied } from "./iam.js";
 import { bceAuthorization, bceTimestamp, canonicalPath, uriEncode } from "./sign.js";
 
 export interface BceRequest {
@@ -75,7 +76,7 @@ export async function callBce<T>(ctx: QueryContext, creds: AccessKeyCredentials,
       if (THROTTLE.test(code)) {
         throw new CloudApiError("baidu", "Throttling", `${code}: ${message}`, err.requestId, raw.status);
       }
-      throw new CloudApiError("baidu", code, message, err.requestId, raw.status);
+      throw new CloudApiError("baidu", code, explainDenied(req.host, method, code, message), err.requestId, raw.status);
     }
     return body as T;
   };

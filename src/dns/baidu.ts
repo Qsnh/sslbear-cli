@@ -94,6 +94,9 @@ export const baiduDns = defineDns<AccessKeyCredentials>({
   // 基础版、普惠版 ns1/ns2.bdydns.cn，企业版 sv1~sv4.bdydns.cn（「开启解析服务」https://cloud.baidu.com/doc/DNS/s/9jxk76qc2）；接口不返回 zone 的 NS
   nameServerPattern: /(^|\.)bdydns\.cn$/,
 
+  // 实测 2026-10：子用户没有智能云解析的读权限时，域名列表返回 200 + 空列表（查解析记录才报 401 PermissionDeny）
+  emptyZonesHint: "百度智能云解析返回的域名列表是空的，子用户没有智能云解析的读权限时也是这样（不报错），请确认已授予 DNSReadAccessPolicy（签发还要 DNSOperateAccessPolicy）",
+
   /**
    * 公网 DNS 的域名列表（内网 DNS 是另一个服务 privatezone.baidubce.com，不会出现在这里）。
    * 返回 running 与 torenew：nsunchange（NS 尚未修改，即未接入）、unregister、failed 时解析记录不会生效。

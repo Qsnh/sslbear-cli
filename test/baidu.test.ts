@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { bceAuthorization } from "../src/providers/baidu/sign.js";
 import { fakeFetch, runCli, type FakeRequest } from "./helpers.js";
+import { explainDenied } from "../src/providers/baidu/iam.js";
 
 const BAIDU_ENV = { BAIDUCLOUD_ACCESS_KEY: "test-ak-baidu", BAIDUCLOUD_SECRET_KEY: "test-sk-baidu" };
 
@@ -77,6 +78,36 @@ describe("baidu 请求格式", () => {
     const r = await runCli(["certs", "-p", "baidu", "--json"], { env: BAIDU_ENV, fetch });
     expect(r.code).toBe(1);
     expect(JSON.parse(r.stderr)).toMatchObject({ ok: false, status: "IamSignatureInvalid" });
+  });
+
+  it("无权限时按接入点与请求方法写出可授予的系统策略（原文不说缺哪个权限）", async () => {
+    // 证书管理：403 BceSignatureValidateException.UnauthorizedException；CDN：403 Forbidden
+    const fetch = fakeFetch((req) =>
+      req.url.host === "certificate.baidubce.com"
+        ? bceError(403, "BceSignatureValidateException.UnauthorizedException", "您没有当前操作的访问权限")
+        : bceError(403, "Forbidden", "the current sub user does not have permission"),
+    );
+    const certs = await runCli(["certs", "-p", "baidu", "--json"], { env: BAIDU_ENV, fetch });
+    expect(JSON.parse(certs.stderr).issues).toEqual([
+      expect.objectContaining({ message: "您没有当前操作的访问权限（缺少权限，可授予系统策略 CASReadAccessPolicy）" }),
+    ]);
+    const domains = await runCli(["domains", "-p", "baidu", "--json"], { env: BAIDU_ENV, fetch });
+    expect(JSON.parse(domains.stderr).issues).toEqual([
+      expect.objectContaining({
+        code: "Forbidden",
+        message: "the current sub user does not have permission（缺少权限，可授予系统策略 CDNReadAccessPolicy，或自定义策略里 bce:cdn 的 QueryDomainList、QueryDomainConfig）",
+      }),
+    ]);
+    // 写接口给运维策略
+    expect(explainDenied("cdn.baidubce.com", "PUT", "Forbidden", "the current sub user does not have permission")).toBe(
+      "the current sub user does not have permission（缺少权限，可授予系统策略 CDNOperateAccessPolicy，或自定义策略里 bce:cdn 的 UpdateDomain）",
+    );
+    expect(explainDenied("certificate.baidubce.com", "POST", "BceSignatureValidateException.UnauthorizedException", "您没有当前操作的访问权限")).toBe(
+      "您没有当前操作的访问权限（缺少权限，可授予系统策略 CASOperateAccessPolicy）",
+    );
+    // 其他 403（如签名错误）原样返回
+    const sig = await runCli(["certs", "-p", "baidu", "--json"], { env: BAIDU_ENV, fetch: fakeFetch(() => bceError(403, "IamSignatureInvalid", "bad sig")) });
+    expect(JSON.parse(sig.stderr).issues[0].message).toBe("bad sig");
   });
 
   it("限流（429 或名称像限流的错误码）自动重试", async () => {

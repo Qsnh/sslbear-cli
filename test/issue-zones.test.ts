@@ -131,6 +131,17 @@ describe("findZones", () => {
     ]);
   });
 
+  it("找不到且百度返回空的域名列表（缺 DNS 读权限时也不报错）：报错里说明可能缺权限；列表不为空时不加", async () => {
+    const empty = targetsFor({ aliyun: [zone("example.com")], baidu: [] });
+    const e = await zoneError(findZones(ctx, empty.lookup, empty.targets, ["a.example.org"]));
+    expect(e.status).toBe("ZoneNotFound");
+    expect(e.message).toContain("百度智能云解析返回的域名列表是空的，子用户没有智能云解析的读权限时也是这样");
+    expect(e.issues).toEqual([]);
+
+    const some = targetsFor({ baidu: [zone("example.cn")] });
+    expect((await zoneError(findZones(ctx, some.lookup, some.targets, ["a.example.org"]))).message).not.toContain("百度智能云解析返回的域名列表是空的");
+  });
+
   it("部分服务商列 zone 失败但域名找到了：照常返回，失败记进 issues", async () => {
     const world = fakeWorld();
     const defs = fakeDnsDefs({ aliyun: [zone("example.com")] }, world, {

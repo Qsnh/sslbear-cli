@@ -43,6 +43,8 @@ export interface DnsProviderDef<C> {
   nameServerPattern: RegExp;
   /** 列出账号下全部公网 zone（自动翻页），私有 zone / 未生效（如待接入）的不返回 */
   listZones(ctx: QueryContext, creds: C): Promise<DnsZone[]>;
+  /** 缺权限时列 zone 不报错、只返回空列表的服务商：列表为空又找不到域名时，追加在 ZoneNotFound 报错里的说明 */
+  emptyZonesHint?: string;
   /**
    * 添加一条 TXT 记录，返回删除时要用的句柄（记录 ID 等，格式由适配器决定）。
    * - 同名下已有的其他 TXT 值必须保留（泛域名与根域名的验证值在同一个名字下）。

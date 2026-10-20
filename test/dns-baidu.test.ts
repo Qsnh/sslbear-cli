@@ -120,6 +120,16 @@ describe("百度智能云 DNS listZones", () => {
   });
 });
 
+describe("百度智能云 DNS 无权限", () => {
+  it("401 PermissionDeny（原文不说缺哪个权限）：写出签发要的系统策略", async () => {
+    const fetch = bce(() => bceError(401, "PermissionDeny", "logical permission deny."));
+    await expect(baiduDns.addTxt(ctxOf(fetch), CREDS, rec("_acme-challenge.example.com"))).rejects.toMatchObject({
+      code: "PermissionDeny",
+      message: "logical permission deny.（缺少权限，可授予系统策略 DNSReadAccessPolicy、DNSOperateAccessPolicy）",
+    });
+  });
+});
+
 describe("百度智能云 DNS addTxt", () => {
   it("按 rr 查，没有同值的就 POST（clientToken 在 query 上），再查一次拿 ID；同名下其他值不动", async () => {
     let added = false;
