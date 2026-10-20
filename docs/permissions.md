@@ -177,8 +177,7 @@
 注意：
 
 - 缺权限时，报错末尾会写出缺少的 CAM 权限和包含它的预设策略，如「缺少 CAM 权限 cdn:UpdateDomainConfig，可授予预设策略 QcloudCDNFullAccess」。COS 的原文只有「Access Denied.」，多半也是缺权限。
-- CDN、COS 用 SSL 证书 ID 绑定证书，不需要额外的证书读取权限。
-- EdgeOne 的部署权限只核对过名字，没有真实部署过。
+- CDN、COS、EdgeOne 用 SSL 证书 ID 绑定证书，不需要额外的证书读取权限。
 
 ## 火山引擎
 
