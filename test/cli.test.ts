@@ -164,7 +164,9 @@ describe("domains 汇总", () => {
     expect(lines[1]).toMatch(/^阿里云\s+CDN\s+img\.example\.com\s+开启\s+img-cert\s+\d{4}-\d{2}-\d{2}\s+17$/);
     expect(r.stdout).toContain("共 3 个域名，1 个 30 天内到期，1 个未开启 HTTPS");
     expect(r.stderr).toContain("提示：aliyun/dcdn 未开通或无资源（DcdnServiceNotFound）");
-    expect(r.stderr).toContain("警告：aliyun/live 查询失败：Forbidden.RAM User not authorized（RequestId: r-9）");
+    expect(r.stderr).toContain(
+      "警告：aliyun/live 查询失败：Forbidden.RAM User not authorized（缺少 RAM 权限 live:DescribeLiveUserDomains，可授予系统策略 AliyunLiveReadOnlyAccess）（RequestId: r-9）",
+    );
   });
 
   it("没有符合条件的结果时给出提示", async () => {

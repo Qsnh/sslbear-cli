@@ -222,6 +222,14 @@ function setSiteCert(
       action: "SetCertificate",
       method: "POST",
       params: { SiteId: siteId, Type: "cas", CasId: casId, Region: CAS_REGION, Id: into?.Id },
+    }).catch((e: unknown) => {
+      // 实测配额满时只回一句超出套餐上限，补上为什么没有原地替换、该怎么处理
+      if (!into && e instanceof CloudApiError && e.code === "CertQuotaCheckFailed") {
+        e.message =
+          `${e.message}（站点证书数已达套餐上限，免费版只有 2 张。只有这些记录在用的同算法证书、且它的域名全部被新证书覆盖时才能原地替换，` +
+          "这次没有这样的证书，只能新增；请先在 ESA 控制台删除不用的站点证书，或改用覆盖旧证书全部域名的证书）";
+      }
+      throw e;
     });
     return res.Id ?? into?.Id ?? casId;
   });

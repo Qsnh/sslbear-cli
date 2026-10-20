@@ -36,12 +36,16 @@
 最小权限：
 
 - 部署（在上表只读策略之上追加）
-  - 数字证书管理服务：`yundun-cert:UploadUserCertificate`
+  - 所有服务都要：`yundun-cert:UploadUserCertificate`（部署前先把证书上传到数字证书管理服务）
   - CDN：`cdn:SetCdnDomainSSLCertificate`；全站加速：`dcdn:SetDcdnDomainSSLCertificate`
   - ESA：`esa:SetCertificate`、`esa:UpdateCustomHostname`
   - OSS：`oss:PutCname`，绑定证书还要 `yundun-cert:CreateSSLCertificate`（OSS 官方要求的另外两项 `yundun-cert:DescribeSSLCertificatePrivateKey`、`yundun-cert:DescribeSSLCertificatePublicKeyDetail` 已含在证书只读策略里）
   - 视频直播：`live:SetLiveDomainCertificate`；视频点播：`vod:SetVodDomainSSLCertificate`
 - 签发（不需要上表的策略）：`alidns:DescribeDomains`（资源只能填 `*`）；`alidns:DescribeSubDomainRecords`、`alidns:AddDomainRecord`、`alidns:DeleteDomainRecord`（可以限定到域名：`acs:alidns::<账号ID>:domain/<域名>`）
+
+注意：
+
+- 缺权限时，报错末尾会写出缺少的 RAM 权限和包含它的系统策略，如「缺少 RAM 权限 cdn:SetCdnDomainSSLCertificate，可授予系统策略 AliyunCDNFullAccess」。OSS 的原文是「The bucket you access does not belong to you」，多半也是缺权限。
 
 ## 腾讯云
 

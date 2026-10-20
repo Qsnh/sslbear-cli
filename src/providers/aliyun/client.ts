@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AliyunCredentials } from "../../lib/env.js";
 import { CloudApiError, parseJson, send, withRetry, type QueryContext } from "../../lib/http.js";
+import { permissionHint, ramAction } from "./ram.js";
 import { canonicalQuery, rpcSignature } from "./sign.js";
 
 export interface RpcRequest {
@@ -19,7 +20,12 @@ interface RpcErrorBody {
   Code?: string;
   Message?: string;
   RequestId?: string;
+  /** 无权限时返回；AuthAction 只有部分产品给（如证书服务、点播），NoPermissionType 为 ImplicitDeny / ExplicitDeny */
+  AccessDeniedDetail?: { AuthAction?: string; NoPermissionType?: string };
 }
+
+/** 没带 AccessDeniedDetail 时也能确定是缺 RAM 权限的错误码 */
+const DENIED_CODES = new Set(["Forbidden.RAM", "NoPermission", "Forbidden.NoPermission"]);
 
 /** 调用阿里云 RPC 风格 API（签名 V1），可重试的错误自动重试 */
 export function callRpc<T>(ctx: QueryContext, creds: AliyunCredentials, req: RpcRequest): Promise<T> {
@@ -57,13 +63,12 @@ export async function callRpcOnce<T>(ctx: QueryContext, creds: AliyunCredentials
   );
   const body = parseJson("aliyun", raw) as T & RpcErrorBody;
   if (raw.status >= 400) {
-    throw new CloudApiError(
-      "aliyun",
-      body.Code ?? `HTTP${raw.status}`,
-      body.Message ?? `HTTP ${raw.status}`,
-      body.RequestId,
-      raw.status,
-    );
+    const code = body.Code ?? `HTTP${raw.status}`;
+    const detail = body.AccessDeniedDetail ?? (DENIED_CODES.has(code) ? {} : undefined);
+    const hint = detail
+      ? permissionHint({ action: detail.AuthAction ?? ramAction(req.endpoint, req.action), explicit: detail.NoPermissionType === "ExplicitDeny" })
+      : "";
+    throw new CloudApiError("aliyun", code, `${body.Message ?? `HTTP ${raw.status}`}${hint}`, body.RequestId, raw.status);
   }
   return body;
 }

@@ -126,7 +126,8 @@ describe("aliyun domains", () => {
         target: "HTTPS 证书列表（用于补全证书信息）",
         kind: "error",
         code: "Forbidden.RAM",
-        message: "User not authorized to operate on the specified resource, or this API doesn't support RAM.",
+        message:
+          "User not authorized to operate on the specified resource, or this API doesn't support RAM.（缺少 RAM 权限 cdn:DescribeCdnHttpsDomainList，可授予系统策略 AliyunCDNReadOnlyAccess）",
         requestId: "req-1",
       },
     ]);
@@ -683,7 +684,7 @@ describe("aliyun oss", () => {
         target: "bucket locked",
         kind: "error",
         code: "AccessDenied",
-        message: "denied by bucket policy",
+        message: "denied by bucket policy（可能缺少 RAM 权限 oss:ListCname，可授予系统策略 AliyunOSSReadOnlyAccess）",
         requestId: "oss-req",
       },
     ]);

@@ -296,6 +296,63 @@ describe("aliyun CDN / DCDN deployer", () => {
     const { ctx } = context(() => rpcError(400, "InvalidDomain.NotFound", "domain not found"));
     await expect(service("cdn").deployer!.apply(ctx, CREDS, target([rec("cdn", "a.example.com")]), input())).rejects.toMatchObject({
       code: "InvalidDomain.NotFound",
+      message: "domain not found",
+    });
+  });
+});
+
+describe("aliyun 无权限时报错写出缺少的 RAM 权限", () => {
+  /** 实测的无权限响应：证书服务、点播带 AuthAction；直播、ESA、云解析的 AccessDeniedDetail 只有加密的诊断信息 */
+  const denied = (status: number, Code: string, detail?: Record<string, string>): FakeReply => ({
+    status,
+    body: {
+      RequestId: "req-1",
+      Code,
+      Message: "You are not authorized to perform this action.",
+      ...(detail && { AccessDeniedDetail: { PolicyType: "AccountLevelIdentityBasedPolicy", EncodedDiagnosticMessage: "AQIB", ...detail } }),
+    },
+  });
+
+  it("优先用 AccessDeniedDetail.AuthAction，并给出包含它的系统策略；不重试", async () => {
+    const { ctx, fetch } = context(casRoutes([[]], denied(403, "NoPermission", { AuthAction: "yundun-cert:UploadUserCertificate", NoPermissionType: "ImplicitDeny" })));
+    await expect(aliyun.uploadCertificate!(ctx, CREDS, CERT)).rejects.toMatchObject({
+      code: "NoPermission",
+      requestId: "req-1",
+      message: "You are not authorized to perform this action.（缺少 RAM 权限 yundun-cert:UploadUserCertificate，可授予系统策略 AliyunYundunCertFullAccess）",
+    });
+    expect(calls(fetch, "UploadUserCertificate")).toHaveLength(1);
+  });
+
+  it.each([
+    ["Forbidden.RAM，没有 AccessDeniedDetail", denied(403, "Forbidden.RAM")],
+    ["Forbidden，AccessDeniedDetail 没有 AuthAction", denied(401, "Forbidden", { NoPermissionType: "ImplicitDeny" })],
+  ])("没给 AuthAction 时按接入点与接口名推出（%s）", async (_, reply) => {
+    const { ctx } = context(() => reply);
+    await expect(service("dcdn").deployer!.apply(ctx, CREDS, target([rec("dcdn", "a.example.com")]), input())).rejects.toMatchObject({
+      message: "You are not authorized to perform this action.（缺少 RAM 权限 dcdn:SetDcdnDomainSSLCertificate，可授予系统策略 AliyunDCDNFullAccess）",
+    });
+  });
+
+  it("各服务的 RAM 服务代码：接入点主机名第一段（地域接入点也一样），证书服务为 yundun-cert", async () => {
+    const vod = context((req) => (req.url.host === "vod.cn-shanghai.aliyuncs.com" ? denied(403, "NoPermission") : casRoutes([[]])(req)));
+    await expect(service("vod").deployer!.apply(vod.ctx, CREDS, target([rec("vod", "v.example.com")]), input())).rejects.toMatchObject({
+      message: expect.stringContaining("（缺少 RAM 权限 vod:SetVodDomainSSLCertificate，可授予系统策略 AliyunVODFullAccess）"),
+    });
+    const esa = context((req) => (req.url.host === ESA_HOST ? denied(403, "Forbidden", {}) : undefined));
+    const site = rec("esa", "a.example.com", { extra: { siteId: "1001", site: "example.com" } });
+    await expect(service("esa").deployer!.apply(esa.ctx, CREDS, target([site]), input())).rejects.toMatchObject({
+      message: expect.stringContaining("（缺少 RAM 权限 esa:ListCertificates，可授予系统策略 AliyunESAReadOnlyAccess）"),
+    });
+    const cas = context(() => denied(403, "NoPermission"));
+    await expect(aliyun.uploadCertificate!(cas.ctx, CREDS, CERT)).rejects.toMatchObject({
+      message: expect.stringContaining("（缺少 RAM 权限 yundun-cert:ListUserCertificateOrder，可授予系统策略 AliyunYundunCertReadOnlyAccess）"),
+    });
+  });
+
+  it("被策略显式拒绝（ExplicitDeny）：加授权没用，提示解除拒绝", async () => {
+    const { ctx } = context(() => denied(403, "NoPermission", { AuthAction: "cdn:SetCdnDomainSSLCertificate", NoPermissionType: "ExplicitDeny" }));
+    await expect(service("cdn").deployer!.apply(ctx, CREDS, target([rec("cdn", "a.example.com")]), input())).rejects.toMatchObject({
+      message: "You are not authorized to perform this action.（RAM 权限 cdn:SetCdnDomainSSLCertificate 被策略显式拒绝，请在 RAM 控制台解除该拒绝）",
     });
   });
 });
@@ -404,13 +461,30 @@ describe("aliyun OSS deployer", () => {
     expect(plain.message).toBe("The format of the certificate is invalid.");
   });
 
-  it("OSS 报错解析 XML 错误码", async () => {
+  it("OSS 报错解析 XML 错误码；AccessDenied 提示可能缺少的 RAM 权限（OSS 无权限时只说 bucket 不属于你）", async () => {
     const { ctx } = context(() => ({
       status: 403,
-      body: "<Error><Code>AccessDenied</Code><Message>denied</Message><RequestId>oss-req</RequestId></Error>",
+      body: "<Error><Code>AccessDenied</Code><Message>The bucket you access does not belong to you.</Message><RequestId>oss-req</RequestId><EC>0003-00000001</EC></Error>",
     }));
     const record = rec("oss", "img.example.com", { extra: { bucket: "b1", region: "cn-hangzhou" } });
-    await expect(oss.deployer!.apply(ctx, CREDS, target([record]), input())).rejects.toMatchObject({ code: "AccessDenied", requestId: "oss-req" });
+    await expect(oss.deployer!.apply(ctx, CREDS, target([record]), input())).rejects.toMatchObject({
+      code: "AccessDenied",
+      requestId: "oss-req",
+      message: "The bucket you access does not belong to you.（可能缺少 RAM 权限 oss:PutCname，可授予系统策略 AliyunOSSFullAccess）",
+    });
+  });
+
+  it("OSS 错误响应带 AuthAction 时以它为准", async () => {
+    const { ctx } = context(() => ({
+      status: 403,
+      body:
+        "<Error><Code>AccessDenied</Code><Message>denied</Message><RequestId>oss-req</RequestId>" +
+        "<AccessDeniedDetail><AuthAction>yundun-cert:DescribeSSLCertificatePrivateKey</AuthAction></AccessDeniedDetail></Error>",
+    }));
+    const record = rec("oss", "img.example.com", { extra: { bucket: "b1", region: "cn-hangzhou" } });
+    await expect(oss.deployer!.apply(ctx, CREDS, target([record]), input())).rejects.toMatchObject({
+      message: "denied（缺少 RAM 权限 yundun-cert:DescribeSSLCertificatePrivateKey，可授予系统策略 AliyunYundunCertReadOnlyAccess）",
+    });
   });
 });
 
@@ -585,7 +659,18 @@ describe("aliyun ESA deployer", () => {
 
   it("新增遇到不可重试的错误：直接抛出，不重发", async () => {
     const { ctx, fetch } = context(esaSeqRoutes([[]], [rpcError(400, "InvalidParameter", "bad")]));
-    await expect(esa.deployer!.apply(ctx, CREDS, target(siteRecords()), input())).rejects.toMatchObject({ code: "InvalidParameter" });
+    await expect(esa.deployer!.apply(ctx, CREDS, target(siteRecords()), input())).rejects.toMatchObject({ code: "InvalidParameter", message: "bad" });
+    expect(calls(fetch, "SetCertificate")).toHaveLength(1);
+  });
+
+  it("新增时站点证书数已达套餐上限（CertQuotaCheckFailed）：说明为什么不能原地替换、该怎么处理", async () => {
+    const quota = rpcError(400, "CertQuotaCheckFailed", "The number of uploaded certificates exceeds the upper limit allowed for the plan.");
+    const { ctx, fetch } = context(esaSeqRoutes([[]], [quota]));
+    const err = (await esa.deployer!.apply(ctx, CREDS, target(siteRecords()), input()).catch((e: unknown) => e)) as CloudApiError;
+    expect(err).toMatchObject({ code: "CertQuotaCheckFailed", requestId: "req-1" });
+    expect(err.message).toMatch(/^The number of uploaded certificates exceeds the upper limit allowed for the plan\.（站点证书数已达套餐上限/);
+    expect(err.message).toContain("同算法");
+    expect(err.message).toContain("ESA 控制台删除");
     expect(calls(fetch, "SetCertificate")).toHaveLength(1);
   });
 

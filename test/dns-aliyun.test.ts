@@ -83,7 +83,7 @@ describe("阿里云云解析 listZones", () => {
     expect(empty.calls).toHaveLength(1);
   });
 
-  it("限流自动重试；其他错误抛 CloudApiError，带错误码与 RequestId", async () => {
+  it("限流自动重试；其他错误抛 CloudApiError，带错误码与 RequestId；无权限时写出缺少的 RAM 权限", async () => {
     const replies = [rpcError(400, "Throttling.User"), rpcError(403, "Forbidden.RAM", "User not authorized")];
     const fetch = alidns(() => replies.shift());
     await expect(aliyunDns.listZones(ctxOf(fetch), CREDS)).rejects.toMatchObject({
@@ -92,6 +92,8 @@ describe("阿里云云解析 listZones", () => {
       code: "Forbidden.RAM",
       requestId: "req-1",
       httpStatus: 403,
+      // 云解析只有签发用到，签发要增删记录，只读策略不够
+      message: "User not authorized（缺少 RAM 权限 alidns:DescribeDomains，可授予系统策略 AliyunDNSFullAccess）",
     });
     expect(fetch.calls).toHaveLength(2);
   });
