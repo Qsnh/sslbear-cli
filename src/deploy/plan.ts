@@ -7,6 +7,8 @@ export const RENEW_WITHIN_DAYS = 30;
 
 /** 两张证书到期（及签发）时间相差在此范围内视为同一张：有的服务只精确到天，华为证书列表的时间还差 8 小时 */
 export const SAME_CERT_TOLERANCE_MS = 48 * 3_600_000;
+/** 时间精确到秒都相同（且算法相同）才确定是同一张；只是相近时用户可以点名强制替换 */
+const EXACT_MS = 1000;
 
 const DAY_MS = 86_400_000;
 
@@ -85,12 +87,19 @@ export function decide(record: DomainRecord, cert: LocalCert, o: DecideOptions):
     if (extraSan) {
       confirm = ["same_expiry", `当前证书与新证书到期时间相近，但当前证书还覆盖 ${extraSan}，不是同一张`];
     } else if (startNear && (!oldAlg || oldAlg === cert.algorithm)) {
-      if (oldAlg) return { ...skip("already_current", "已是该证书（到期时间相同）"), ...base };
+      // 只是时间相近时也可能是另一张：实测（2026-10）相隔 34 小时签发的两张 ECC 证书，当前那张的 SAN 是新证书的子集，
+      // 按同一张跳过后加 -d、--force 也换不回去
+      const exact =
+        !!oldAlg &&
+        Math.abs(oldMs - newMs) <= EXACT_MS &&
+        (!Number.isFinite(oldStart) || Math.abs(oldStart - Date.parse(cert.notBefore)) <= EXACT_MS);
+      if (exact) return { ...skip("already_current", "已是该证书（到期时间相同）"), ...base };
       if (!(o.force && o.named)) {
         return {
           ...skip(
             "already_current",
-            "已是该证书（到期时间相同）；若其实是同期签发的另一张证书（如 RSA / ECC 各一张），向用户确认后用 -d 点名该域名并加 --force 可强制替换",
+            `已是该证书（到期时间${Math.abs(oldMs - newMs) <= EXACT_MS ? "相同" : "相近"}）；若其实是另一张证书（如同期签发的 RSA / ECC 各一张、两天内重签的），` +
+              "向用户确认后用 -d 点名该域名并加 --force 可强制替换",
           ),
           ...base,
         };

@@ -43,7 +43,7 @@
 | `deployed` / `updated` | 已开启 HTTPS 并部署 / 已替换旧证书。稍后核对 |
 | `would_deploy` / `would_update` | `--dry-run` 给出的计划。去掉 `--dry-run` 执行 |
 | `skipped`，且 `needsConfirm: true` | 需要用户决定，`reason` 有四种：`not_due` 当前证书还剩 30 天以上；`newer_current` 当前证书比新证书到期还晚；`same_expiry` 到期时间相同，但签发时间或算法不同；`unknown_expiry` 查不到当前证书的到期时间。把域名和 `message` 列给用户，问要不要提前替换。用户同意后，加 `-d <这些域名> --force` 重跑 |
-| `skipped` `already_current` | 已经是这张证书，不用处理 |
+| `skipped` `already_current` | 已经是这张证书，不用处理。用户说其实是另一张、坚持要换时，用 `-d <该域名> --force` 重跑 |
 | `skipped` `https_off` | 域名没开 HTTPS。用户要开时，用 `-d` 点名重跑 |
 | `skipped` `platform_managed` | 云厂商的平台默认域名，证书由平台负责，不用处理 |
 | `skipped` `unsupported` | 这个服务不支持用 CLI 部署。按 `message` 请用户去控制台操作 |

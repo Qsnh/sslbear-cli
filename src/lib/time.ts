@@ -7,6 +7,8 @@ const LOCAL_DATETIME = /^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{1,2})(?
  * 把云厂商返回的各种时间格式统一成 ISO 8601 (UTC)。
  * 不带时区的 "YYYY-MM-DD HH:mm:ss" 按北京时间理解：国内云厂商接口返回的本地时间均为 UTC+8。
  * 纯数字按 Unix 时间戳处理（< 1e12 视为秒，否则为毫秒）。
+ * Unix 纪元（1970-01-01T00:00:00Z）及以前的时间视为占位的零值、返回 undefined：如 EdgeOne 免费证书申请中时 ExpireTime 为 "0001-01-01T00:00:00Z"（实测），
+ * 当真会被算成早已过期。
  */
 export function toIso(value: unknown): string | undefined {
   if (value === undefined || value === null || value === "") return undefined;
@@ -27,7 +29,7 @@ export function toIso(value: unknown): string | undefined {
   } else {
     return undefined;
   }
-  return Number.isFinite(ms) ? new Date(ms).toISOString() : undefined;
+  return Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString() : undefined;
 }
 
 /** 剩余天数向下取整：还剩 0.5 天记为 0，已过期为负数 */

@@ -45,9 +45,15 @@ function algorithmOf(signAlgo: string | undefined): CertInfo["algorithm"] {
 const certsOf = (r: DomainRecord): CertInfo[] => r.certs ?? (r.cert ? [r.cert] : []);
 
 /**
+ * 域名还在部署上一次的变更时 ModifyHostsCertificate 报的错：实测（2026-10）新建的域名处于 process 时报
+ * ResourceInUse「四层转发代理变更中，请等待变更完成后重试。」；ActionInProgress 文档写的是「操作频繁，请稍后重试」
+ */
+const BUSY = new Set(["ResourceInUse", "InvalidParameter.ActionInProgress"]);
+
+/**
  * ModifyHostsCertificate 的 ServerCertInfo 是该域名的完整证书列表（RSA + ECC 可各挂一张）：
  * sslcert 模式下保留与新证书不同算法的那张（含国密），替换同算法的；免费证书模式下整体换成新证书。
- * ClientCertInfo / UpstreamCertInfo 不传即保持原有配置。
+ * ClientCertInfo / UpstreamCertInfo 不传即保持原有配置。域名还在部署上一次的变更时报 DomainBusy，编排层按可重试处理。
  */
 const deployer: Deployer<TencentCredentials> = {
   unsupported(record, mode) {
@@ -72,6 +78,10 @@ const deployer: Deployer<TencentCredentials> = {
       Hosts: [record.domain],
       Mode: "sslcert",
       ServerCertInfo: [...keep.map((c) => ({ CertId: c.id })), { CertId: certId }],
+    }).catch((e: unknown) => {
+      if (!(e instanceof CloudApiError) || !BUSY.has(e.code)) throw e;
+      const message = `该域名上一次的配置变更还在部署中，未做修改；稍后重新执行即可（${e.message.replace(/[。.]$/, "")}，${e.code}）`;
+      throw new CloudApiError(e.provider, "DomainBusy", message, e.requestId, e.httpStatus);
     });
     return { certId };
   },

@@ -41,8 +41,21 @@ describe("decide", () => {
   it("旧证书与新证书到期时间相差 48 小时内、算法相同：视为同一张（--force 也跳过）", () => {
     for (const t of ["2027-01-01T00:00:00Z", "2026-12-31T16:00:00Z", "2027-01-02T23:00:00Z"]) {
       const r = rec({ cert: { name: "old", notAfter: t, algorithm: "RSA" } });
-      expect(decide(r, CERT, { ...opts, force: true })).toMatchObject({ kind: "skip", reason: "already_current", message: "已是该证书（到期时间相同）" });
+      expect(decide(r, CERT, { ...opts, force: true })).toMatchObject({ kind: "skip", reason: "already_current" });
     }
+  });
+
+  it("时间精确到秒都相同才确定是同一张（-d + --force 也跳过）；只是相近时提示可点名 + --force，点名并加 --force 就换", () => {
+    const exact = rec({ cert: { name: "old", notBefore: "2026-10-01T00:00:00Z", notAfter: "2027-01-01T00:00:00Z", algorithm: "RSA" } });
+    expect(decide(exact, CERT, { ...opts, force: true, named: true })).toMatchObject({ kind: "skip", reason: "already_current", message: "已是该证书（到期时间相同）" });
+    // 实测：相隔 34 小时签发的两张证书，当前那张的 SAN 是新证书的子集
+    const near = rec({ cert: { name: "old", notBefore: "2026-10-02T10:00:00Z", notAfter: "2027-01-02T10:00:00Z", algorithm: "RSA", sans: ["example.com"] } });
+    const d = decide(near, CERT, { ...opts, force: true });
+    expect(d).toMatchObject({ kind: "skip", reason: "already_current" });
+    expect(d.needsConfirm).toBeUndefined();
+    expect(d.message).toContain("到期时间相近");
+    expect(d.message).toContain("-d 点名该域名并加 --force");
+    expect(decide(near, CERT, { ...opts, force: true, named: true })).toMatchObject({ kind: "update" });
   });
 
   it("旧证书签发时间也在 48 小时内（或查不到签发时间）才算同一张", () => {

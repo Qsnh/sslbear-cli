@@ -19,6 +19,12 @@ describe("toIso", () => {
     expect(toIso("2024-07-02T05:31:09Z")).toBe("2024-07-02T05:31:09.000Z");
     expect(toIso("Mon, 4 May 2048 10:14:51 GMT")).toBe("2048-05-04T10:14:51.000Z");
   });
+  it("Unix 纪元及以前的零值时间（如 EdgeOne 申请中的免费证书 0001-01-01T00:00:00Z）视为没有", () => {
+    expect(toIso("0001-01-01T00:00:00Z")).toBeUndefined();
+    expect(toIso("1970-01-01T00:00:00Z")).toBeUndefined();
+    expect(toIso(0)).toBeUndefined();
+    expect(toIso("1970-01-01T00:00:01Z")).toBe("1970-01-01T00:00:01.000Z");
+  });
   it("秒级与毫秒级时间戳", () => {
     expect(toIso(1719898269)).toBe("2024-07-02T05:31:09.000Z");
     expect(toIso(1719898269000)).toBe("2024-07-02T05:31:09.000Z");

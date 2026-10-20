@@ -266,6 +266,19 @@ describe("tencent teo（EdgeOne）部署", () => {
   const run = (record: DomainRecord, mode: DeployTarget["mode"], input = inputOf()) =>
     apply("teo", (req) => (req.action === "ModifyHostsCertificate" ? ok() : undefined), { mode, records: [record] }, input);
 
+  it("域名还在部署上一次的变更（ResourceInUse，实测新建的域名处于 process 时）：报 DomainBusy 并说明稍后重试", async () => {
+    const { result } = apply(
+      "teo",
+      (req) => (req.action === "ModifyHostsCertificate" ? tcError("ResourceInUse", "四层转发代理变更中，请等待变更完成后重试。") : undefined),
+      { mode: "update", records: [rec("teo", "www.example.io", { extra, cert: ecc })] },
+    );
+    await expect(result).rejects.toMatchObject({
+      code: "DomainBusy",
+      requestId: "rid-err",
+      message: "该域名上一次的配置变更还在部署中，未做修改；稍后重新执行即可（四层转发代理变更中，请等待变更完成后重试，ResourceInUse）",
+    });
+  });
+
   it("update：RSA + ECC 双证书时只换同算法那张，另一张原样保留；不传客户端 / 回源证书配置", async () => {
     const { fetch, result } = run(rec("teo", "www.example.io", { cert: rsa, certs: [rsa, ecc], extra }), "update");
     expect(await result).toEqual({ certId: "new-cert" });
