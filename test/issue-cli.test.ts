@@ -753,6 +753,12 @@ describe("验证因 DNS 查不到记录失败时重试一次", () => {
     expect(s.world.log.filter((l) => l.startsWith("remove"))).toHaveLength(4);
   });
 
+  it("只有二次验证（境外验证点）失败时在 message 里说明原因", async () => {
+    const s = setup({ acme: { waitAuthorization: async () => Promise.reject(invalidAuthz("dns", "example.com：During secondary validation: DNS problem: networking error looking up TXT for _acme-challenge.example.com")) } });
+    const e = errOf(await s.issue(["-d", DOMAINS, "--json"]));
+    expect(e.message).toContain("DNS 服务商可能限制了境外查询");
+  });
+
   it("CAA 拒绝等非 DNS 原因不重试；第二次仍因 DNS 失败就报错", async () => {
     const caa = setup({ acme: { waitAuthorization: async () => Promise.reject(invalidAuthz("caa", "CAA record forbids issuance")) } });
     expect(errOf(await caa.issue(["-d", DOMAINS, "--json"]))).toMatchObject({ status: "AcmeChallengeFailed", acmeType: "caa" });

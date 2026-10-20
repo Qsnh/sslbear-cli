@@ -488,7 +488,11 @@ async function validate(client: AcmeClient, challenges: Challenge[], say: (m: st
     } catch (e) {
       // 只有授权变成 invalid 才是验证没通过；网络错误、授权过期、请求被拒等按普通 ACME 错误处理（授权过期重跑就会重新下单）
       if (e instanceof AcmeError && e.invalidAuthorization) {
-        throw new IssueError("AcmeChallengeFailed", `CA 验证 ${c.domain} 失败（${e.type}）：${e.detail}`, {
+        // 多地验证里只有部分验证点失败：多半是 DNS 服务商对境外查询有限制，或个别节点没同步，原文看不出来
+        const hint = /secondary validation/i.test(e.detail)
+          ? "（Let's Encrypt 主验证点已通过，部分境外验证点查不到：DNS 服务商可能限制了境外查询，或个别节点还没同步）"
+          : "";
+        throw new IssueError("AcmeChallengeFailed", `CA 验证 ${c.domain} 失败（${e.type}）：${e.detail}${hint}`, {
           retryable: false,
           domain: c.domain,
           acmeType: e.type,
