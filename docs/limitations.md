@@ -158,4 +158,4 @@
 | Google Cloud DNS | `gcloud auth application-default login` 的用户凭证、工作负载身份联合、元数据服务器的默认服务账号；私有 zone | 只用服务账号 JSON 密钥。只查一个项目（`GOOGLE_CLOUD_PROJECT`，没设时用密钥里的 `project_id`）。配了路由策略的 TXT 报 `UnsupportedRecordSet` |
 | Azure DNS | Azure 中国（世纪互联）、政府云；托管身份、`az login`；私有 DNS 区域 | 只用服务主体 + 客户端密码，只查 `AZURE_SUBSCRIPTION_ID` 这一个订阅 |
 | DigitalOcean | — | 不检查 NS：NS 没指向 DigitalOcean 的域名也会被选中，要等到超时才报 NS 不一致 |
-| GoDaddy | 在别家注册、只在 GoDaddy 托管 DNS 的域名；用了自定义 NS 的域名 | 只做过模拟测试。GoDaddy 计划 2026 年停用现在用的 Developer Key 鉴权，停用后要升级 sslbear-cli。账号不满足 API 开放条件时所有请求返回 403 |
+| GoDaddy | 在别家注册、只在 GoDaddy 托管 DNS 的域名；用了自定义 NS 的域名 | 只做过模拟测试。sslbear-cli 用的 Classic Developer Key（sso-key）已被 GoDaddy 在域名接口上标为弃用（官方写到 2026 年为止，没给具体停用日期），停用后要升级 sslbear-cli。账号不满足 API 访问条件（至少有 1 个域名，或有开通域名管理权限的套餐）时所有请求返回 403 |

@@ -4,108 +4,154 @@
 
 | 要用的命令 | 授予什么 |
 | --- | --- |
-| 查询：`domains` / `certs` | 用到的产品的只读权限，加上证书服务的只读权限 |
+| 查询：`domains` / `certs` | 用到的服务的只读权限，加上证书服务的只读权限 |
 | 部署：`deploy` | 在只读的基础上，加上传证书、修改域名 HTTPS 配置的写权限 |
 | 签发：`issue` | 只要域名所在 DNS 服务商的解析权限：列出域名，增删解析记录 |
 
-每家云先给**省事做法**（直接授予系统策略），再给**最小权限**（想收紧时自己建策略）。
+每家云先给一张按服务列出的系统策略表（省事做法），再给最小权限（想收紧时自己建策略）。策略名、权限名都按各家 2026-10 的官方文档核对过。
 
 注意：
 
-- **证书服务的只读权限一定要给。** 不少服务的域名接口只返回证书 ID，到期时间要去证书服务查，缺这个权限时到期时间会是空的。
+- **证书服务的只读权限要给。** `certs` 和部署都要用；腾讯云、火山引擎、华为云、百度智能云、七牛云的部分服务还靠它查到期时间，缺了到期时间是空的。
 - 缺权限不会让整条命令失败：只有缺权限的服务出现在 `issues`（或 `failed`）里，其他服务照常输出。
-- 只部署部分服务时，只给这几个服务的写权限就行。`issue --dry-run` 只需要列出域名的权限。
+- 部署前会先查询一遍，所以部署也要有查询权限。只部署部分服务时，只给这几个服务的写权限就行。
+- `issue --dry-run` 只需要列出域名的权限。
 
 跳转：[阿里云](#阿里云) · [腾讯云](#腾讯云) · [火山引擎](#火山引擎) · [华为云](#华为云) · [百度智能云](#百度智能云) · [七牛云](#七牛云) · [其他 DNS 服务商](#其他-dns-服务商)
 
 ## 阿里云
 
-省事做法：
+| 服务 | 查询 | 部署 |
+| --- | --- | --- |
+| CDN | `AliyunCDNReadOnlyAccess` | `AliyunCDNFullAccess` |
+| 全站加速 DCDN | `AliyunDCDNReadOnlyAccess` | `AliyunDCDNFullAccess` |
+| 边缘安全加速 ESA | `AliyunESAReadOnlyAccess` | `AliyunESAFullAccess` |
+| 对象存储 OSS | `AliyunOSSReadOnlyAccess` | `AliyunOSSFullAccess` |
+| 视频直播 | `AliyunLiveReadOnlyAccess` | `AliyunLiveFullAccess` |
+| 视频点播 | `AliyunVODReadOnlyAccess` | `AliyunVODFullAccess` |
+| 数字证书管理服务 | `AliyunYundunCertReadOnlyAccess` | `AliyunYundunCertFullAccess` |
 
-| 命令 | 系统策略 |
-| --- | --- |
-| 查询 | 用到哪个产品给哪个：`AliyunCDNReadOnlyAccess`、`AliyunDCDNReadOnlyAccess`、`AliyunESAReadOnlyAccess`、`AliyunOSSReadOnlyAccess`、`AliyunLiveReadOnlyAccess`、`AliyunVODReadOnlyAccess`；再加证书的 `AliyunYundunCertReadOnlyAccess` |
-| 部署 | 把上面的 `ReadOnlyAccess` 换成 `FullAccess`，比如 `AliyunCDNFullAccess`、`AliyunYundunCertFullAccess` |
-| 签发 | `AliyunDNSFullAccess` |
+签发（云解析 DNS）：`AliyunDNSFullAccess`；只跑 `--dry-run` 时 `AliyunDNSReadOnlyAccess` 就够。
 
-最小权限（在只读之上追加）：
+最小权限：
 
-- 部署
-  - 证书：`yundun-cert:UploadUserCertificate`、`yundun-cert:ListUserCertificateOrder`、`yundun-cert:GetUserCertificateDetail`
-  - CDN：`cdn:SetCdnDomainSSLCertificate`；DCDN：`dcdn:SetDcdnDomainSSLCertificate`；直播：`live:SetLiveDomainCertificate`；点播：`vod:SetVodDomainSSLCertificate`；ESA：`esa:SetCertificate`、`esa:UpdateCustomHostname`
-  - OSS：`oss:PutCname`，还要让 OSS 能读证书：`yundun-cert:DescribeSSLCertificatePrivateKey`、`yundun-cert:DescribeSSLCertificatePublicKeyDetail`、`yundun-cert:CreateSSLCertificate`
-- 签发：`alidns:DescribeDomains`（资源只能填 `*`）；`alidns:DescribeSubDomainRecords`、`alidns:AddDomainRecord`、`alidns:DeleteDomainRecord`（可以限定到域名：`acs:alidns::<账号ID>:domain/<域名>`）
+- 部署（在上表只读策略之上追加）
+  - 数字证书管理服务：`yundun-cert:UploadUserCertificate`
+  - CDN：`cdn:SetCdnDomainSSLCertificate`；全站加速：`dcdn:SetDcdnDomainSSLCertificate`
+  - ESA：`esa:SetCertificate`、`esa:UpdateCustomHostname`
+  - OSS：`oss:PutCname`，绑定证书还要 `yundun-cert:CreateSSLCertificate`（OSS 官方要求的另外两项 `yundun-cert:DescribeSSLCertificatePrivateKey`、`yundun-cert:DescribeSSLCertificatePublicKeyDetail` 已含在证书只读策略里）
+  - 视频直播：`live:SetLiveDomainCertificate`；视频点播：`vod:SetVodDomainSSLCertificate`
+- 签发（不需要上表的策略）：`alidns:DescribeDomains`（资源只能填 `*`）；`alidns:DescribeSubDomainRecords`、`alidns:AddDomainRecord`、`alidns:DeleteDomainRecord`（可以限定到域名：`acs:alidns::<账号ID>:domain/<域名>`）
 
 ## 腾讯云
 
-省事做法：
+| 服务 | 查询 | 部署 |
+| --- | --- | --- |
+| CDN | `QcloudCDNReadOnlyAccess` | `QcloudCDNFullAccess` |
+| EdgeOne | `QcloudTEOReadOnlyaccess`（官方文档的写法，大小写以控制台为准） | `QcloudTEOFullAccess` |
+| 对象存储 COS | `QcloudCOSReadOnlyAccess` | `QcloudCOSFullAccess` |
+| 云直播 | `QcloudLIVEReadOnlyAccess` | `QcloudLIVEFullAccess` |
+| 云点播 | `QcloudVODReadonlyAccess` | `QcloudVODFullAccess` |
+| SSL 证书 | `QcloudSSLReadOnlyAccess` | `QcloudSSLFullAccess` |
 
-| 命令 | 预设策略 |
-| --- | --- |
-| 查询 | 用到的产品的只读策略：CDN、EdgeOne、COS（`QcloudCOSReadOnlyAccess`）、云直播、云点播；再加 SSL 证书的只读策略。在 CAM 控制台按产品名搜「只读」 |
-| 部署 | 换成对应产品的全读写策略（FullAccess） |
-| 签发 | `QcloudDNSPodFullAccess` |
+签发（DNSPod）：`QcloudDNSPodFullAccess`；只跑 `--dry-run` 时 `QcloudDNSPodReadOnlyAccess` 就够。
 
-最小权限（在只读之上追加）：
+最小权限：
 
-- 部署：`ssl:UploadCertificate`；CDN：`cdn:ModifyDomainConfig`、`cdn:UpdateDomainConfig`；EdgeOne：`teo:ModifyHostsCertificate`；COS：`cos:PutBucketDomainCertificate`；直播：`live:ModifyLiveDomainCertBindings`；点播：`vod:SetVodDomainCertificate`
-- 签发：`dnspod:DescribeDomainList`（资源只能选全部）；`dnspod:DescribeRecordList`、`dnspod:CreateRecord`、`dnspod:DeleteRecord`（可以按域名授权：`qcs::dnspod::uin/<主账号ID>:domain/<DomainId>`）
+- 部署（在上表只读策略之上追加）
+  - SSL 证书：`ssl:UploadCertificate`
+  - CDN：`cdn:ModifyDomainConfig`、`cdn:UpdateDomainConfig`；EdgeOne：`teo:ModifyHostsCertificate`；COS：`cos:PutBucketDomainCertificate`
+  - 云直播：`live:ModifyLiveDomainCertBindings`；云点播：`vod:SetVodDomainCertificate`
+- 签发：`dnspod:DescribeDomainList`、`dnspod:DescribeRecordList`、`dnspod:CreateRecord`、`dnspod:DeleteRecord`。都可以按域名授权，资源写 `qcs::dnspod::uin/<主账号ID>:domain/<DomainId>`（DomainId 是 DNSPod 里的域名 ID，不是域名）。只授权部分域名时 `DescribeDomainList` 会返回什么官方没写，稳妥起见它授权全部资源。
 
 ## 火山引擎
 
-省事做法：
+| 服务 | 查询 | 部署 |
+| --- | --- | --- |
+| CDN | `CDNReadOnlyAccess`、`CDNSSLReadOnlyAccess` | `CDNReadOnlyAccess`、`CDNSSLFullAccess` |
+| 全站加速 DCDN | `DCDNReadOnlyAccess` | `DCDNFullAccess` |
+| 对象存储 TOS | `TOSReadOnlyAccess` | `TOSFullAccess` |
+| 视频点播 | `VodReadOnlyAccess` | `VodFullAccessV2` |
+| 视频直播 | `LIVEReadOnlyAccess` | `LIVEFullAccess` |
+| veImageX | `ImageXReadOnlyAccess` | `ImageXFullAccessV2` |
+| 证书中心 | `SSLReadOnly` | `SSLFullAccess` |
 
-| 命令 | 系统策略 |
-| --- | --- |
-| 查询 | `CDNReadOnlyAccess`、`DCDNReadOnlyAccess`、`TOSReadOnlyAccess`、`VodReadOnlyAccess`、`LIVEReadOnlyAccess`、`ImageXReadOnlyAccess`；再加证书中心的 `SSLReadOnly` |
-| 部署 | 换成对应产品（含证书中心）的 FullAccess |
-| 签发 | `DNSFullAccess` |
+签发（云解析 DNS）：`DNSFullAccess`；只跑 `--dry-run` 时 `DNSReadOnlyAccess` 就够。
 
-最小权限（在只读之上追加）：
+注意：
 
-- 部署
-  - 证书中心：`ImportCertificate`
-  - CDN：`BatchDeployCert`；DCDN：`CreateCertBind`、`DescribeDomainDetail`、`UpdateDomainConfig`；TOS：`GetBucketCustomDomain`、`PutBucketCustomDomain`
-  - 点播：`DescribeVodDomainConfig`、`UpdateVodDomainConfig`；直播：`ListCertV2`、`DescribeCertDetailSecretV2`、`CreateCert`、`BindCert`；veImageX：`GetDomainConfig`、`UpdateHttps`
+- **CDN 的证书权限要单独给。** `CDNFullAccess` 不含配置证书，部署要用 `CDNSSLFullAccess`；查询域名关联证书的接口也归在 CDN 证书管理里，对应 `CDNSSLReadOnlyAccess`。
+- 点播、veImageX 的 FullAccess 在 2026-08-20 升级成了带 V2 的版本，旧的 `VodFullAccess`、`ImageXFullAccess` 不要再用。
+- **第一次部署前要做跨服务授权。** CDN、全站加速、TOS、点播、veImageX 要获得授权才能访问证书中心里的证书。用主账号在该产品控制台给域名配一次 HTTPS 证书，按提示完成授权即可；子用户默认没有跨服务授权的权限。TOS 没授权时证书状态是 `RoleNotExist`。
+
+最小权限（自定义策略的 Action 写成「服务代码:接口名」，注意 `CDN`、`ImageX` 的大小写；资源填 `*`）：
+
+- 部署（在上表只读策略之上追加）
+  - 证书中心：`certificate_service:ImportCertificate`
+  - CDN：`CDN:BatchDeployCert`；全站加速：`dcdn:CreateCertBind`、`dcdn:DescribeDomainDetail`、`dcdn:UpdateDomainConfig`；TOS：`tos:PutBucketCustomDomain`
+  - 点播：`vod:DescribeVodDomainConfig`、`vod:UpdateVodDomainConfig`
+  - 直播：`live:ListCertV2`、`live:DescribeCertDetailSecretV2`、`live:CreateCert`、`live:BindCert`
+  - veImageX：`ImageX:GetDomainConfig`、`ImageX:UpdateHttps`
 - 签发：`dns:ListZones`、`dns:ListRecords`、`dns:CreateRecord`、`dns:DeleteRecord`
 
 ## 华为云
 
-省事做法：
+华为云 IAM 有新旧两套授权，策略名互不通用：新版控制台授予「身份策略」，旧版在「权限管理」里授予「角色与策略」。官方说新版按账号逐步开放，看你的 IAM 控制台是哪套，用对应那一列。
 
-| 命令 | 系统策略 |
-| --- | --- |
-| 查询 | `CDN DomainReadOnlyAccess`、`SCM ReadOnlyAccess`、`Live ReadOnlyAccess`；OBS 见下方注意 |
-| 部署 | `CDN DomainConfiguration`、`SCM FullAccess`、`Live FullAccess`；OBS 见下方注意。只部署 CDN 时不需要 `SCM FullAccess` |
-| 签发 | `DNS FullAccess` |
+| 服务 | 用途 | 旧版（角色与策略） | 新版（身份策略） |
+| --- | --- | --- | --- |
+| CDN | 查询 | `CDN DomainReadOnlyAccess` | `CDNDomainReadOnlyPolicy` |
+| CDN | 部署（再加） | `CDN DomainConfiguration` | `CDNDomainConfigurationPolicy` |
+| 云证书管理 CCM | 查询 | `SCM ReadOnlyAccess` | `SCMReadOnlyPolicy` |
+| 云证书管理 CCM | 部署 | `SCM FullAccess` | `SCMFullPolicy` |
+| 视频直播 | 查询 | `Live ReadOnlyAccess` | `LiveReadOnlyPolicy` |
+| 视频直播 | 部署 | `Live FullAccess` | `LiveFullAccessPolicy` |
+| 对象存储 OBS | 查询 | `Tenant Guest`（全部服务只读，范围大），或自定义策略 | 自定义身份策略 |
+| 对象存储 OBS | 部署 | `OBS Administrator`，或自定义策略 | `OBSFullAccessPolicy`，或自定义身份策略 |
+| 云解析服务 DNS | 签发 | `DNS FullAccess` | `DNSFullAccessPolicy` |
 
 注意：
 
-- **项目级策略要授权到对的地域。** `Live ReadOnlyAccess`、`Live FullAccess` 授权到直播所在地域的项目；`DNS FullAccess` 授权到华北-北京四（cn-north-4）。不想区分就选「所有资源」。
-- **OBS 没有现成的系统策略可用**（`OBS ReadOnlyAccess` 不含读取自定义域名）。自己建策略：查询要 `obs:bucket:ListAllMyBuckets`、`obs:bucket:GetBucketCustomDomainConfiguration`（或者直接给全局只读 `Tenant Guest`），部署再加 `obs:bucket:PutBucketCustomDomainConfiguration`。
+- **旧版要选对授权范围。** CDN、云证书管理、OBS 是全局服务，选「全局服务资源」；视频直播选直播所在地域的项目；云解析 DNS 选华北-北京四（cn-north-4）。不想区分就选「所有资源」。新版没有这一步。
+- `CDN DomainConfiguration` 不能单独给，要和 `CDN DomainReadOnlyAccess` 一起给（官方要求）。
+- 只部署 CDN 时不需要云证书管理的写权限。
+- OBS 的只读系统策略（`OBS ReadOnlyAccess`、`OBSReadOnlyPolicy`）不含读取桶的自定义域名，不能用。
 
-最小权限：
+最小权限（自定义策略）：
 
-- 云证书管理（部署）：`scm:cert:import`、`scm:cert:get`、`scm:cert:list`
-- 签发：`dns:zone:list`、`dns:recordset:list`、`dns:recordset:create`、`dns:recordset:update`、`dns:recordset:delete`（同样授权到 cn-north-4 或所有资源）
+- OBS：`obs:bucket:ListAllMyBuckets`、`obs:bucket:GetBucketCustomDomainConfiguration`，部署再加 `obs:bucket:PutBucketCustomDomainConfiguration`。新版身份策略里这三项首字母小写：`obs:bucket:listAllMyBuckets`、`obs:bucket:getBucketCustomDomainConfiguration`、`obs:bucket:putBucketCustomDomainConfiguration`。
+- 云证书管理：查询要 `scm:cert:list`；部署再加 `scm:cert:get` 和上传证书（旧版 `scm:cert:upload`，新版 `scm:cert:import`）。
+- 签发：`dns:zone:list`、`dns:recordset:list`、`dns:recordset:create`、`dns:recordset:update`、`dns:recordset:delete`。官方给其中几项列了云监控（`ces:`）的依赖授权项，要一起加上，见授权项列表（[旧版](https://support.huaweicloud.com/api-dns/dns_api_70002.html)、[新版](https://support.huaweicloud.com/api-dns/Permission.html)）。旧版里 DNS 是项目级服务，要单独建一个策略，不能和 OBS、云证书管理放在同一个策略里。
 
 ## 百度智能云
 
-| 命令 | 授予什么 |
-| --- | --- |
-| 查询 | `CdnReadAccessPolicy`（CDN）、`CASReadPolicy`（证书管理，要选产品级权限） |
-| 部署 | 再加证书管理的创建证书、查看证书详情权限，CDN 域名配置的写权限 |
-| 签发 | `DNSOperatePolicy` |
+| 服务 | 查询 | 部署 |
+| --- | --- | --- |
+| CDN | `CdnReadAccessPolicy` | `CdnOperateAccessPolicy` |
+| 证书管理 | `CASReadPolicy` | `CASWritePolicy` |
 
-注意：签发前要先在控制台开通智能云解析，否则报缺少服务角色 `BceServiceRole_console_dns`。另外百度智能云解析目前实测签不出证书，见[已知限制](limitations.md#百度智能云)。
+签发（智能云解析）：`DNSOperatePolicy`；只跑 `--dry-run` 时 `DNSReadPolicy` 就够。
+
+注意：
+
+- **证书管理只能用这两个系统策略**（产品级）：实例级的自定义策略获取不了证书详情列表，也上传不了证书。
+- 证书管理的策略名以 IAM 文档为准；个别官方 API 文档写作 `CASReadAccessPolicy`、`CASOperateAccessPolicy`，以控制台的系统策略列表为准。
+- 实测：没开通智能云解析时，签发报缺少服务角色 `BceServiceRole_console_dns`，要先在控制台开通。另外百度智能云解析目前实测签不出证书，见[已知限制](limitations.md#百度智能云)。
+
+最小权限：CDN 可以按域名收紧，自定义策略选服务 `bce:cdn`，授权 `QueryDomainList`（资源 `domain/*`）、`QueryDomainConfig`、`UpdateDomain`（资源 `domain/<域名>`）。
 
 ## 七牛云
 
-| 命令 | 授予什么 |
+| 用途 | 授予什么 |
 | --- | --- |
-| 查询 | 用主账号 AK；或给 IAM 子账号建自定义策略，授权 `cdn/GetDomainList`、`cdn/GetDomainInfo`（七牛没有现成的只读策略） |
-| 部署 | 用主账号 AK；或给 IAM 子账号加 CDN 域名配置的写权限和 SSL 证书上传权限 |
+| 查询 | 主账号 AK；或给 IAM 子账号建自定义策略：`cdn/GetDomainList`、`cdn/GetDomainInfo` |
+| 部署 | 建议用主账号 AK。子账号要再加 `cdn/UpdateHttps` |
 | 签发 | 七牛没有 DNS 服务 |
+
+注意：
+
+- **七牛 IAM 没有系统策略，也没有 SSL 证书服务的权限项。** 子账号可能查不到证书列表（`certs` 和到期时间补全会出现在 `issues` 里），也可能上传不了证书，所以部署建议用主账号 AK。
+- 全站加速域名对应的权限项是 `dcdn/GetDomainList`、`dcdn/GetDomainInfo`、`dcdn/UpdateHttps`。
 
 ## 其他 DNS 服务商
 
@@ -113,15 +159,15 @@
 
 | 服务商 | 怎么授权 | 注意 |
 | --- | --- | --- |
-| Cloudflare | dash.cloudflare.com → My Profile → API Tokens，创建 Custom Token：权限 `Zone → Zone → Read` + `Zone → DNS → Edit`，Zone Resources 选要签发的 zone 或 All zones | 「Edit zone DNS」模板缺 `Zone → Zone → Read`，要手动加上。不支持 Global API Key |
+| Cloudflare | dash.cloudflare.com → My Profile → API Tokens → Create Token，选 Custom token：权限 `Zone → Zone → Read` + `Zone → DNS → Edit`，Zone Resources 选要签发的 zone 或 All zones | 「Edit zone DNS」模板缺 `Zone → Zone → Read`，要手动加上。不支持 Global API Key |
 | AWS Route 53 | IAM 用户授权 `route53:ListHostedZones`、`route53:ListResourceRecordSets`、`route53:ChangeResourceRecordSets` | 账号里有多个同名公网 zone 时，还要 `route53:GetHostedZone`，否则报 `ZoneAmbiguous` |
-| Google Cloud DNS | 服务账号授予 DNS 管理员（`roles/dns.admin`） | 项目要启用 Cloud DNS API（`dns.googleapis.com`），否则报 `accessNotConfigured` |
-| Azure DNS | 应用注册 + 客户端密码，给这个服务主体分配「DNS 区域参与者」（DNS Zone Contributor） | 分配在**订阅**上：列 zone 用的是订阅级接口 |
-| DigitalOcean | Personal Access Token：Full Access，或 Custom Scopes 勾选 `domain:read` + `domain:update` | Read Only 令牌不能用 |
-| GoDaddy | developer.godaddy.com 创建 **Production** 环境的 API Key | OTE 测试环境的 Key 不能用。Key 没有细分权限，等同账号的域名管理权限。账号不满足 GoDaddy 的 API 开放条件时，所有请求返回 403 |
+| Google Cloud DNS | 服务账号在项目上授予 DNS Administrator（`roles/dns.admin`） | 项目要启用 Cloud DNS API（`dns.googleapis.com`），否则报 `accessNotConfigured` |
+| Azure DNS | Microsoft Entra ID → 应用注册，新建应用后在「证书和机密」里新建客户端密码；再给这个应用分配「DNS 区域参与者」（DNS Zone Contributor） | 建议分配在订阅上：列 zone 用的是订阅级接口 |
+| DigitalOcean | 控制台 Account → API → Tokens → Generate New Token：Full Access，或 Custom Scopes 勾选 `domain:read` + `domain:update` | Read Only 令牌不能用 |
+| GoDaddy | 在 classic-developer.godaddy.com/keys 创建 **Production** 环境的 Key 和 Secret（Secret 只显示一次） | developer.godaddy.com 现在发的是 Personal Access Token，sslbear-cli 还不支持。OTE 测试环境的 Key 不能用。Key 不能限定权限范围。账号里至少要有 1 个域名（或有开通域名管理权限的套餐），否则返回 403 |
 
 想收紧权限时：
 
-- AWS Route 53：`ListHostedZones` 的 Resource 只能是 `*`；另外两个可以限定为 `arn:aws:route53:::hostedzone/<zone ID>`。写权限还能用条件键收窄到验证记录：`route53:ChangeResourceRecordSetsRecordTypes` = `TXT`、`route53:ChangeResourceRecordSetsActions` = `UPSERT` / `DELETE`、`route53:ChangeResourceRecordSetsNormalizedRecordNames` 匹配 `_acme-challenge.*`。
-- Google Cloud DNS：自定义角色包含 `dns.managedZones.list`、`dns.resourceRecordSets.list`、`dns.changes.create`、`dns.changes.get`、`dns.resourceRecordSets.create`、`dns.resourceRecordSets.update`、`dns.resourceRecordSets.delete`，授予在项目上。
-- Azure DNS：自定义角色最少要 `Microsoft.Network/dnsZones/read`、`Microsoft.Network/dnsZones/TXT/read`、`Microsoft.Network/dnsZones/TXT/write`、`Microsoft.Network/dnsZones/TXT/delete`。
+- AWS Route 53：`ListHostedZones` 的 Resource 只能是 `*`；`GetHostedZone`、`ListResourceRecordSets`、`ChangeResourceRecordSets` 可以限定为 `arn:aws:route53:::hostedzone/<zone ID>`。写权限还能用条件键收窄到验证记录：用 `ForAllValues:StringEquals` 限定 `route53:ChangeResourceRecordSetsRecordTypes` 为 `TXT`、`route53:ChangeResourceRecordSetsActions` 为 `CREATE` 和 `DELETE`（sslbear-cli 不用 `UPSERT`）；用 `ForAllValues:StringLike` 限定 `route53:ChangeResourceRecordSetsNormalizedRecordNames` 为 `_acme-challenge.*`（小写，不带结尾的点）。
+- Google Cloud DNS：自定义角色包含 `dns.managedZones.list`、`dns.resourceRecordSets.list`、`dns.changes.create`、`dns.changes.get`、`dns.resourceRecordSets.create`、`dns.resourceRecordSets.update`、`dns.resourceRecordSets.delete`，在项目上授予。
+- Azure DNS：自定义角色最少要 `Microsoft.Network/dnsZones/read`、`Microsoft.Network/dnsZones/TXT/read`、`Microsoft.Network/dnsZones/TXT/write`、`Microsoft.Network/dnsZones/TXT/delete`，同样分配在订阅上。

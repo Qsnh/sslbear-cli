@@ -23,7 +23,7 @@ const NOT_FOUND_CODE = "81044";
 const AUTH_CODES = new Set([6111, 9109, 10000]);
 const PERMISSION_HINT =
   "CLOUDFLARE_API_TOKEN 无效或权限不足：令牌需要 Zone → Zone → Read（列出 zone）与 Zone → DNS → Edit（增删 TXT 记录）权限" +
-  "（新版权限名为 Zone Read、DNS Write），Zone Resources 要包含该域名所在的 zone";
+  "（API 文档里叫 Zone Read、DNS Write），Zone Resources 要包含该域名所在的 zone";
 
 interface CfMessage {
   code?: number;

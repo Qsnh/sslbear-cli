@@ -47,12 +47,12 @@ mkdir -p ~/.sslbear-cli && touch ~/.sslbear-cli/.env && chmod 600 ~/.sslbear-cli
 
 | DNS 服务商（`--dns`） | 必填 | 可选 | 怎么获取 |
 | --- | --- | --- | --- |
-| cloudflare | `CLOUDFLARE_API_TOKEN` | — | API Tokens 里建 Custom Token，权限 `Zone → Zone → Read` + `Zone → DNS → Edit`。不支持 Global API Key |
-| aws（Route 53） | `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY` | `AWS_SESSION_TOKEN` | IAM 用户，授权 `route53:ListHostedZones`、`ListResourceRecordSets`、`ChangeResourceRecordSets` |
-| google（Cloud DNS） | `GOOGLE_APPLICATION_CREDENTIALS`（服务账号 JSON 密钥文件的路径） | `GOOGLE_CLOUD_PROJECT` | 服务账号授予 DNS 管理员（`roles/dns.admin`），项目要启用 Cloud DNS API |
-| azure（Azure DNS） | `AZURE_TENANT_ID`、`AZURE_CLIENT_ID`、`AZURE_CLIENT_SECRET`、`AZURE_SUBSCRIPTION_ID` | — | 应用注册 + 客户端密码，在订阅上分配「DNS 区域参与者」 |
-| digitalocean | `DIGITALOCEAN_TOKEN` | — | Personal Access Token，Full Access 或勾选 `domain:read` + `domain:update` |
-| godaddy | `GODADDY_API_KEY`、`GODADDY_API_SECRET` | — | developer.godaddy.com 创建 Production 环境的 API Key |
+| cloudflare | `CLOUDFLARE_API_TOKEN` | — | dash.cloudflare.com → My Profile → API Tokens 建 Custom token，权限 `Zone → Zone → Read` + `Zone → DNS → Edit`。不支持 Global API Key |
+| aws（Route 53） | `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY` | `AWS_SESSION_TOKEN` | IAM 用户，授权 `route53:ListHostedZones`、`route53:ListResourceRecordSets`、`route53:ChangeResourceRecordSets`；账号里有多个同名公网 zone 时再加 `route53:GetHostedZone` |
+| google（Cloud DNS） | `GOOGLE_APPLICATION_CREDENTIALS`（服务账号 JSON 密钥文件的路径） | `GOOGLE_CLOUD_PROJECT` | 服务账号在项目上授予 DNS Administrator（`roles/dns.admin`），项目要启用 Cloud DNS API |
+| azure（Azure DNS） | `AZURE_TENANT_ID`、`AZURE_CLIENT_ID`、`AZURE_CLIENT_SECRET`、`AZURE_SUBSCRIPTION_ID` | — | Microsoft Entra ID 应用注册，在「证书和机密」里新建客户端密码，再在订阅上给这个应用分配「DNS 区域参与者」 |
+| digitalocean | `DIGITALOCEAN_TOKEN` | — | 控制台 Account → API → Tokens 生成 Personal Access Token：Full Access，或 Custom Scopes 勾选 `domain:read` + `domain:update` |
+| godaddy | `GODADDY_API_KEY`、`GODADDY_API_SECRET` | — | 在 classic-developer.godaddy.com/keys 创建 Production 环境的 Key 和 Secret。developer.godaddy.com 现在发的 Personal Access Token 不支持 |
 
 ## 子账号与权限
 

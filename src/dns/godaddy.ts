@@ -24,7 +24,7 @@ const MAX_PAGES = 1000;
 /** GoDaddy 托管 DNS 的权威 NS（nsXX.domaincontrol.com） */
 const NS_PATTERN = /\.domaincontrol\.com$/;
 const AUTH_HINT =
-  "GoDaddy 鉴权失败：请确认 GODADDY_API_KEY / GODADDY_API_SECRET 是同一对 Production（生产环境）密钥（OTE 测试环境的密钥不能用于 api.godaddy.com）。" +
+  "GoDaddy 鉴权失败：请确认 GODADDY_API_KEY / GODADDY_API_SECRET 是同一对 Production（生产环境）密钥（在 classic-developer.godaddy.com/keys 创建；OTE 测试环境的密钥不能用于 api.godaddy.com）。" +
   "GoDaddy 已计划停用 Domains 接口的 Classic Developer Key（sso-key），停用后需改用 Personal Access Token";
 const FORBIDDEN_HINT =
   "GoDaddy 拒绝访问：域名管理与 DNS 接口只对符合条件的账号开放（现行文档要求账号在 GoDaddy 至少持有 1 个域名，或有开通管理权限的套餐；" +
