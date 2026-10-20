@@ -1,6 +1,7 @@
 import type { AccessKeyCredentials } from "../../lib/env.js";
 import { CloudApiError, send, withRetry, type QueryContext } from "../../lib/http.js";
 import { memo } from "../../lib/paginate.js";
+import { explainDenied } from "./iam.js";
 import { apigAuthorization, canonicalQuery, hwEscape, sdkDate } from "./sign.js";
 
 export interface HuaweiRequest {
@@ -98,7 +99,7 @@ export async function callHuawei<T>(ctx: QueryContext, creds: AccessKeyCredentia
     const err = findError(parsed, raw.status);
     if (err) {
       const code = THROTTLE_CODES.has(err.code) ? `Throttling.${err.code}` : err.code;
-      throw new CloudApiError("huawei", code, err.message, err.requestId, raw.status);
+      throw new CloudApiError("huawei", code, explainDenied(err.message), err.requestId, raw.status);
     }
     return parsed as T;
   };

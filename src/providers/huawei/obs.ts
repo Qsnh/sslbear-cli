@@ -8,6 +8,7 @@ import { xmlBlocks, xmlText } from "../../lib/xml.js";
 import type { CertInfo, DomainRecord } from "../../types.js";
 import type { DeployInput, DeployOutcome, DeployTarget, DomainService, Warn } from "../registry.js";
 import { certName, earliest, orderCerts, PEM_FALLBACK_NOTE, scmCertIdOrPem } from "./common.js";
+import { permissionHint } from "./iam.js";
 import { enrichFromScm } from "./scm.js";
 import { obsAuthorization, obsStringToSign } from "./sign.js";
 
@@ -18,6 +19,8 @@ const SERVICE_HOST = "obs.cn-north-4.myhuaweicloud.com";
 const THROTTLE_CODES = new Set(["SlowDown"]);
 
 interface ObsRequest {
+  /** 授权项，无权限时写进报错（OBS 的拒绝原文不说缺哪个） */
+  action: "obs:bucket:listAllMyBuckets" | "obs:bucket:getBucketCustomDomainConfiguration" | "obs:bucket:putBucketCustomDomainConfiguration";
   host: string;
   /** 缺省 GET */
   method?: "GET" | "PUT";
@@ -44,10 +47,12 @@ async function obsSend(ctx: QueryContext, creds: AccessKeyCredentials, req: ObsR
     const raw = await send(ctx, "huawei", `https://${req.host}/${req.search ?? ""}`, { method, headers, ...(req.body !== undefined && { body: req.body }) });
     if (raw.status >= 400) {
       const code = xmlText(raw.text, "Code") ?? `HTTP${raw.status}`;
+      const message = xmlText(raw.text, "Message") ?? `HTTP ${raw.status}`;
       throw new CloudApiError(
         "huawei",
         THROTTLE_CODES.has(code) ? `Throttling.${code}` : code,
-        xmlText(raw.text, "Message") ?? `HTTP ${raw.status}`,
+        // 无权限只有 AccessDenied「Access Denied」（也可能来自桶策略），按接口推断
+        code === "AccessDenied" ? `${message}${permissionHint(req.action, true)}` : message,
         xmlText(raw.text, "RequestId"),
         raw.status,
       );
@@ -67,6 +72,7 @@ async function listBuckets(ctx: QueryContext, creds: AccessKeyCredentials, warn:
   // 文档没写分页，SDK 支持 marker / IsTruncated，按截断标记兜底翻页
   for (let page = 0; page < 200; page++) {
     const xml = await obsSend(ctx, creds, {
+      action: "obs:bucket:listAllMyBuckets",
       host: SERVICE_HOST,
       resource: "/",
       ...(marker && { search: `?marker=${encodeURIComponent(marker)}` }),
@@ -143,7 +149,14 @@ async function applyObs(ctx: QueryContext, creds: AccessKeyCredentials, target: 
       `<Certificate>${xmlEscape(input.cert.certPem)}</Certificate><PrivateKey>${xmlEscape(input.cert.keyPem)}</PrivateKey>` +
       `<CertificateType>server</CertificateType></CustomDomainConfiguration>`;
     const search = `?customdomain=${record.domain}`;
-    await obsSend(ctx, creds, { host: `${bucket}.obs.${region}.myhuaweicloud.com`, method: "PUT", resource: `/${bucket}/${search}`, search, body });
+    await obsSend(ctx, creds, {
+      action: "obs:bucket:putBucketCustomDomainConfiguration",
+      host: `${bucket}.obs.${region}.myhuaweicloud.com`,
+      method: "PUT",
+      resource: `/${bucket}/${search}`,
+      search,
+      body,
+    });
   }
   return compact({ certId, note: uploaded && !certId ? PEM_FALLBACK_NOTE : undefined });
 }
@@ -157,6 +170,7 @@ export const obs: DomainService<AccessKeyCredentials> = {
     const perBucket = await mapLimit(buckets, 5, async (bucket) => {
       try {
         const xml = await obsSend(ctx, creds, {
+          action: "obs:bucket:getBucketCustomDomainConfiguration",
           host: `${bucket.name}.obs.${bucket.region}.myhuaweicloud.com`,
           resource: `/${bucket.name}/?customdomain`,
           search: "?customdomain",

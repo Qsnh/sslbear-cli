@@ -71,6 +71,22 @@ describe("huawei 请求格式", () => {
     );
   });
 
+  it("无权限时报错写出缺少的 IAM 权限与可授予的系统策略（新旧两版 IAM）", async () => {
+    const denied = (action: string, resource: string) =>
+      `User: iam::0000:user:dev is not authorized to perform: ${action} on resource: ${resource} because no identity-based policy allows the ${action} action.`;
+    const fetch = fakeFetch((req) =>
+      req.url.pathname === "/v3/scm/certificates" ? apigError(403, "SCM.4002", `Permission denied. Policy does not allow action to be performed${denied("scm:cert:list", "scm:cn-north-4:0000:cert:*")}`) : undefined,
+    );
+    const r = await runCli(["certs", "-p", "huawei", "--json"], { env: HUAWEI_ENV, fetch });
+    expect(r.code).toBe(1);
+    expect(JSON.parse(r.stderr).issues).toEqual([
+      expect.objectContaining({
+        code: "SCM.4002",
+        message: expect.stringMatching(/scm:cert:list action\.（缺少 IAM 权限 scm:cert:list，可授予系统策略 SCMReadOnlyPolicy，旧版 IAM 授予 SCM ReadOnlyAccess）$/),
+      }),
+    ]);
+  });
+
   it("别名 HW_ACCESS_KEY / HW_SECRET_KEY 也可用", async () => {
     const fetch = fakeFetch(scmRoute);
     const r = await runCli(["certs", "-p", "huawei", "--json"], { env: { HW_ACCESS_KEY: "HWalias0000000000000", HW_SECRET_KEY: "s" }, fetch });
@@ -676,7 +692,15 @@ describe("huawei obs", () => {
     });
     expect(map["own.example.cn"].cert).toEqual({ id: "000001A14A3ABD8282E7B4974512770A", name: "own", notAfter: "2027-01-15T13:09:53.000Z" });
     expect(r.json.data.issues).toEqual([
-      expect.objectContaining({ service: "obs", kind: "error", target: "bucket locked", code: "AccessDenied", requestId: "obs-req" }),
+      expect.objectContaining({
+        service: "obs",
+        kind: "error",
+        target: "bucket locked",
+        code: "AccessDenied",
+        requestId: "obs-req",
+        // OBS 的拒绝原文不说缺哪个权限（也可能是桶策略），按接口推断；只读系统策略不含读自定义域名
+        message: "Access Denied（可能缺少 IAM 权限 obs:bucket:getBucketCustomDomainConfiguration，需用自定义策略授予）",
+      }),
     ]);
 
     const list = fetch.calls.find((c) => c.url.host === "obs.cn-north-4.myhuaweicloud.com")!;

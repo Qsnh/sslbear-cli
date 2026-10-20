@@ -117,6 +117,14 @@ describe("华为云云解析 listZones", () => {
     const err = await huaweiDns.listZones(ctxOf(denied), CREDS).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(CloudApiError);
     expect(err).toMatchObject({ provider: "huawei", code: "APIGW.0302", requestId: "rid-APIGW.0302", httpStatus: 403 });
+
+    // 新版 IAM 的拒绝原文带授权项（实测 DNS.1802 的错误体是 {code, message}）：签发要增删记录，查询接口被拒也给读写策略
+    const msg = "User: iam::0000:user:dev is not authorized to perform: dns:zone:list on resource: dns::0000:zone:* because no identity-based policy allows the dns:zone:list action.";
+    const v5 = hw(() => ({ status: 403, body: { code: "DNS.1802", message: msg } }));
+    await expect(huaweiDns.listZones(ctxOf(v5), CREDS)).rejects.toMatchObject({
+      code: "DNS.1802",
+      message: `${msg}（缺少 IAM 权限 dns:zone:list，可授予系统策略 DNSFullAccessPolicy，旧版 IAM 授予 DNS FullAccess）`,
+    });
   });
 
   it("NS 主机名规则覆盖 .com / .cn / .net / .org，以及历史域名的 hwclouds-dns.com / .net", () => {

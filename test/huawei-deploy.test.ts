@@ -293,6 +293,18 @@ describe("huawei cdn deployer", () => {
     expectNoKeyInUrl(fetch.calls);
   });
 
+  it("无权限（CDN.0004，原文带授权项）时报错写出缺少的 IAM 权限与系统策略", async () => {
+    const action = "cdn:configuration:modifyHttpsConf";
+    const msg = `User: iam::0000:user:dev is not authorized to perform: ${action} on resource: cdn::0000:domain:www.example.com because no identity-based policy allows the ${action} action.`;
+    const { ctx } = ctxOf((req) =>
+      req.method === "PUT" ? { status: 403, body: { error: { error_code: "CDN.0004", error_msg: msg } } } : cdnRoute({ https_status: "on", certificate_type: "server" })(req),
+    );
+    await expect(cdn.deployer!.apply(ctx, CREDS, { records: [cdnRecord()], mode: "update" }, pemOnly())).rejects.toMatchObject({
+      code: "CDN.0004",
+      message: `${msg}（缺少 IAM 权限 ${action}，可授予系统策略 CDNDomainConfigurationPolicy，旧版 IAM 授予 CDN DomainConfiguration）`,
+    });
+  });
+
   it("deploy：原先未开启 HTTPS，开启并配置国际证书（读不到的 HTTPS 子项不发送）", async () => {
     const { ctx, fetch } = ctxOf(cdnRoute({ https_status: "off" }));
     await cdn.deployer!.apply(ctx, CREDS, { records: [cdnRecord({ https: false, cert: undefined })], mode: "deploy" }, pemOnly());
@@ -786,7 +798,11 @@ describe("huawei obs deployer", () => {
 
   it("失败抛 CloudApiError（XML 错误体）；extra 缺 bucket / region 时报错且不上传", async () => {
     const { ctx } = ctxOf(() => ({ status: 403, body: "<Error><Code>AccessDenied</Code><Message>Access Denied</Message><RequestId>obs-rid</RequestId></Error>" }));
-    await expect(obs.deployer!.apply(ctx, CREDS, { records: [obsRecord()], mode: "update" }, viaScm())).rejects.toMatchObject({ code: "AccessDenied", requestId: "obs-rid" });
+    await expect(obs.deployer!.apply(ctx, CREDS, { records: [obsRecord()], mode: "update" }, viaScm())).rejects.toMatchObject({
+      code: "AccessDenied",
+      requestId: "obs-rid",
+      message: "Access Denied（可能缺少 IAM 权限 obs:bucket:putBucketCustomDomainConfiguration，可授予系统策略 OBSFullAccessPolicy，旧版 IAM 授予 OBS Administrator）",
+    });
     const input = viaScm();
     await expect(obs.deployer!.apply(ctx, CREDS, { records: [obsRecord({ extra: {} })], mode: "update" }, input)).rejects.toThrow(/bucket/);
     expect(input.certId).not.toHaveBeenCalled();
