@@ -1,6 +1,6 @@
 # 已知限制
 
-`domains` / `certs` / `deploy` 的行为都在 2026-10 用各云真实账号验证过，用 TLS 握手核对过边缘实际下发的证书；腾讯云 EdgeOne 例外，账号没开通，只经过模拟测试。`issue` 在 2026-10 用真实账号向 Let's Encrypt 签发验证过的 DNS 服务商：阿里云、DNSPod、火山引擎、华为云、Cloudflare、AWS Route 53、Google Cloud DNS、Azure DNS、DigitalOcean（根域名 + 泛域名，测试环境与正式环境）；百度智能云只确认过签名与接入点；GoDaddy 只经过模拟测试。每个厂商一节，「查询」对应 `domains` / `certs`，「部署」对应 `deploy`，「签发」对应 `issue`。
+`domains` / `certs` / `deploy` 的行为都在 2026-10 用各云真实账号验证过，用 TLS 握手核对过边缘实际下发的证书；腾讯云 EdgeOne 例外，账号没开通，只经过模拟测试。`issue` 在 2026-10 用真实账号向 Let's Encrypt 签发验证过的 DNS 服务商：阿里云、DNSPod、火山引擎、华为云、Cloudflare、AWS Route 53、Google Cloud DNS、Azure DNS、DigitalOcean（根域名 + 泛域名，测试环境与正式环境）；百度智能云的记录增删实测正常，但 Let's Encrypt 验证失败（见百度一节）；GoDaddy 只经过模拟测试。每个厂商一节，「查询」对应 `domains` / `certs`，「部署」对应 `deploy`，「签发」对应 `issue`。
 
 ## 通用
 
@@ -136,8 +136,9 @@
 - 只替换国际证书（RSA / ECC 二选一），国密 HTTPS 证书不处理。
 - 证书管理按证书详情里的 SHA-1 指纹查重，同名同到期的 RSA、ECC 两张证书不会互相复用。
 
-签发（智能云解析，只确认过签名与接入点，未实际签发）：
+签发（智能云解析）：
 
+- **实测签不出证书**（2026-10，免费版）：添加、删除验证记录都正常，Let's Encrypt 主验证点也通过，但多地二次验证时海外验证点查百度的 NS（ns1 / ns2.bdydns.cn，只有国内 IP）一直报 `networking error`，测试环境、正式环境各试多次都是 `AcmeChallengeFailed`。疑似百度权威 DNS 对境外查询有限制；用百度解析的域名请改用其他 DNS 服务商签发，或换带境外节点的套餐后自行验证。
 - 不支持 .beer 等部分后缀，添加域名时报 `ZoneNameNotSupportException`（.xyz、.top、.space、.com 可以）。
 
 - 只查状态为正常（running）和未备案（torenew）的域名：备案不影响解析生效。NS 尚未修改（nsunchange）的不参与查找；百度说 NS 修改后系统更新要 24~48 小时，这期间报 `ZoneNotFound`。
