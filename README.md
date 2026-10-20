@@ -80,7 +80,7 @@ agent 调用一律加 `--json`，这样遇到需要确认的情况也不会停�
 | `ZoneAmbiguous` | 多家服务商（`providers`）都托管了这个 zone，按 NS 判断不出实际用哪家 | 问用户实际用哪家，加 `--dns <那家>` 重跑 |
 | `DnsRecordFailed` | 在 `provider` 添加 TXT 记录失败（`code`、`requestId`），多半缺写权限 | `retryable: true` 先重跑一次；否则报给用户，见[所需权限](docs/permissions.md) |
 | `DnsPropagationTimeout` | 超时仍没在权威 DNS 上看到记录。`message` 会说明域名的 NS 是否指向该服务商 | NS 没指向该服务商时告诉用户；否则加大 `--dns-timeout` 重跑 |
-| `AcmeChallengeFailed` | Let's Encrypt 验证 `domain` 失败（`acmeType`、`detail`） | 把 `detail` 报给用户。常见原因：`_acme-challenge` 有 CNAME、CAA 记录不允许 Let's Encrypt |
+| `AcmeChallengeFailed` | Let's Encrypt 验证 `domain` 失败（`acmeType`、`detail`） | 把 `detail` 报给用户。常见原因：`_acme-challenge` 有 CNAME、CAA 记录不允许 Let's Encrypt、DNS 服务商限制境外查询（如百度智能云解析，见[已知限制](docs/limitations.md)） |
 | `AcmeRateLimited` | 触发 Let's Encrypt 频率限制，`retryAfter` 秒后可重试 | 不要马上重试，把时间告诉用户 |
 | `AcmeError` | 其他 ACME 错误，含网络错误（`acmeType`） | `retryable: true` 稍后重跑；否则报给用户 |
 | `Interrupted` | 签发被中止（进程收到 SIGINT / SIGTERM，exit 130 / 143），本次加的记录已删除；没删掉的在 `dns` 里 `cleaned: false` | 转告需要手动删除的记录，把命令超时设长后重跑 |
