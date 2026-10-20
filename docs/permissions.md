@@ -341,18 +341,44 @@ CDN、全站加速、TOS、点播、veImageX 靠跨服务授权读证书中心�
 
 | 服务 | 查询 | 部署 |
 | --- | --- | --- |
-| CDN | `CdnReadAccessPolicy` | `CdnOperateAccessPolicy` |
-| 证书管理 | `CASReadPolicy` | `CASWritePolicy` |
+| CDN | `CDNReadAccessPolicy` | `CDNOperateAccessPolicy` |
+| 证书管理 | `CASReadAccessPolicy` | `CASOperateAccessPolicy` |
 
-签发（智能云解析）：`DNSOperatePolicy`；只跑 `--dry-run` 时 `DNSReadPolicy` 就够。
+签发（智能云解析）：`DNSReadAccessPolicy` + `DNSOperateAccessPolicy`；只跑 `--dry-run` 时 `DNSReadAccessPolicy` 就够。
 
 注意：
 
-- **证书管理只能用这两个系统策略**（产品级）：实例级的自定义策略获取不了证书详情列表，也上传不了证书。
-- 证书管理的策略名以 IAM 文档为准；个别官方 API 文档写作 `CASReadAccessPolicy`、`CASOperateAccessPolicy`，以控制台的系统策略列表为准。
-- 实测：没开通智能云解析时，签发报缺少服务角色 `BceServiceRole_console_dns`，要先在控制台开通。另外百度智能云解析目前实测签不出证书，见[已知限制](limitations.md#百度智能云)。
+- 策略名按控制台「授权 → 系统策略」列表核对过（2026-10），注意 CDN 是大写 `CDN` 开头。
+- 证书管理用系统策略，没有实测自定义策略。
+- 智能云解析缺读权限时，域名列表不报错、只返回空，`issue` 会报 `ZoneNotFound`（报错里会提示这种可能）。
+- 实测：没开通智能云解析时，签发报缺少服务角色 `BceServiceRole_console_dns`，要先在控制台开通。
 
-最小权限：CDN 可以按域名收紧，自定义策略选服务 `bce:cdn`，授权 `QueryDomainList`（资源 `domain/*`）、`QueryDomainConfig`、`UpdateDomain`（资源 `domain/<域名>`）。
+最小权限（2026-10 实测：子用户只挂下面这条自定义策略 + 4 条系统策略，查询、部署、签发都能跑通）：
+
+- CDN：自定义策略，服务 `bce:cdn`，查询要 `QueryDomainList`、`QueryDomainConfig`，部署再加 `UpdateDomain`。资源填 `*`；想只放行部分域名，资源写 `domain/<域名>`（`QueryDomainList` 要 `domain/*`）
+- 证书管理：查询 `CASReadAccessPolicy`；部署再加 `CASOperateAccessPolicy`（上传证书）
+- 签发：`DNSReadAccessPolicy`、`DNSOperateAccessPolicy`
+
+<details>
+<summary>CDN 自定义策略（查询 + 部署，可直接粘贴到「策略管理 → 创建策略 → 按策略语法创建」）</summary>
+
+```json
+{
+  "accessControlList": [
+    {
+      "service": "bce:cdn",
+      "region": "*",
+      "effect": "Allow",
+      "permission": ["QueryDomainList", "QueryDomainConfig", "UpdateDomain"],
+      "resource": ["*"]
+    }
+  ]
+}
+```
+
+只查询时把 `UpdateDomain` 删掉。
+
+</details>
 
 ## 七牛云
 
